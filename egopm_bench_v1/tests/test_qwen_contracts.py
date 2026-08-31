@@ -233,6 +233,28 @@ def test_usage_ledger_extracts_only_numeric_usage_without_response_content() -> 
     assert "private" not in json.dumps(result)
 
 
+def test_rate_limiter_uses_stricter_request_or_reserved_token_interval() -> None:
+    script = load_script("05_extract_cues.py")
+    clock = {"now": 0.0}
+    waits: list[float] = []
+
+    def monotonic() -> float:
+        return clock["now"]
+
+    def sleep(seconds: float) -> None:
+        waits.append(seconds)
+        clock["now"] += seconds
+
+    limiter = script.RateLimiter(300, 1_000_000, monotonic, sleep)
+    assert limiter.acquire(500_000) == 0.0  # token 限额给出 30 秒，比 300 RPM 的 0.2 秒严格。
+    assert limiter.acquire(1) == 30.0
+    assert waits == [30.0]
+    # 新 limiter 验证请求数门：极小 token 时仍不能在 0.2 秒以内连续突发。
+    limiter = script.RateLimiter(300, 1_000_000, monotonic, sleep)
+    assert limiter.acquire(1) == 0.0
+    assert limiter.acquire(1) == pytest.approx(0.2)
+
+
 def test_success_marker_hash_gate_rejects_tampered_fixture(tmp_path: Path) -> None:
     script = load_script("05_extract_cues.py")
     artifact = tmp_path / "source_video_atoms.jsonl"
@@ -301,8 +323,11 @@ def test_ledger_excludes_raw_response_and_preflight_is_read_only(tmp_path: Path)
     script = load_script("05_extract_cues.py")
     settings = shard_settings(script)
     ledger = tmp_path / "ledger.jsonl"
-    script.append_ledger(ledger, {"status": "failed", "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "failure_summary": "TimeoutError: 60 seconds", "raw_response_saved": False})
+    script.append_ledger(ledger, {"status": "failed", "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "failure_summary": "TimeoutError: 60 seconds", "raw_response_saved": False, "rate_limit_reserved_tokens_per_attempt": 1024, "rate_limit_reserved_tokens_total": 3072, "rate_limit_wait_seconds": 1.5, "rate_limit_attempt_count": 3})
     assert "response body" not in ledger.read_text(encoding="utf-8")
+    ledger_event = json.loads(ledger.read_text(encoding="utf-8"))
+    assert ledger_event["rate_limit_reserved_tokens_per_attempt"] == 1024
+    assert ledger_event["rate_limit_wait_seconds"] == 1.5
     atom = source_atom(1, "A person starts cooking in a kitchen.")
     schema = json.loads((ROOT / "schemas" / "cue_candidate.schema.json").read_text(encoding="utf-8"))
     report = script.preflight([atom], {"sha256": "source-hash"}, "synthetic prompt", schema, "run_fixture", settings)

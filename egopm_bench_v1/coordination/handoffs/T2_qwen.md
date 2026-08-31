@@ -5,6 +5,7 @@
 - 本次只实现第 05 步的离线启动修复和可恢复分片框架；没有读取 `DASHSCOPE_API_KEY`，没有调用千问，也没有写入 `cues/cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json`、任何正式 Cue 或 Seed。
 - `05_extract_cues.py` 现在将 `SOURCE_ATOMS_SUCCESS.json` 的相对 `artifact_path` 严格解释为 `egopm_bench_v1` 项目根相对路径，接受已冻结的 `source/source_video_atoms.jsonl`，拒绝绝对错误目标、`..` 越界和以 SUCCESS 所在目录猜测路径的旧行为。
 - 模型与执行参数全部从 T0 冻结的 `models.cue_extraction.execution` 读取并逐字段校验：`explicit_execute_only`、每 shard `500` 个 Atom、`max_tokens=512`、`max_retries=2`、目标 `300` RPM / `1,000,000` TPM、服务端 `response_usage` 为权威、原始响应禁止落盘，以及固定的 shard 文件后缀和数值顺序合并规则。
+- 实际执行分支在每一个 HTTP 尝试（包括重试）之前执行保守无突发节流：token 预留为该次实际序列化 UTF-8 请求字节数加 `max_tokens`，间隔取 `60/RPM` 与 `预留 token×60/TPM` 中较严格者。逐请求账本持久化单次/累计预留 token、累计实际等待秒数和尝试数；该信息不含模型正文，也不替代服务端 `response_usage` 的实际结算统计。
 - 默认启动为只读 `preflight`：验证 SUCCESS/Schema、按 `atom_id` 排序、核算 shard 与严格的请求 UTF-8 字节 token 上界，并打印报告；该路径不会读取环境变量、不会网络访问、不会创建运行目录。只有显式传入 `--execute` 才允许进入读取凭据和模型调用的分支。
 - 正式执行分片时，每个 shard 独立保存输入 Atom ID/规范行哈希清单、输出 JSONL、逐请求账本和完成标记；完成标记绑定来源哈希、输入清单 SHA256、输出 SHA256 和账本 SHA256。恢复时只跳过完全匹配当前清单与哈希的完成 shard，缺失、失败或失配 shard 会被单独重跑；合并拒绝任何未完成 shard，并按数字 shard 编号固定顺序进行。
 - 恢复完整性补丁：完成判定现在强制要求账本文件存在，且完成标记的 `ledger_sha256` 必须匹配当前账本；账本缺失或任一字节被篡改都会把 shard 重新列为待处理，不能被恢复逻辑跳过。对应合成测试覆盖这两种情况。

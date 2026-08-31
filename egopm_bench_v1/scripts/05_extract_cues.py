@@ -157,6 +157,43 @@ def response_usage(response: dict[str, Any]) -> dict[str, int | None]:
     return {key: usage.get(key) if isinstance(usage.get(key), int) and usage[key] >= 0 else None for key in ("prompt_tokens", "completion_tokens", "total_tokens")}
 
 
+class RateLimiter:
+    """按请求与保守 token 预留双门限串行发放请求，不允许启动时突发。"""
+
+    def __init__(self, rpm: int, tpm: int, clock: Callable[[], float] = time.monotonic, sleeper: Callable[[float], None] = time.sleep) -> None:
+        self.rpm, self.tpm, self.clock, self.sleeper, self.next_allowed_at = rpm, tpm, clock, sleeper, None
+
+    def minimum_interval(self, reserved_tokens: int) -> float:
+        if reserved_tokens <= 0: raise ContractError("每次请求的 token 预留必须为正数")
+        # 取较长间隔，保证任意相邻请求同时不超过 RPM 和预留 TPM，且不会积累突发额度。
+        return max(60 / self.rpm, reserved_tokens * 60 / self.tpm)
+
+    def acquire(self, reserved_tokens: int) -> float:
+        arrived = self.clock()
+        scheduled = arrived if self.next_allowed_at is None else self.next_allowed_at
+        requested_wait = max(0.0, scheduled - arrived)
+        if requested_wait:
+            self.sleeper(requested_wait)
+        departed = self.clock()
+        actual_wait = max(0.0, departed - arrived)
+        self.next_allowed_at = max(scheduled, departed) + self.minimum_interval(reserved_tokens)
+        return actual_wait
+
+
+class CallFailure(ContractError):
+    """把重试与节流元数据带回 shard 账本，同时仍不携带模型原始响应。"""
+
+    def __init__(self, message: str, retry_count: int, reserved_tokens: int, wait_seconds: float, attempts: int) -> None:
+        super().__init__(message)
+        self.retry_count, self.reserved_tokens, self.wait_seconds, self.attempts = retry_count, reserved_tokens, wait_seconds, attempts
+
+
+def reserved_tokens(payload: dict[str, Any], settings: Settings) -> int:
+    """以实际序列化请求 UTF-8 字节加输出上限预留，避免未知分词器低估节流 token。"""
+    request_bytes = len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    return request_bytes + settings.max_tokens
+
+
 def _content(response: dict[str, Any]) -> str:
     try: content = response["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError) as error: raise ContractError("响应缺少结构化 content") from error
@@ -164,23 +201,28 @@ def _content(response: dict[str, Any]) -> str:
     return content
 
 
-def call_structured_qwen(*, settings: Settings, payload: dict[str, Any], timeout_sec: float, opener: Callable[..., Any] = urlopen) -> tuple[dict[str, Any], int, dict[str, int | None]]:
+def call_structured_qwen(*, settings: Settings, payload: dict[str, Any], timeout_sec: float, limiter: RateLimiter, opener: Callable[..., Any] = urlopen) -> tuple[dict[str, Any], int, dict[str, int | None], dict[str, Any]]:
     """此函数仅由显式执行守卫调用；密钥只在这一分支由环境变量读取。"""
     key = os.environ.get(settings.credential)
     if not key: raise ContractError("未设置 DASHSCOPE_API_KEY")
-    request = Request(settings.endpoint + "/chat/completions", data=json.dumps(payload, ensure_ascii=False).encode(), headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    reservation, total_wait = len(body) + settings.max_tokens, 0.0
+    request = Request(settings.endpoint + "/chat/completions", data=body, headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, method="POST")
     last: Exception | None = None
     for retry in range(settings.max_retries + 1):
+        total_wait += limiter.acquire(reservation)
         try:
             with opener(request, timeout=timeout_sec) as handle: response = json.loads(handle.read().decode())
             value = json.loads(_content(response))
             if not isinstance(value, dict): raise ContractError("结构化结果根节点必须是 object")
-            return value, retry, response_usage(response)
+            return value, retry, response_usage(response), {"rate_limit_reserved_tokens_per_attempt": reservation, "rate_limit_reserved_tokens_total": reservation * (retry + 1), "rate_limit_wait_seconds": total_wait, "rate_limit_attempt_count": retry + 1}
+        except ContractError as error:
+            raise CallFailure(str(error), retry, reservation, total_wait, retry + 1) from error
         except (HTTPError, URLError, TimeoutError, json.JSONDecodeError) as error:
             last = error
             if retry == settings.max_retries: break
             time.sleep(min(2 ** retry, 4))
-    raise ContractError("千问调用耗尽重试次数") from last
+    raise CallFailure("千问调用耗尽重试次数", settings.max_retries, reservation, total_wait, settings.max_retries + 1) from last
 
 
 def validate_cue_semantics(atom: dict[str, Any], cue: dict[str, Any]) -> None:
@@ -264,17 +306,20 @@ def append_ledger(path: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"); handle.flush(); os.fsync(handle.fileno())
 
 
-def execute_shard(manifest: dict[str, Any], atom_map: dict[str, dict[str, Any]], run_root: Path, prompt: str, schema: dict[str, Any], validator: jsonschema.Draft202012Validator, run_id: str, settings: Settings, timeout: float) -> None:
+def execute_shard(manifest: dict[str, Any], atom_map: dict[str, dict[str, Any]], run_root: Path, prompt: str, schema: dict[str, Any], validator: jsonschema.Draft202012Validator, run_id: str, settings: Settings, timeout: float, limiter: RateLimiter) -> None:
     file_paths = paths(run_root, manifest, settings.layout); write_jsonl(file_paths["manifest"], manifest["atoms"]); cues = []
     for item in manifest["atoms"]:
-        atom = atom_map[item["atom_id"]]; event = {"event_type": "request", "run_id": run_id, "shard_id": manifest["shard_id"], "atom_id": atom["atom_id"], "requested_at": now(), "model_id": EXPECTED_MODEL_ID, "raw_response_saved": False}
+        atom = atom_map[item["atom_id"]]; payload = build_chat_request(prompt=prompt, schema=schema, atom=atom, run_id=run_id, settings=settings); reservation = reserved_tokens(payload, settings)
+        event = {"event_type": "request", "run_id": run_id, "shard_id": manifest["shard_id"], "atom_id": atom["atom_id"], "requested_at": now(), "model_id": EXPECTED_MODEL_ID, "raw_response_saved": False, "rate_limit_reserved_tokens_per_attempt": reservation, "rate_limit_reserved_tokens_total": 0, "rate_limit_wait_seconds": 0.0, "rate_limit_attempt_count": 0}
         try:
-            cue, retry, usage = call_structured_qwen(settings=settings, payload=build_chat_request(prompt=prompt, schema=schema, atom=atom, run_id=run_id, settings=settings), timeout_sec=timeout)
+            cue, retry, usage, rate_limit = call_structured_qwen(settings=settings, payload=payload, timeout_sec=timeout, limiter=limiter)
             validate_instance(validator, cue, "cue"); validate_cue_semantics(atom, cue)
-            event.update({"status": "success", "retry_count": retry, "usage": usage, "failure_category": None, "failure_summary": None})
+            event.update({"status": "success", "retry_count": retry, "usage": usage, "failure_category": None, "failure_summary": None, **rate_limit})
             if cue.get("validation_status") == "accepted": cues.append(cue)
         except Exception as error:
-            event.update({"status": "failed", "retry_count": settings.max_retries, "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "failure_category": type(error).__name__, "failure_summary": str(error)[:160].replace("\n", " ")}); append_ledger(file_paths["ledger"], event); raise
+            if isinstance(error, CallFailure):
+                event.update({"retry_count": error.retry_count, "rate_limit_reserved_tokens_per_attempt": error.reserved_tokens, "rate_limit_reserved_tokens_total": error.reserved_tokens * error.attempts, "rate_limit_wait_seconds": error.wait_seconds, "rate_limit_attempt_count": error.attempts})
+            event.update({"status": "failed", "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "failure_category": type(error).__name__, "failure_summary": str(error)[:160].replace("\n", " ")}); append_ledger(file_paths["ledger"], event); raise
         append_ledger(file_paths["ledger"], event)
     write_jsonl(file_paths["output"], cues)
     write_json(file_paths["complete"], {"run_id": run_id, "shard_id": manifest["shard_id"], "source_atoms_sha256": manifest["source_atoms_sha256"], "input_manifest_sha256": sha256_file(file_paths["manifest"]), "output_sha256": sha256_file(file_paths["output"]), "ledger_sha256": sha256_file(file_paths["ledger"]), "completed_at": now(), "raw_response_saved": False})
@@ -291,7 +336,8 @@ def run(args: argparse.Namespace) -> int:
     # 默认路径绝不可触网；仅经过预算审批的 ``--execute`` 才能走到此处读取环境变量。
     run_root = args.run_root / run_id; shard_manifests = manifests(atoms, marker["sha256"], settings.shard_size, run_id); write_json(run_root / "run_metadata.json", {**report, "mode": "execute", "started_at": now(), "raw_response_saved": False})
     atom_map = {atom["atom_id"]: atom for atom in atoms}
-    for manifest in pending_shards(shard_manifests, run_root, settings.layout): execute_shard(manifest, atom_map, run_root, prompt, schema, cue_validator, run_id, settings, args.timeout_sec)
+    limiter = RateLimiter(settings.rpm, settings.tpm)
+    for manifest in pending_shards(shard_manifests, run_root, settings.layout): execute_shard(manifest, atom_map, run_root, prompt, schema, cue_validator, run_id, settings, args.timeout_sec, limiter)
     count = merge_completed_shards(shard_manifests, run_root, settings.layout, args.output)
     write_json(args.success_marker, {"artifact_path": str(args.output.resolve()), "sha256": sha256_file(args.output), "row_count": count, "contract_version": CONTRACT_VERSION, "config_version": CONFIG_VERSION, "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION}, "generated_at": now(), "upstream_hashes": {"source_atoms": marker["sha256"]}, "run_id": run_id, "raw_response_path": None})
     return 0
