@@ -1,12 +1,12 @@
 # EgoPM-Bench v1 状态板
 
-当前合同冻结版本：**v1.0.0**（2026-08-31）
+当前治理合同冻结版本：**v1.1.0**（2026-08-31）。数据 Schema 与配置合同保持 `v1.0.0`。
 
 `DONE` 表示 T0 已审阅产物并确认通过必需验证。状态只能是 `TODO`、`IN_PROGRESS`、`BLOCKED` 或 `DONE`。
 
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| Contract v1 | T0 | DONE | v1.0.0；`487fa9a` | 无 | 允许 Wave 1 的 fixture-only 开发 |
+| 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；提交待创建 | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | TODO | — | 代码开发无阻断；正式输出前须经 T4 source QA | 实现并单测 01–04 |
 | Source QA | T4 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 | 以 synthetic fixture 实现验证器 |
 | Cue library | T2 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 + Source QA DONE | 仅实现客户端与合同 |
@@ -24,3 +24,4 @@
 - 本合同冻结数据形状、路径语义、文件所有权、SUCCESS 标记语义、来源 split 策略、模型登记表和评测协议结构。
 - 数值型记忆预算与重复提醒参数刻意保持待定。这符合研究规范，并阻断所有正式 oracle 输出。
 - 全部 Markdown 正文必须中文撰写；字段名、命令、路径和不可翻译专名除外。T0 将以此作为合并硬门禁。
+- CR-2026-001 已将 Python 中文模块说明与关键中文注释提升为治理合同 v1.1.0 的合并硬门禁；数据 Schema 与配置合同未变，故不要求重生成数据。
