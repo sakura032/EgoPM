@@ -1,6 +1,6 @@
 contract_version: v1.1.0
 config_version: v1.1.0
-registry_version: v1.0.0
+registry_version: v1.1.0
 credential_environment_variable: DASHSCOPE_API_KEY
 credential_policy: environment_only
 raw_response_policy: local_only_not_for_git
@@ -15,6 +15,45 @@ models:
     temperature: 0
     prompt_version: cue_extractor_v1
     schema: cue_candidate.schema.json
+    schema_version: v1.0.0
+    execution:
+      cue_execution_policy_version: v1.0.0
+      mode: explicit_execute_only
+      shard_size_atoms: 500
+      max_tokens: 512
+      max_retries: 2
+      rate_limit_policy:
+        target_requests_per_minute: 300
+        target_total_tokens_per_minute: 1000000
+        official_requests_per_minute: 30000
+        official_total_tokens_per_minute: 5000000
+        official_region: cn-beijing
+      token_accounting:
+        authoritative_source: response_usage
+        input_field: prompt_tokens
+        output_field: completion_tokens
+        total_field: total_tokens
+        preflight_upper_bound: serialized_utf8_request_bytes
+        raw_response_storage: forbidden
+      pricing_snapshot:
+        pricing_version: "2026-09-01_cn-beijing_list"
+        official_pricing_url: https://help.aliyun.com/zh/model-studio/model-pricing
+        input_price_cny_per_million_tokens: 0.2
+        output_price_cny_per_million_tokens: 0.8
+        price_region: cn-beijing
+        input_context_window_tokens: 32000
+        retry_attempts_billed_independently: true
+      shard_layout:
+        root: cues/shards
+        input_manifest_suffix: .input.jsonl
+        output_suffix: .output.jsonl
+        ledger_suffix: .ledger.jsonl
+        completion_suffix: .complete.json
+        merge_order: numeric_shard_index_ascending
+      recovery:
+        require_matching_source_hash: true
+        rerun_only_incomplete_or_failed_shards: true
+        completion_marker_requires_sha256: true
   seed_generation:
     model_id: qwen3.7-plus-2026-05-26
     thinking_enabled: true
