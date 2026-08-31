@@ -7,6 +7,7 @@
 - 模型与执行参数全部从 T0 冻结的 `models.cue_extraction.execution` 读取并逐字段校验：`explicit_execute_only`、每 shard `500` 个 Atom、`max_tokens=512`、`max_retries=2`、目标 `300` RPM / `1,000,000` TPM、服务端 `response_usage` 为权威、原始响应禁止落盘，以及固定的 shard 文件后缀和数值顺序合并规则。
 - 默认启动为只读 `preflight`：验证 SUCCESS/Schema、按 `atom_id` 排序、核算 shard 与严格的请求 UTF-8 字节 token 上界，并打印报告；该路径不会读取环境变量、不会网络访问、不会创建运行目录。只有显式传入 `--execute` 才允许进入读取凭据和模型调用的分支。
 - 正式执行分片时，每个 shard 独立保存输入 Atom ID/规范行哈希清单、输出 JSONL、逐请求账本和完成标记；完成标记绑定来源哈希、输入清单 SHA256、输出 SHA256 和账本 SHA256。恢复时只跳过完全匹配当前清单与哈希的完成 shard，缺失、失败或失配 shard 会被单独重跑；合并拒绝任何未完成 shard，并按数字 shard 编号固定顺序进行。
+- 恢复完整性补丁：完成判定现在强制要求账本文件存在，且完成标记的 `ledger_sha256` 必须匹配当前账本；账本缺失或任一字节被篡改都会把 shard 重新列为待处理，不能被恢复逻辑跳过。对应合成测试覆盖这两种情况。
 - 账本逐请求记录 `usage.prompt_tokens`、`usage.completion_tokens`、`usage.total_tokens`、重试次数、失败类别/截断摘要、模型和 Atom 身份；缺少服务端 usage 显式写为 `null`。账本不写 `choices`、模型正文或原始 HTTP 响应。
 - 新增无 API 合成测试覆盖：项目内相对路径与越界拒绝、固定请求参数、服务端 usage 选择、确定性分片覆盖及顺序、完成 shard 跳过、未完成 shard 拒绝合并、账本无正文、预检只读和冻结执行配置读取。所有测试文件均在 `pytest` 临时目录，不会写正式输出。
 

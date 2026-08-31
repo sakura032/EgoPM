@@ -223,13 +223,14 @@ def paths(run_root: Path, manifest: dict[str, Any], layout: dict[str, str]) -> d
 
 
 def _complete(manifest: dict[str, Any], file_paths: dict[str, Path]) -> bool:
-    if not all(file_paths[key].is_file() for key in ("manifest", "output", "complete")): return False
+    # ledger 与候选输出同属可消费边界；缺失或篡改账本时必须重跑，不能静默跳过 shard。
+    if not all(file_paths[key].is_file() for key in ("manifest", "output", "ledger", "complete")): return False
     try:
         marker = read_json(file_paths["complete"])
         # 标记自己的哈希不足以说明它属于当前输入；必须逐项匹配重新构造的固定清单。
         if read_jsonl(file_paths["manifest"]) != manifest["atoms"]: return False
     except ContractError: return False
-    return marker.get("source_atoms_sha256") == manifest["source_atoms_sha256"] and marker.get("input_manifest_sha256") == sha256_file(file_paths["manifest"]) and marker.get("output_sha256") == sha256_file(file_paths["output"]) and marker.get("shard_id") == manifest["shard_id"]
+    return marker.get("source_atoms_sha256") == manifest["source_atoms_sha256"] and marker.get("input_manifest_sha256") == sha256_file(file_paths["manifest"]) and marker.get("output_sha256") == sha256_file(file_paths["output"]) and marker.get("ledger_sha256") == sha256_file(file_paths["ledger"]) and marker.get("shard_id") == manifest["shard_id"]
 
 
 def pending_shards(shard_manifests: list[dict[str, Any]], run_root: Path, layout: dict[str, str]) -> list[dict[str, Any]]:

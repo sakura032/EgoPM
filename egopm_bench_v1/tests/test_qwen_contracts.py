@@ -203,6 +203,7 @@ def mark_complete(script: ModuleType, manifest: dict[str, Any], run_root: Path, 
     file_paths = script.paths(run_root, manifest, settings.layout)
     script.write_jsonl(file_paths["manifest"], manifest["atoms"])
     script.write_jsonl(file_paths["output"], [])
+    script.write_jsonl(file_paths["ledger"], [{"status": "success", "raw_response_saved": False}])
     script.write_json(
         file_paths["complete"],
         {
@@ -210,6 +211,7 @@ def mark_complete(script: ModuleType, manifest: dict[str, Any], run_root: Path, 
             "source_atoms_sha256": manifest["source_atoms_sha256"],
             "input_manifest_sha256": script.sha256_file(file_paths["manifest"]),
             "output_sha256": script.sha256_file(file_paths["output"]),
+            "ledger_sha256": script.sha256_file(file_paths["ledger"]),
         },
     )
 
@@ -277,6 +279,22 @@ def test_shards_are_ordered_resumable_and_incomplete_merge_is_rejected(tmp_path:
     mark_complete(script, manifests[1], run_root, settings)
     assert script.pending_shards(manifests, run_root, settings.layout) == []
     assert script.merge_completed_shards(manifests, run_root, settings.layout, tmp_path / "merged.jsonl") == 0
+
+
+def test_missing_or_tampered_ledger_makes_completed_shard_pending(tmp_path: Path) -> None:
+    script = load_script("05_extract_cues.py")
+    settings = shard_settings(script)
+    manifest = script.manifests([source_atom(1, "one starts cooking")], "source-hash", settings.shard_size, "run_fixture")[0]
+    run_root = tmp_path / "run_fixture"
+    mark_complete(script, manifest, run_root, settings)
+    file_paths = script.paths(run_root, manifest, settings.layout)
+    assert script.pending_shards([manifest], run_root, settings.layout) == []
+    file_paths["ledger"].unlink()
+    assert script.pending_shards([manifest], run_root, settings.layout) == [manifest]
+    mark_complete(script, manifest, run_root, settings)
+    with file_paths["ledger"].open("a", encoding="utf-8") as handle:
+        handle.write('{"status":"tampered"}\n')
+    assert script.pending_shards([manifest], run_root, settings.layout) == [manifest]
 
 
 def test_ledger_excludes_raw_response_and_preflight_is_read_only(tmp_path: Path) -> None:
