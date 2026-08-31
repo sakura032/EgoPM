@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | 已冻结 Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`CR-2026-007` 已接受五条自适应包的无 API 实施准备 | v2 配置/代码/QA 尚未完成，且仍等待用户确认预算、执行范围和分批方案 | T0 先冻结 v2 执行字段，再由 T2/T4 完成无 API 实现与审阅；确认后方可显式执行 |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`CR-2026-007` v2 无 API 实施完成；只读预检为 74160 package / 742 shard | 已完成代码、QA 与预检；仍等待用户确认预算、执行范围、时间窗和失败 package 重跑范围 | 仅在明确授权后由 T2 传入 `--execute`；随后 T4 独立 Cue QA |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
@@ -31,6 +31,8 @@
 - 本次合同升级后以 synthetic fixture 执行 `python -m pytest -q --basetemp .pytest_cache/contract-v11`，结果为 `27 passed in 0.81s`；`git diff --check` 通过。未运行正式 01–04，未调用千问，未生成 Life Log。
 - T1 已在主项目 `main` 正式运行 01–04，仅读取 808 个 EgoLife SRT（Transcript 402、Dense Caption 406），未读取、下载、复制、拼接或处理 MP4。正式 Source 产物提交为 `ada03ec`；近重复精确索引修复为 `f730cdf`。最终原子为 370799 行，冻结 SHA256 为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`。
 - T4 已以 `4c81eec` 将 Source QA 对齐 v1.1 的 Dense Caption 主时间窗口与全 session 精确近重复规则，并在 `7ea18b8` 写入新的只读审计。T0 已独立复算 SUCCESS 原子哈希与行数，结果一致；Source blocker 为 0，`answer_leakage_count` 与 `split_leakage_count` 均为 0。审计中的 5 个 blocker 都仅表示 Cue、candidate、frozen、lifelog、decisions 尚未生成，不归责 Source。
-- T0 已审阅并合并第 05 步无 API 启动修复：T4 的阶段化 Schema 版本校验为 `d2a1c67`；T2 的项目根相对路径、确定性 shard、无正文账本与显式执行守卫为 `310195f`，账本 SHA 恢复门为 `9d44f46`，RPM/TPM 无突发限流为 `a437c02`。文件均在各自所有权范围内；无 API 回归共 `39 passed`，未调用千问、未读取密钥、未写 Cue library 或 SUCCESS。
-- Cue 执行配置已冻结：每 shard `500` Atom，`max_tokens=512`，最多重试 `2` 次，目标为 `300 RPM` 与 `1000000 TPM`，并且仅记录服务端 `response_usage`；禁止保存原始模型响应。`2026-09-01` 无 API 预检实际读取已冻结的 370799 Atom，得到 `742` 个 shard（末 shard `299`），序列化输入字节上界 `1779240532`、输出 token 上界 `189849088`、总上界 `1969089620`，估计最短时长 `1969.08962` 分钟。按冻结的北京 `<=32K` 价格快照，基准单次尝试费用上界为 `¥507.7273768`，每条均耗尽两次重试的保守上界为 `¥1523.1821304`。Cue 门保持 `BLOCKED`，直至用户明确确认预算、执行范围与分批方案。
-- `CR-2026-007` 已接受第 05 步 v2 的无 API 实施准备，并将“最多 5 条 Atom 自适应 package、程序回填受控字段、逐 package 恢复”写入 `CHANGE_REQUESTS.md`。该变更不修改最终 Cue Schema 或 Source 覆盖；当前仅开始 T0/T2/T4 的实现与测试准备，尚未冻结 v2 运行配置，更未授权任何模型调用或 Cue 正式产物。
+- 第 05 步最初的单 Atom v1 无 API 启动修复及其 `39 passed` 回归保留为成本对照历史；它不再是允许生产的请求协议。T4 的阶段化 Schema 版本校验为 `d2a1c67`；最初的 T2 显式执行守卫与恢复基础为 `310195f`、`9d44f46`、`a437c02`。全过程未调用千问、未读取密钥、未写 Cue library 或 SUCCESS。
+- 当前唯一允许的 Cue 执行配置为 v2：每逻辑 shard `500` Atom，每 package 最多 `5` 条且 `max_tokens=128 × package Atom 数`，最多重试 `2` 次，目标为 `300 RPM` 与 `1000000 TPM`；逐请求只记录服务端 `response_usage` 与无正文账本，禁止保存原始模型响应。
+- `CR-2026-007` 的 v2 无 API 实施已由 T0 审阅完成：T0 协议冻结为 `4f9b990`、`673ebf2`、`88efa16`；T2 执行器/账本/恢复与路径门为 `6628eb0`、`22862d3`；T4 阶段 Schema 与完整协议血缘 QA 为 `da38f78`、`d67aab7`。T2/T4 交接整理分别为 `2a4f4e9`、`b3e8716`。全仓无 API 测试由 T0 复跑为 `41 passed in 1.34s`，且 `git diff --check` 通过。
+- T0 于 `2026-09-01` 对冻结的 370799 条 Source Atom 实际运行默认只读 v2 预检：74160 个 package、742 个逻辑 shard、最大请求 12202 UTF-8 字节、输入上界 311023165 UTF-8 字节、输出上界 47462272 token；未读密钥、未联网、未写正式 Cue/SUCCESS。按冻结价格的单次保守上界为 `¥100.1744506`，三次尝试全耗尽为 `¥300.5233518`；以 `1000000 TPM` 的保守预留口径，时长下界为约 5.98 小时（RPM 下界为 4.12 小时）。
+- Cue 门仍为 `BLOCKED`，唯一阻断是用户尚未明确确认总预算、执行范围、运行时间窗和失败 package 重跑范围。确认前不得使用 `--execute`、调用千问、写 `cues/cue_library.jsonl` 或 `cues/CUE_LIBRARY_SUCCESS.json`，也不得启动 Seed 或 Life Log。
