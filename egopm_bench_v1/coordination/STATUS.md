@@ -6,7 +6,7 @@
 
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；提交待创建 | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
+| 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | TODO | — | 代码开发无阻断；正式输出前须经 T4 source QA | 实现并单测 01–04 |
 | Source QA | T4 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 | 以 synthetic fixture 实现验证器 |
 | Cue library | T2 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 + Source QA DONE | 仅实现客户端与合同 |
