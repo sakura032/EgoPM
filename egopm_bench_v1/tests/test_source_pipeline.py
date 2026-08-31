@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import sys
+from itertools import combinations
 from pathlib import Path
 from types import ModuleType
 
@@ -243,3 +244,75 @@ def test_alignment_rejects_negative_frozen_tolerance(tmp_path: Path) -> None:
     config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
     with pytest.raises(ValueError, match="必须为非负数"):
         aligner.run(config_path)
+
+
+def test_indexed_near_duplicate_pairs_equal_naive_reference() -> None:
+    """精确索引必须与同人同日跨 session 的朴素 Jaccard 全对参考完全等价。"""
+
+    splitter = _load_script("04_make_source_splits")
+    atoms = [
+        {
+            "atom_id": "a_same_session",
+            "participant_source_id": "P01",
+            "source_day": "DAY1",
+            "session_id": "session_a",
+            "visible_text": "the person opens the kitchen cabinet and puts the blue cup on the table",
+        },
+        {
+            "atom_id": "b_exact_cross_session",
+            "participant_source_id": "P01",
+            "source_day": "DAY1",
+            "session_id": "session_b",
+            "visible_text": "the person opens the kitchen cabinet and puts the blue cup on the table",
+        },
+        {
+            "atom_id": "c_near_cross_session",
+            "participant_source_id": "P01",
+            "source_day": "DAY1",
+            "session_id": "session_c",
+            "visible_text": "the person opens the kitchen cabinet and puts the blue cup on a table",
+        },
+        {
+            "atom_id": "d_different_cross_session",
+            "participant_source_id": "P01",
+            "source_day": "DAY1",
+            "session_id": "session_d",
+            "visible_text": "the person leaves the building and walks toward the bus stop",
+        },
+        {
+            "atom_id": "e_other_participant",
+            "participant_source_id": "P02",
+            "source_day": "DAY1",
+            "session_id": "session_e",
+            "visible_text": "the person opens the kitchen cabinet and puts the blue cup on the table",
+        },
+        {
+            "atom_id": "f_other_day",
+            "participant_source_id": "P01",
+            "source_day": "DAY2",
+            "session_id": "session_f",
+            "visible_text": "the person opens the kitchen cabinet and puts the blue cup on the table",
+        },
+        {
+            "atom_id": "g_empty_text",
+            "participant_source_id": "P01",
+            "source_day": "DAY1",
+            "session_id": "session_g",
+            "visible_text": "",
+        },
+    ]
+    threshold = 0.92
+    expected: set[tuple[str, str]] = set()
+    for left_session, right_session in splitter._same_person_day_cross_session_pairs(atoms):
+        for left_atom, right_atom in ((left, right) for left in left_session for right in right_session):
+            left_grams = splitter._char_3grams(left_atom["visible_text"])
+            right_grams = splitter._char_3grams(right_atom["visible_text"])
+            if not left_grams or not right_grams:
+                continue
+            if min(len(left_grams), len(right_grams)) / max(len(left_grams), len(right_grams)) < threshold:
+                continue
+            if splitter._jaccard(left_grams, right_grams) >= threshold:
+                expected.add(tuple(sorted((left_atom["atom_id"], right_atom["atom_id"]))))
+
+    observed = {tuple(sorted(pair)) for pair in splitter._indexed_near_duplicate_pairs(atoms, threshold)}
+    assert observed == expected

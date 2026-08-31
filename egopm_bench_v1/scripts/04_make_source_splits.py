@@ -114,7 +114,7 @@ def _same_person_day_cross_session_pairs(atoms: list[dict[str, Any]]) -> Iterabl
     """比较同一人同一天的所有不同 session 对，不虚构跨 SRT 的时间顺序。"""
 
     # normalized 时间只在单个 session 内有意义；若按它排序会把不同 SRT 的相对零点误判为现实先后。
-    # 因此 v1 穷举同一人同一天的不同 session 对，宁可增加确定性比较，也不使用不可表达的 max_gap。
+    # 此迭代器保留给单元测试中的朴素参考实现使用；正式路径必须走下方精确索引，避免大语料笛卡尔枚举。
     by_person_day: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for atom in atoms:
         by_person_day[(atom["participant_source_id"], atom["source_day"])][atom["session_id"]].append(atom)
@@ -124,6 +124,50 @@ def _same_person_day_cross_session_pairs(atoms: list[dict[str, Any]]) -> Iterabl
             yield sessions[left_id], sessions[right_id]
 
 
+def _indexed_near_duplicate_pairs(atoms: list[dict[str, Any]], threshold: float) -> Iterable[tuple[str, str]]:
+    """精确找出跨 session、同一人同一天且达到 Jaccard 阈值的原子对。"""
+
+    # 先用全体三元 gram 的稳定频率排序定义前缀。若两集合的 Jaccard 不低于阈值，
+    # 它们必在各自长度推导的前缀中至少共享一个 gram；因此前缀倒排只排除不可能的对，
+    # 不是近似检索、降采样或改变比较范围。
+    gram_cache = {atom["atom_id"]: _char_3grams(atom["visible_text"]) for atom in atoms}
+    gram_frequency = Counter(gram for grams in gram_cache.values() for gram in grams)
+    by_person_day: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for atom in atoms:
+        by_person_day[(atom["participant_source_id"], atom["source_day"])].append(atom)
+
+    for key in sorted(by_person_day):
+        prefix_index: dict[str, list[str]] = defaultdict(list)
+        group_atoms = sorted(by_person_day[key], key=lambda atom: atom["atom_id"])
+        group_atoms_by_id = {atom["atom_id"]: atom for atom in group_atoms}
+        for atom in group_atoms:
+            atom_id = atom["atom_id"]
+            grams = gram_cache[atom_id]
+            if not grams:
+                continue
+            required_overlap = math.ceil(threshold * len(grams))
+            prefix_size = len(grams) - required_overlap + 1
+            prefix = sorted(grams, key=lambda gram: (gram_frequency[gram], gram))[:prefix_size]
+            candidate_ids = {
+                candidate_id
+                for gram in prefix
+                for candidate_id in prefix_index[gram]
+                if candidate_id != atom_id
+            }
+            for candidate_id in sorted(candidate_ids):
+                candidate = group_atoms_by_id[candidate_id]
+                # 同 session 的关系已是硬分组；近重复规则只比较不同 session，避免更改既有关系的含义。
+                if candidate["session_id"] == atom["session_id"]:
+                    continue
+                candidate_grams = gram_cache[candidate_id]
+                if min(len(grams), len(candidate_grams)) / max(len(grams), len(candidate_grams)) < threshold:
+                    continue
+                if _jaccard(grams, candidate_grams) >= threshold:
+                    yield candidate_id, atom_id
+            for gram in prefix:
+                prefix_index[gram].append(atom_id)
+
+
 def _source_components(atoms: list[dict[str, Any]], split_policy: dict[str, Any]) -> tuple[dict[str, list[str]], int]:
     atom_ids = [atom["atom_id"] for atom in atoms]
     if len(atom_ids) != len(set(atom_ids)):
@@ -131,7 +175,6 @@ def _source_components(atoms: list[dict[str, Any]], split_policy: dict[str, Any]
     disjoint_set = _DisjointSet(atom_ids)
     by_session: dict[str, list[str]] = defaultdict(list)
     by_world_event: dict[str, list[str]] = defaultdict(list)
-    by_id = {atom["atom_id"]: atom for atom in atoms}
     for atom in atoms:
         by_session[atom["session_id"]].append(atom["atom_id"])
         if atom["world_event_id"] is not None:
@@ -145,21 +188,10 @@ def _source_components(atoms: list[dict[str, Any]], split_policy: dict[str, Any]
     near_duplicate = split_policy["grouping"]["near_duplicate"]
     if near_duplicate["enabled"]:
         threshold = float(near_duplicate["similarity_threshold"])
-        gram_cache = {atom_id: _char_3grams(atom["visible_text"]) for atom_id, atom in by_id.items()}
-        for left_session, right_session in _same_person_day_cross_session_pairs(atoms):
-            for left_atom in left_session:
-                left_grams = gram_cache[left_atom["atom_id"]]
-                for right_atom in right_session:
-                    right_grams = gram_cache[right_atom["atom_id"]]
-                    # Jaccard 不可能超过短集合与长集合的大小比，可避免大量无意义比较。
-                    if not left_grams or not right_grams:
-                        continue
-                    if min(len(left_grams), len(right_grams)) / max(len(left_grams), len(right_grams)) < threshold:
-                        continue
-                    if _jaccard(left_grams, right_grams) >= threshold:
-                        # 仅达到冻结阈值的近重复才合并，不能用模型或人工“感觉相似”替代确定性规则。
-                        if disjoint_set.union(left_atom["atom_id"], right_atom["atom_id"]):
-                            duplicate_links += 1
+        for left_atom_id, right_atom_id in _indexed_near_duplicate_pairs(atoms, threshold):
+            # 索引候选仍以完整 char_3gram Jaccard 复核；只有达到冻结阈值才可形成防泄漏连通边。
+            if disjoint_set.union(left_atom_id, right_atom_id):
+                duplicate_links += 1
 
     components: dict[str, list[str]] = defaultdict(list)
     for atom_id in atom_ids:
@@ -247,8 +279,11 @@ def _validate_final_atoms(
     if errors:
         # 在任何文件替换前阻断 Schema 失败，确保不会以无效正式原子覆盖上一份可读产物。
         raise ValueError("Source Atom Schema 验证失败：" + "; ".join(errors))
+    atoms_by_id = {atom["atom_id"]: atom for atom in atoms}
     for component_id, members in components.items():
-        split_values = {next(atom["split"] for atom in atoms if atom["atom_id"] == member) for member in members}
+        # 生产语料可包含数十万原子；按成员逐次扫描完整 atoms 会使验证退化为二次复杂度，
+        # 并延迟 SUCCESS 发布。先按稳定 atom_id 建索引，才能在不改变连通分量约束的前提下线性核验。
+        split_values = {atoms_by_id[member]["split"] for member in members}
         if split_values != {assignments[component_id]}:
             raise AssertionError(f"来源连通分量 {component_id} 跨 split")
 
