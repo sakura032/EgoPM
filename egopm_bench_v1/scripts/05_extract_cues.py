@@ -39,6 +39,7 @@ class Settings:
     """从冻结登记读取的模型、限额和 shard 版式；禁止用隐式默认值替代。"""
     endpoint: str; credential: str; region: str; max_tokens: int; max_retries: int
     shard_size: int; rpm: int; tpm: int; layout: dict[str, str]
+    pricing_version: str; pricing_url: str; input_price_per_million: float; output_price_per_million: float; pricing_context_tokens: int
 
 
 def now() -> str:
@@ -118,15 +119,17 @@ def load_runtime_settings(path: Path) -> Settings:
     if registry.get("contract_version") != CONTRACT_VERSION or registry.get("config_version") != CONFIG_VERSION: raise ContractError("model_registry 版本不兼容")
     if cue.get("model_id") != EXPECTED_MODEL_ID or cue.get("prompt_version") != PROMPT_VERSION or cue.get("thinking_enabled") is not False or cue.get("temperature") != 0 or cue.get("schema_version") != CUE_SCHEMA_VERSION: raise ContractError("Cue 模型或请求参数未按冻结值设置")
     if not isinstance(execution, dict) or execution.get("cue_execution_policy_version") != "v1.0.0" or execution.get("mode") != "explicit_execute_only": raise ContractError("cue_extraction.execution 未按冻结策略设置")
-    limit, accounting, layout, recovery = execution.get("rate_limit_policy"), execution.get("token_accounting"), execution.get("shard_layout"), execution.get("recovery")
-    if not all(isinstance(v, dict) for v in (limit, accounting, layout, recovery)): raise ContractError("execution 缺少限速、计量、布局或恢复配置")
+    limit, accounting, pricing, layout, recovery = execution.get("rate_limit_policy"), execution.get("token_accounting"), execution.get("pricing_snapshot"), execution.get("shard_layout"), execution.get("recovery")
+    if not all(isinstance(v, dict) for v in (limit, accounting, pricing, layout, recovery)): raise ContractError("execution 缺少限速、计量、价格、布局或恢复配置")
     if accounting != {"authoritative_source": "response_usage", "input_field": "prompt_tokens", "output_field": "completion_tokens", "total_field": "total_tokens", "preflight_upper_bound": "serialized_utf8_request_bytes", "raw_response_storage": "forbidden"}: raise ContractError("token_accounting 未冻结为服务端 usage 且禁止原始响应")
     expected_layout = {"root": "cues/shards", "input_manifest_suffix": ".input.jsonl", "output_suffix": ".output.jsonl", "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json", "merge_order": "numeric_shard_index_ascending"}
     if layout != expected_layout or recovery != {"require_matching_source_hash": True, "rerun_only_incomplete_or_failed_shards": True, "completion_marker_requires_sha256": True}: raise ContractError("shard 布局或恢复策略未按冻结值设置")
+    expected_pricing = {"pricing_version": "2026-09-01_cn-beijing_list", "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing", "input_price_cny_per_million_tokens": 0.2, "output_price_cny_per_million_tokens": 0.8, "price_region": "cn-beijing", "input_context_window_tokens": 32000, "retry_attempts_billed_independently": True}
+    if pricing != expected_pricing: raise ContractError("pricing_snapshot 未按冻结的北京不超过 32K 价格快照设置")
     if registry.get("credential_environment_variable") != "DASHSCOPE_API_KEY" or registry.get("credential_policy") != "environment_only": raise ContractError("凭据策略不兼容")
     endpoint, region = registry.get("default_endpoint"), registry.get("default_region")
     if not isinstance(endpoint, str) or not endpoint.startswith("https://") or not isinstance(region, str) or not region: raise ContractError("endpoint 或 region 无效")
-    return Settings(endpoint.rstrip("/"), "DASHSCOPE_API_KEY", region, _positive(execution.get("max_tokens"), "max_tokens"), _positive(execution.get("max_retries", 0) + 1, "max_retries+1") - 1, _positive(execution.get("shard_size_atoms"), "shard_size_atoms"), _positive(limit.get("target_requests_per_minute"), "target_requests_per_minute"), _positive(limit.get("target_total_tokens_per_minute"), "target_total_tokens_per_minute"), expected_layout)
+    return Settings(endpoint.rstrip("/"), "DASHSCOPE_API_KEY", region, _positive(execution.get("max_tokens"), "max_tokens"), _positive(execution.get("max_retries", 0) + 1, "max_retries+1") - 1, _positive(execution.get("shard_size_atoms"), "shard_size_atoms"), _positive(limit.get("target_requests_per_minute"), "target_requests_per_minute"), _positive(limit.get("target_total_tokens_per_minute"), "target_total_tokens_per_minute"), expected_layout, expected_pricing["pricing_version"], expected_pricing["official_pricing_url"], expected_pricing["input_price_cny_per_million_tokens"], expected_pricing["output_price_cny_per_million_tokens"], expected_pricing["input_context_window_tokens"])
 
 
 def load_validator(path: Path) -> jsonschema.Draft202012Validator:
@@ -291,7 +294,14 @@ def merge_completed_shards(shard_manifests: list[dict[str, Any]], run_root: Path
 def token_bounds(atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any], run_id: str, settings: Settings) -> dict[str, Any]:
     sizes = [len(json.dumps(build_chat_request(prompt=prompt, schema=schema, atom=row, run_id=run_id, settings=settings), ensure_ascii=False, separators=(",", ":")).encode()) for row in atoms]
     count, input_upper, output_upper = len(atoms), sum(sizes), len(atoms) * settings.max_tokens
-    return {"authoritative_at_runtime": "response_usage.prompt_tokens/completion_tokens/total_tokens", "preflight_upper_bound": "serialized_utf8_request_bytes", "input_tokens_lower_bound": count, "input_tokens_upper_bound": input_upper, "output_tokens_lower_bound": 0, "output_tokens_upper_bound": output_upper, "total_tokens_upper_bound": input_upper + output_upper, "max_request_utf8_bytes": max(sizes, default=0), "estimated_minimum_minutes_at_target_limits": max(count / settings.rpm, (input_upper + output_upper) / settings.tpm) if count else 0}
+    max_request = max(sizes, default=0)
+    # UTF-8 字节数是请求 token 数的保守上界；若它超过已冻结的 32K 价格窗口则不能声称该价格适用。
+    if max_request > settings.pricing_context_tokens: raise ContractError("单请求 UTF-8 token 上界超过冻结价格快照的 32K 输入窗口")
+    def cost(attempts: int) -> dict[str, float | int]:
+        input_cny = input_upper * attempts / 1_000_000 * settings.input_price_per_million
+        output_cny = output_upper * attempts / 1_000_000 * settings.output_price_per_million
+        return {"attempt_count": attempts, "input_tokens_upper_bound": input_upper * attempts, "output_tokens_upper_bound": output_upper * attempts, "input_cny_upper_bound": input_cny, "output_cny_upper_bound": output_cny, "total_cny_upper_bound": input_cny + output_cny}
+    return {"authoritative_at_runtime": "response_usage.prompt_tokens/completion_tokens/total_tokens", "preflight_upper_bound": "serialized_utf8_request_bytes", "input_tokens_lower_bound": count, "input_tokens_upper_bound": input_upper, "output_tokens_lower_bound": 0, "output_tokens_upper_bound": output_upper, "total_tokens_upper_bound": input_upper + output_upper, "max_request_utf8_bytes": max_request, "estimated_minimum_minutes_at_target_limits": max(count / settings.rpm, (input_upper + output_upper) / settings.tpm) if count else 0, "pricing_snapshot": {"pricing_version": settings.pricing_version, "official_pricing_url": settings.pricing_url, "price_region": "cn-beijing", "input_context_window_tokens": settings.pricing_context_tokens, "input_price_cny_per_million_tokens": settings.input_price_per_million, "output_price_cny_per_million_tokens": settings.output_price_per_million, "retry_attempts_billed_independently": True}, "cny_upper_bounds": {"baseline_one_attempt_per_atom": cost(1), "conservative_all_atoms_exhaust_max_retries": cost(settings.max_retries + 1)}}
 
 
 def preflight(atoms: list[dict[str, Any]], marker: dict[str, Any], prompt: str, schema: dict[str, Any], run_id: str, settings: Settings) -> dict[str, Any]:

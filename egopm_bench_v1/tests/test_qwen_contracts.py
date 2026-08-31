@@ -172,7 +172,7 @@ def test_cue_request_uses_fixed_model_and_strict_schema() -> None:
     settings = script.Settings("https://example.invalid/v1", "DASHSCOPE_API_KEY", "cn-beijing", 512, 2, 500, 300, 1_000_000, {
         "root": "cues/shards", "input_manifest_suffix": ".input.jsonl", "output_suffix": ".output.jsonl",
         "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json", "merge_order": "numeric_shard_index_ascending",
-    })
+    }, "2026-09-01_cn-beijing_list", "https://help.aliyun.com/zh/model-studio/model-pricing", 0.2, 0.8, 32000)
     request = script.build_chat_request(
         prompt="synthetic unit-test prompt", schema=schema, atom=atom, run_id="run_cue_fixture", settings=settings
     )
@@ -195,7 +195,7 @@ def shard_settings(script: ModuleType) -> Any:
             "ledger_suffix": ".ledger.jsonl",
             "completion_suffix": ".complete.json",
             "merge_order": "numeric_shard_index_ascending",
-        },
+        }, "2026-09-01_cn-beijing_list", "https://help.aliyun.com/zh/model-studio/model-pricing", 0.2, 0.8, 32000,
     )
 
 
@@ -341,6 +341,34 @@ def test_frozen_execution_configuration_is_loaded() -> None:
     script = load_script("05_extract_cues.py")
     settings = script.load_runtime_settings(ROOT / "config" / "model_registry.yaml")
     assert (settings.shard_size, settings.max_tokens, settings.max_retries, settings.rpm, settings.tpm) == (500, 512, 2, 300, 1_000_000)
+
+
+def test_pricing_snapshot_drift_is_rejected(tmp_path: Path) -> None:
+    script = load_script("05_extract_cues.py")
+    registry = (ROOT / "config" / "model_registry.yaml").read_text(encoding="utf-8")
+    changed = registry.replace("input_price_cny_per_million_tokens: 0.2", "input_price_cny_per_million_tokens: 0.3")
+    assert changed != registry
+    altered = tmp_path / "model_registry.yaml"
+    altered.write_text(changed, encoding="utf-8")
+    with pytest.raises(script.ContractError, match="pricing_snapshot"):
+        script.load_runtime_settings(altered)
+
+
+def test_preflight_cost_bounds_include_one_attempt_and_exhausted_retries() -> None:
+    script = load_script("05_extract_cues.py")
+    settings = shard_settings(script)
+    atom = source_atom(1, "A person starts cooking in a kitchen.")
+    schema = json.loads((ROOT / "schemas" / "cue_candidate.schema.json").read_text(encoding="utf-8"))
+    bounds = script.token_bounds([atom], "synthetic prompt", schema, "run_fixture", settings)
+    baseline = bounds["cny_upper_bounds"]["baseline_one_attempt_per_atom"]
+    exhausted = bounds["cny_upper_bounds"]["conservative_all_atoms_exhaust_max_retries"]
+    assert baseline["attempt_count"] == 1
+    assert exhausted["attempt_count"] == 3
+    assert exhausted["input_tokens_upper_bound"] == baseline["input_tokens_upper_bound"] * 3
+    assert exhausted["output_tokens_upper_bound"] == baseline["output_tokens_upper_bound"] * 3
+    assert exhausted["total_cny_upper_bound"] == pytest.approx(baseline["total_cny_upper_bound"] * 3)
+    assert bounds["pricing_snapshot"]["input_price_cny_per_million_tokens"] == 0.2
+    assert bounds["pricing_snapshot"]["output_price_cny_per_million_tokens"] == 0.8
 
 
 def test_retrieval_returns_two_distinct_same_split_lures() -> None:
