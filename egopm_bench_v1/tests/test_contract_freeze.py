@@ -129,6 +129,7 @@ def test_cue_execution_policy_freezes_no_api_recovery_contract() -> None:
         "rerun_only_incomplete_or_failed_packages": True,
         "completion_marker_requires_sha256": True,
     }
+    assert {"cue_execution_policy_version", "cue_execution_protocol_sha256", "cue_prompt_sha256", "cue_inference_schema_sha256", "source_atoms_sha256", "package_maximum_atoms", "package_maximum_request_utf8_bytes", "output_tokens_per_atom", "package_count", "usage_summary"}.issubset(registry["run_manifest_required_fields"])
 
 
 def test_cue_inference_schema_excludes_program_controlled_fields() -> None:
