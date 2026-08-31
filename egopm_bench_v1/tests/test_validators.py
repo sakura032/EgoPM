@@ -52,9 +52,9 @@ def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
         "artifact_path": "source/source_video_atoms.jsonl",
         "sha256": qa.sha256_file(artifact),
         "row_count": 1,
-        "contract_version": "v1.0.0",
-        "config_version": "v1.0.0",
-        "schema_versions": {"source_video_atom": "v1.0.0"},
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {"source_video_atom": "v1.1.0"},
         "generated_at": "2026-08-31T00:00:00+00:00",
         "upstream_hashes": {},
     }

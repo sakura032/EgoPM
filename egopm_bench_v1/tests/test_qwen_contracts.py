@@ -140,9 +140,9 @@ def write_success(path: Path, artifact: Path) -> None:
                 "artifact_path": str(artifact.resolve()),
                 "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
                 "row_count": len(artifact.read_text(encoding="utf-8").splitlines()),
-                "contract_version": "v1.0.0",
-                "config_version": "v1.0.0",
-                "schema_versions": {"fixture": "v1.0.0"},
+                "contract_version": "v1.1.0",
+                "config_version": "v1.1.0",
+                "schema_versions": {"fixture": "v1.1.0"},
                 "generated_at": "2026-08-31T00:00:00Z",
                 "upstream_hashes": {},
             }
@@ -221,10 +221,10 @@ def test_success_marker_hash_gate_rejects_tampered_fixture(tmp_path: Path) -> No
     write_jsonl(artifact, [source_atom(1, "A person starts cooking in a kitchen.")])
     marker = tmp_path / "SOURCE_ATOMS_SUCCESS.json"
     write_success(marker, artifact)
-    script.require_verified_success(artifact, marker, "v1.0.0")
+    script.require_verified_success(artifact, marker, "v1.1.0")
     artifact.write_text("{}\n", encoding="utf-8")
     with pytest.raises(script.ContractError, match="SHA256"):
-        script.require_verified_success(artifact, marker, "v1.0.0")
+        script.require_verified_success(artifact, marker, "v1.1.0")
 
 
 def test_retrieval_returns_two_distinct_same_split_lures() -> None:

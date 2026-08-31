@@ -1,7 +1,7 @@
 """Source 流水线第 03 步：按时间窗口对齐两种字幕，输出草稿 Source Atom 与报告。
 
-输入为第 02 步 `raw_srt_segments.jsonl` 和显式对齐容差；输出为
-`source_video_atoms.jsonl` 草稿及 `atom_build_report.json`。本步以 Dense Caption
+输入为第 02 步 `raw_srt_segments.jsonl` 和冻结配置中的对齐容差；输出为
+`source_video_atoms_draft.jsonl` 草稿及 `atom_build_report.json`。本步以 Dense Caption
 为可观察动作主窗口、宽松保留单模态文本；split 只会由第 04 步冻结，故不能发布
 SUCCESS 标记。
 """
@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import yaml
+import jsonschema
 
 
-def _load_paths(config_path: Path) -> tuple[dict[str, Any], Path, Path, Path]:
+def _load_paths(config_path: Path) -> tuple[dict[str, Any], Path, Path, Path, Path]:
     config_path = config_path.resolve()
     config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     if not isinstance(config, dict):
@@ -36,8 +37,9 @@ def _load_paths(config_path: Path) -> tuple[dict[str, Any], Path, Path, Path]:
     return (
         config,
         resolve(str(config["artifacts"]["raw_srt_segments"])),
-        resolve(str(config["artifacts"]["source_atoms"])),
+        resolve(str(config["artifacts"]["source_atoms_draft"])),
         resolve(str(config["artifacts"]["source_report"])),
+        resolve(str(config["schema_dir"])) / "source_video_atom_draft.schema.json",
     )
 
 
@@ -110,6 +112,7 @@ def _make_atom(
     return {
         "atom_id": atom_id,
         "atom_kind": "source_video_atom",
+        "atom_stage": "draft",
         "participant_source_id": participant,
         "source_day": source_day,
         "session_id": session_id,
@@ -134,9 +137,8 @@ def _make_atom(
         "visible_text": _visible_text(transcript, dense_caption),
         "modality_coverage": coverage,
         "provenance": "egolife_srt",
-        # 04 会按 split_policy 重写。Schema 暂无 draft/unassigned 枚举，故只作为未冻结草稿的占位值；
-        # 未存在 SUCCESS 标记前任何下游均不得读取它，避免把该值误认作已冻结 split。
-        "split": "train",
+        # 草稿绝不能伪装为训练集：只有第 04 步冻结 split 后，才会形成可被下游读取的最终原子。
+        "split": None,
     }
 
 
@@ -223,7 +225,7 @@ def _build_report(
     return {
         "contract_version": config["contract_version"],
         "config_version": config["config_version"],
-        "schema_version": "v1.0.0",
+        "schema_version": "v1.1.0",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "stage": "alignment_draft_pending_split_freeze",
         "input_hashes": {"raw_srt_segments": _sha256(raw_segments_path)},
@@ -236,7 +238,7 @@ def _build_report(
             "dense_caption_primary_windows": dense_count,
             "dense_caption_windows_with_transcript": both_count,
             "pairing_rate": round(both_count / dense_count, 6) if dense_count else 0.0,
-            "atom_merging": "未执行；合并阈值尚未在冻结配置中定义",
+            "atom_merging": "已由冻结配置禁用；保留最小可追溯字幕窗口",
         },
         "counts": {
             "raw_segment_records": len(records),
@@ -285,15 +287,49 @@ def _write_jsonl_atomically(output_path: Path, records: Iterable[dict[str, Any]]
     os.replace(temporary_path, output_path)
 
 
-def run(config_path: Path, *, tolerance_seconds: float) -> tuple[Path, Path]:
-    """按给定容差对齐；正式生产前该参数必须由 T0 冻结到配置。"""
+def _frozen_alignment_tolerance(config: dict[str, Any]) -> float:
+    """读取并校验 T0 冻结的 v1 对齐策略，拒绝运行时覆盖。"""
 
-    if tolerance_seconds < 0:
-        # 负容差没有时间语义，拒绝它比隐式取绝对值更可复现。
-        raise ValueError("tolerance_seconds 不能为负数")
-    config, raw_segments_path, output_path, report_path = _load_paths(config_path)
+    source_build = config.get("source_build")
+    if not isinstance(source_build, dict):
+        raise ValueError("paths.yaml 缺少冻结的 source_build 配置")
+    alignment = source_build.get("alignment")
+    atom_merging = source_build.get("atom_merging")
+    if not isinstance(alignment, dict) or not isinstance(atom_merging, dict):
+        raise ValueError("source_build 缺少 alignment 或 atom_merging 配置")
+    tolerance = alignment.get("transcript_dense_caption_tolerance_seconds")
+    if not isinstance(tolerance, (int, float)) or isinstance(tolerance, bool) or tolerance < 0:
+        # 负数、布尔值或缺失值都无法表达可复现的字幕时间窗口，必须在写草稿前中止。
+        raise ValueError("冻结的 transcript_dense_caption_tolerance_seconds 必须为非负数")
+    if alignment.get("primary_window_modality") != "dense_caption":
+        raise ValueError("v1 对齐主窗口必须为 dense_caption")
+    if atom_merging.get("enabled") is not False:
+        raise ValueError("v1 禁止合并相邻字幕窗口")
+    return float(tolerance)
+
+
+def _validate_draft_atoms(atoms: list[dict[str, Any]], schema_path: Path) -> None:
+    """在原子替换前验证草稿边界，避免把带最终 split 的记录写入草稿路径。"""
+
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = [
+        f"{atom.get('atom_id', '<missing>')}: {error.message}"
+        for atom in atoms
+        for error in validator.iter_errors(atom)
+    ]
+    if errors:
+        raise ValueError("Source Atom 草稿 Schema 验证失败：" + "; ".join(errors))
+
+
+def run(config_path: Path) -> tuple[Path, Path]:
+    """按 T0 冻结容差生成独立草稿；运行时不接受可漂移的对齐参数。"""
+
+    config, raw_segments_path, output_path, report_path, schema_path = _load_paths(config_path)
+    tolerance_seconds = _frozen_alignment_tolerance(config)
     records = _read_jsonl(raw_segments_path)
     atoms = _build_atoms(records, tolerance_seconds)
+    _validate_draft_atoms(atoms, schema_path)
     report = _build_report(config, raw_segments_path, records, atoms, tolerance_seconds)
     _write_jsonl_atomically(output_path, atoms)
     _write_json_atomically(report_path, report)
@@ -308,14 +344,8 @@ def main() -> None:
         default=Path(__file__).resolve().parents[1] / "config" / "paths.yaml",
         help="冻结的 paths.yaml 路径",
     )
-    parser.add_argument(
-        "--tolerance-seconds",
-        type=float,
-        required=True,
-        help="Wave 1 显式传入的对齐容差；正式值须等待 T0 冻结配置",
-    )
     arguments = parser.parse_args()
-    run(arguments.config, tolerance_seconds=arguments.tolerance_seconds)
+    run(arguments.config)
 
 
 if __name__ == "__main__":

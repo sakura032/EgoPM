@@ -1,6 +1,6 @@
 # All paths are relative to this file's directory unless explicitly documented.
-contract_version: v1.0.0
-config_version: v1.0.0
+contract_version: v1.1.0
+config_version: v1.1.0
 path_anchor: config_directory
 project_root: ../..
 benchmark_root: ..
@@ -22,6 +22,7 @@ coordination_dir: ../coordination
 artifacts:
   source_inventory: ../source/srt_inventory.csv
   raw_srt_segments: ../source/raw_srt_segments.jsonl
+  source_atoms_draft: ../source/source_video_atoms_draft.jsonl
   source_atoms: ../source/source_video_atoms.jsonl
   source_split_map: ../source/source_split_map.jsonl
   source_report: ../source/atom_build_report.json
@@ -39,6 +40,22 @@ artifacts:
   validation_errors: ../audit/validation_errors.jsonl
   leakage_report: ../audit/leakage_report.json
   final_statistics: ../audit/final_statistics.json
+
+# 第 03 步只写草稿；第 04 步验证草稿、冻结 split 后才写唯一正式 Source Atom 路径。
+source_build:
+  alignment:
+    transcript_dense_caption_tolerance_seconds: 2.0
+    primary_window_modality: dense_caption
+    retain_unmatched_single_modality_atoms: true
+  atom_merging:
+    enabled: false
+    rationale: v1 保留最小可追溯字幕窗口，不按时长丢弃或合并相邻窗口
+    report_longer_than_seconds: 30
+  staging:
+    draft_atom_stage: draft
+    draft_split: null
+    final_atom_stage: final
+    final_split_labels: [train, dev, test]
 
 success_markers:
   source_atoms: ../source/SOURCE_ATOMS_SUCCESS.json

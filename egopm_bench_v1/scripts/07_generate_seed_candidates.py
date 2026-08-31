@@ -30,8 +30,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MODEL_ID = "qwen3.7-plus-2026-05-26"
 PROMPT_VERSION = "seed_generator_v1"
-CONTRACT_VERSION = "v1.0.0"
-CONFIG_VERSION = "v1.0.0"
+CONTRACT_VERSION = "v1.1.0"
+CONFIG_VERSION = "v1.1.0"
+TRIGGER_LURE_SCHEMA_VERSION = "v1.0.0"
+SEED_SCHEMA_VERSION = "v1.0.0"
 REQUIRED_TERMINAL_CONDITIONS = {"completed", "cancelled", "expired", "already_reminded"}
 SUCCESS_REQUIRED_FIELDS = {
     "artifact_path",
@@ -201,7 +203,7 @@ def validate_retrieval_rows(rows: list[dict[str, Any]]) -> None:
         if row["retrieval_id"] in seen:
             raise ContractError("trigger/lure 集存在重复 retrieval_id")
         seen.add(row["retrieval_id"])
-        if row["schema_version"] != CONTRACT_VERSION:
+        if row["schema_version"] != TRIGGER_LURE_SCHEMA_VERSION:
             raise ContractError("trigger/lure 集 Schema 版本不兼容")
         lure_ids = row["lure_atom_ids"]
         if not isinstance(lure_ids, list) or len(lure_ids) < 2 or len(set(lure_ids)) != len(lure_ids):
@@ -244,7 +246,7 @@ def build_chat_request(
             "run_id": run_id,
             "model_id": EXPECTED_MODEL_ID,
             "prompt_version": PROMPT_VERSION,
-            "schema_version": CONTRACT_VERSION,
+            "schema_version": SEED_SCHEMA_VERSION,
         },
     }
     user_input = {
@@ -356,7 +358,7 @@ def validate_seed_semantics(
         "run_id": run_id,
         "model_id": EXPECTED_MODEL_ID,
         "prompt_version": PROMPT_VERSION,
-        "schema_version": CONTRACT_VERSION,
+        "schema_version": SEED_SCHEMA_VERSION,
     }:
         raise ContractError("Seed generation_record 与本次调用元数据不一致")
     lure_ids = seed["lure_atom_ids"]
@@ -488,7 +490,7 @@ def run(args: argparse.Namespace) -> int:
             "row_count": len(seeds),
             "contract_version": CONTRACT_VERSION,
             "config_version": CONFIG_VERSION,
-            "schema_versions": {"reminder_seed": CONTRACT_VERSION},
+            "schema_versions": {"reminder_seed": SEED_SCHEMA_VERSION},
             "generated_at": utc_now(),
             "upstream_hashes": {
                 "source_atoms": source_marker["sha256"],

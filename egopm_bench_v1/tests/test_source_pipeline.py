@@ -50,8 +50,8 @@ def _write_test_config(tmp_path: Path) -> Path:
     source_dir = tmp_path / "source"
     config_dir.mkdir(parents=True)
     paths = {
-        "contract_version": "v1.0.0",
-        "config_version": "v1.0.0",
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
         "raw_root": "../raw/EgoLifeCap",
         "transcript_root": "../raw/EgoLifeCap/Transcript",
         "dense_caption_root": "../raw/EgoLifeCap/DenseCaption",
@@ -60,28 +60,47 @@ def _write_test_config(tmp_path: Path) -> Path:
         "artifacts": {
             "source_inventory": "../source/srt_inventory.csv",
             "raw_srt_segments": "../source/raw_srt_segments.jsonl",
+            "source_atoms_draft": "../source/source_video_atoms_draft.jsonl",
             "source_atoms": "../source/source_video_atoms.jsonl",
             "source_split_map": "../source/source_split_map.jsonl",
             "source_report": "../source/atom_build_report.json",
         },
         "success_markers": {"source_atoms": "../source/SOURCE_ATOMS_SUCCESS.json"},
+        "source_build": {
+            "alignment": {
+                "transcript_dense_caption_tolerance_seconds": 2.0,
+                "primary_window_modality": "dense_caption",
+                "retain_unmatched_single_modality_atoms": True,
+            },
+            "atom_merging": {
+                "enabled": False,
+                "report_longer_than_seconds": 30,
+            },
+            "staging": {
+                "draft_atom_stage": "draft",
+                "draft_split": None,
+                "final_atom_stage": "final",
+                "final_split_labels": ["train", "dev", "test"],
+            },
+        },
     }
     policy = {
-        "contract_version": "v1.0.0",
-        "config_version": "v1.0.0",
-        "policy_version": "v1.0.0",
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "policy_version": "v1.1.0",
         "random_seed": 20260829,
         "ratios": {"train": 0.7, "dev": 0.15, "test": 0.15},
         "split_labels": ["train", "dev", "test"],
         "grouping": {
             "hard_group_keys": ["session_id", "world_event_id"],
-            "adjacency_grouping": {"enabled": True, "max_gap_seconds": 30},
             "near_duplicate": {
                 "enabled": True,
                 "normalized_text": "unicode_nfkc_lowercase_collapse_whitespace",
                 "algorithm": "char_3gram_jaccard",
                 "similarity_threshold": 0.92,
-                "comparison_scope": "same_or_adjacent_session",
+                "comparison_scope": "all_sessions_same_participant_source_day",
+                "cross_session_time_order": "prohibited",
+                "max_gap_seconds": None,
             },
         },
     }
@@ -117,7 +136,7 @@ def _write_synthetic_srt_tree(tmp_path: Path) -> None:
     )
     _write_srt(
         raw_root / "DenseCaption" / "P01" / "DAY1" / "only_dense_caption.srt",
-        [("00:00:13,000", "00:00:15,000", "A person opens a cupboard.")],
+        [("00:00:16,000", "00:00:18,000", "A person opens a cupboard.")],
     )
     broken = raw_root / "Transcript" / "P02" / "DAY2" / "broken_transcript.srt"
     broken.parent.mkdir(parents=True, exist_ok=True)
@@ -160,8 +179,14 @@ def test_source_pipeline_fixture_only_end_to_end(tmp_path: Path) -> None:
     assert hello["raw_text"] == "Hello\nthere"
     assert not segments_path.with_name(segments_path.name + ".tmp").exists()
 
-    atoms_path, report_path = aligner.run(config_path, tolerance_seconds=0.5)
-    draft_atoms = _read_jsonl(atoms_path)
+    draft_atoms_path, report_path = aligner.run(config_path)
+    draft_atoms = _read_jsonl(draft_atoms_path)
+    assert draft_atoms_path.name == "source_video_atoms_draft.jsonl"
+    assert all(atom["atom_stage"] == "draft" and atom["split"] is None for atom in draft_atoms)
+    draft_schema = json.loads((ROOT / "schemas" / "source_video_atom_draft.schema.json").read_text(encoding="utf-8"))
+    draft_validator = jsonschema.Draft202012Validator(draft_schema)
+    for atom in draft_atoms:
+        draft_validator.validate(atom)
     assert {atom["modality_coverage"] for atom in draft_atoms} == {
         "both",
         "transcript_only",
@@ -171,11 +196,14 @@ def test_source_pipeline_fixture_only_end_to_end(tmp_path: Path) -> None:
     assert "Dense caption:" in both_atom["visible_text"]
     assert "Transcript:" in both_atom["visible_text"]
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    assert report["alignment"]["tolerance_seconds"] == 0.5
+    assert report["alignment"]["tolerance_seconds"] == 2.0
     assert report["anomalies"]["unparsed_files"]
 
     finalized_atoms_path, split_map_path, success_path = splitter.run(config_path)
     finalized_atoms = _read_jsonl(finalized_atoms_path)
+    assert finalized_atoms_path.name == "source_video_atoms.jsonl"
+    assert finalized_atoms_path != draft_atoms_path
+    assert all(atom["atom_stage"] == "final" for atom in finalized_atoms)
     split_map = _read_jsonl(split_map_path)
     assert len(finalized_atoms) == len(split_map)
     schema = json.loads((ROOT / "schemas" / "source_video_atom.schema.json").read_text(encoding="utf-8"))
@@ -202,13 +230,16 @@ def test_source_pipeline_fixture_only_end_to_end(tmp_path: Path) -> None:
     assert not success_path.with_name(success_path.name + ".tmp").exists()
 
 
-def test_alignment_rejects_negative_tolerance(tmp_path: Path) -> None:
-    """未冻结到配置的对齐参数仍须显式且可验证。"""
+def test_alignment_rejects_negative_frozen_tolerance(tmp_path: Path) -> None:
+    """冻结配置中的负容差必须在写出草稿前被拒绝。"""
 
     _write_synthetic_srt_tree(tmp_path)
     config_path = _write_test_config(tmp_path)
     _load_script("01_inventory_srt").run(config_path)
     _load_script("02_parse_srt").run(config_path)
     aligner = _load_script("03_align_modal_text")
-    with pytest.raises(ValueError, match="不能为负数"):
-        aligner.run(config_path, tolerance_seconds=-0.01)
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    config["source_build"]["alignment"]["transcript_dense_caption_tolerance_seconds"] = -0.01
+    config_path.write_text(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ValueError, match="必须为非负数"):
+        aligner.run(config_path)

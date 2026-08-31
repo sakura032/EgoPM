@@ -5,9 +5,9 @@
 | 编号 | 日期 | 提出者 | 受影响合同 | 摘要 | 兼容性 | 决定 | 目标版本 | 状态 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | CR-2026-001 | 2026-08-31 | T0 | 治理合同与生产指南 | 新增 Python 中文模块说明和关键中文注释的合并硬门禁 | 仅治理规则变更；数据 Schema/配置仍为 `v1.0.0`，无需重生成数据 | 批准 | 治理合同 `v1.1.0` | DONE |
-| CR-2026-002 | 2026-08-31 | T1 | Source 配置与 Source Atom 产物 | 冻结文本对齐容差、原子合并时长和连续性规则 | 新增或变更冻结参数后，必须重建全部 `source/**` 及下游产物 | 待决定 | 数据合同后续版本 | 待决定 |
-| CR-2026-003 | 2026-08-31 | T1 | Source Atom Schema 与第 03/04 步接口 | 区分未 split 的草稿原子与最终 Source Atom | 若增加草稿工件或改变中间 `split` 语义，必须重建全部正式 Source 及下游产物 | 待决定 | 数据合同后续版本 | 待决定 |
-| CR-2026-004 | 2026-08-31 | T1 | `split_policy.yaml` 与 session 邻接比较 | 定义跨 session 的可复现时间顺序与 `max_gap_seconds` 适用边界 | 规则变更会影响 split map、Source SUCCESS 及全部下游产物 | 待决定 | 数据合同后续版本 | 待决定 |
+| CR-2026-002 | 2026-08-31 | T1 | Source 配置与 Source Atom 产物 | 冻结文本对齐容差、原子合并时长和连续性规则 | 新增或变更冻结参数后，必须重建全部 `source/**` 及下游产物 | 批准：容差 `2.0` 秒，Dense Caption 主窗口，禁用相邻窗口合并 | 配置合同 `v1.1.0` | DONE |
+| CR-2026-003 | 2026-08-31 | T1 | Source Atom Schema 与第 03/04 步接口 | 区分未 split 的草稿原子与最终 Source Atom | 若增加草稿工件或改变中间 `split` 语义，必须重建全部正式 Source 及下游产物 | 批准：草稿使用独立路径与 Schema，`atom_stage=draft`、`split=null`；最终原子为 `atom_stage=final` | 配置合同与 Source Schema `v1.1.0` | DONE |
+| CR-2026-004 | 2026-08-31 | T1 | `split_policy.yaml` 与 session 邻接比较 | 定义跨 session 的可复现时间顺序与 `max_gap_seconds` 适用边界 | 规则变更会影响 split map、Source SUCCESS 及全部下游产物 | 批准：同一人同一天的全部不同 session 对均比较；禁止以 session 相对秒排序或使用 `max_gap_seconds` | 配置合同 `v1.1.0` | DONE |
 | CR-2026-005 | 2026-08-31 | T2 | 检索配置、路径与 Schema | 冻结生产级触发/诱饵语义检索模型、版本、参数和哈希边界 | 需重建检索集合、Seed candidates 及所有后续产物 | 待决定 | 数据合同后续版本 | 待决定 |
 | CR-2026-006 | 2026-08-31 | T4 | 反事实配对与 Evidence Set Schema/成功标记 | 为 `counterfactual_pairs.jsonl` 和 `evidence_sets.jsonl` 增加可审计的 Schema 与哈希边界 | 若字段或语义改变，必须重建相应 Life Log、Decision、QA、统计和数据集卡 | 待决定 | 数据合同后续版本 | 待决定 |
 
@@ -25,3 +25,17 @@
 ```
 
 仅 T0 可以登记、决定和关闭请求。工作对话仅可在自身 handoff 文件中提出请求，且解释性正文必须使用中文。
+
+## T0 决议说明
+
+### CR-2026-002
+
+`paths.yaml` 已冻结 `transcript_dense_caption_tolerance_seconds: 2.0`。Dense Caption 是主窗口；未命中的单模态窗口保留。v1 不合并相邻字幕窗口，也不按窗口时长淘汰记录；超过 30 秒的窗口只写入报告，供后续审计。
+
+### CR-2026-003
+
+第 03 步只能写 `source/source_video_atoms_draft.jsonl`，并以 `source_video_atom_draft.schema.json` 验证。草稿记录的 `atom_stage` 必为 `draft`，`split` 必为 `null`。第 04 步必须先验证草稿，再写唯一正式路径 `source/source_video_atoms.jsonl`；最终记录的 `atom_stage` 必为 `final`，`split` 必为 `train`、`dev` 或 `test`。没有 `SOURCE_ATOMS_SUCCESS.json` 的草稿永远不可被下游读取。
+
+### CR-2026-004
+
+`normalized_start_sec` 与 `normalized_end_sec` 只表达单个 session 内的相对秒，绝不可推断不同 SRT session 的真实先后。为避免不可复现的邻接猜测，近重复检查固定为同一 `participant_source_id`、同一 `source_day` 的全部不同 session 对；不使用 `max_gap_seconds`。

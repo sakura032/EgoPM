@@ -31,8 +31,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_MODEL_ID = "qwen3.7-flash-2026-07-15"
 PROMPT_VERSION = "cue_extractor_v1"
-CONTRACT_VERSION = "v1.0.0"
-CONFIG_VERSION = "v1.0.0"
+CONTRACT_VERSION = "v1.1.0"
+CONFIG_VERSION = "v1.1.0"
+SOURCE_SCHEMA_VERSION = "v1.1.0"
+CUE_SCHEMA_VERSION = "v1.0.0"
 SUCCESS_REQUIRED_FIELDS = {
     "artifact_path",
     "sha256",
@@ -206,7 +208,7 @@ def build_chat_request(
         "source_text": atom["visible_text"],
         "model_id": EXPECTED_MODEL_ID,
         "prompt_version": PROMPT_VERSION,
-        "schema_version": CONTRACT_VERSION,
+        "schema_version": CUE_SCHEMA_VERSION,
         "run_id": run_id,
     }
     user_input = {
@@ -292,7 +294,7 @@ def validate_cue_semantics(atom: dict[str, Any], cue: dict[str, Any]) -> None:
         "source_text": atom["visible_text"],
         "model_id": EXPECTED_MODEL_ID,
         "prompt_version": PROMPT_VERSION,
-        "schema_version": CONTRACT_VERSION,
+        "schema_version": CUE_SCHEMA_VERSION,
     }
     for field, required in expected.items():
         if cue.get(field) != required:
@@ -335,7 +337,7 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
 def run(args: argparse.Namespace) -> int:
     endpoint, api_key_name, region, model_settings = load_runtime_settings(args.model_registry)
     # 此门在任何付费模型请求前执行；失败时保留旧输出而不产生新的模型调用。
-    source_marker = require_verified_success(args.source_atoms, args.source_success, CONTRACT_VERSION)
+    source_marker = require_verified_success(args.source_atoms, args.source_success, SOURCE_SCHEMA_VERSION)
     source_validator = load_validator(args.source_schema)
     cue_schema = read_json(args.cue_schema)
     cue_validator = load_validator(args.cue_schema)
@@ -373,7 +375,7 @@ def run(args: argparse.Namespace) -> int:
         "row_count": len(cues),
         "contract_version": CONTRACT_VERSION,
         "config_version": CONFIG_VERSION,
-        "schema_versions": {"cue_candidate": CONTRACT_VERSION},
+        "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION},
         "generated_at": utc_now(),
         "upstream_hashes": {"source_atoms": source_marker["sha256"]},
         "run_id": run_id,

@@ -17,6 +17,7 @@ import random
 import unicodedata
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
+from itertools import combinations
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -64,11 +65,13 @@ def _load_paths(config_path: Path) -> tuple[dict[str, Any], dict[str, Any], dict
     paths = {
         "inventory": resolve(str(config["artifacts"]["source_inventory"])),
         "raw_segments": resolve(str(config["artifacts"]["raw_srt_segments"])),
+        "draft_atoms": resolve(str(config["artifacts"]["source_atoms_draft"])),
         "atoms": resolve(str(config["artifacts"]["source_atoms"])),
         "split_map": resolve(str(config["artifacts"]["source_split_map"])),
         "report": resolve(str(config["artifacts"]["source_report"])),
         "success_marker": resolve(str(config["success_markers"]["source_atoms"])),
         "schema": resolve(str(config["schema_dir"])) / "source_video_atom.schema.json",
+        "draft_schema": resolve(str(config["schema_dir"])) / "source_video_atom_draft.schema.json",
     }
     return config, split_policy, paths
 
@@ -107,24 +110,18 @@ def _jaccard(left: set[str], right: set[str]) -> float:
     return len(left & right) / len(left | right)
 
 
-def _session_adjacency_pairs(atoms: list[dict[str, Any]]) -> Iterable[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
-    """仅在同 participant/day 的相邻 session 间比较近重复，控制全量比较规模。"""
+def _same_person_day_cross_session_pairs(atoms: list[dict[str, Any]]) -> Iterable[tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    """比较同一人同一天的所有不同 session 对，不虚构跨 SRT 的时间顺序。"""
 
-    # 只有同一 participant/day 的相邻 session 可能代表连续来源；不做全局两两比较，
-    # 既遵守 policy 的 comparison_scope，也避免无关人物因常见短语被误连通。
+    # normalized 时间只在单个 session 内有意义；若按它排序会把不同 SRT 的相对零点误判为现实先后。
+    # 因此 v1 穷举同一人同一天的不同 session 对，宁可增加确定性比较，也不使用不可表达的 max_gap。
     by_person_day: dict[tuple[str, str], dict[str, list[dict[str, Any]]]] = defaultdict(lambda: defaultdict(list))
     for atom in atoms:
         by_person_day[(atom["participant_source_id"], atom["source_day"])][atom["session_id"]].append(atom)
-    for sessions in by_person_day.values():
-        ordered_sessions = sorted(
-            sessions.items(),
-            key=lambda item: (
-                min(float(atom["normalized_start_sec"]) for atom in item[1]),
-                item[0],
-            ),
-        )
-        for (_, left), (_, right) in zip(ordered_sessions, ordered_sessions[1:]):
-            yield left, right
+    for key in sorted(by_person_day):
+        sessions = by_person_day[key]
+        for left_id, right_id in combinations(sorted(sessions), 2):
+            yield sessions[left_id], sessions[right_id]
 
 
 def _source_components(atoms: list[dict[str, Any]], split_policy: dict[str, Any]) -> tuple[dict[str, list[str]], int]:
@@ -149,7 +146,7 @@ def _source_components(atoms: list[dict[str, Any]], split_policy: dict[str, Any]
     if near_duplicate["enabled"]:
         threshold = float(near_duplicate["similarity_threshold"])
         gram_cache = {atom_id: _char_3grams(atom["visible_text"]) for atom_id, atom in by_id.items()}
-        for left_session, right_session in _session_adjacency_pairs(atoms):
+        for left_session, right_session in _same_person_day_cross_session_pairs(atoms):
             for left_atom in left_session:
                 left_grams = gram_cache[left_atom["atom_id"]]
                 for right_atom in right_session:
@@ -218,6 +215,8 @@ def _replace_source_group_and_split(
     for atom in sorted(atoms, key=lambda item: item["atom_id"]):
         component_id = atom_to_component[atom["atom_id"]]
         finalized = dict(atom)
+        # 草稿与最终原子必须由不可混淆的阶段字段区分，避免下游把未冻结 split 的记录当作正式输入。
+        finalized["atom_stage"] = "final"
         finalized["source_group_id"] = f"group_{component_id}"
         finalized["split"] = assignments[component_id]
         finalized_atoms.append(finalized)
@@ -254,6 +253,20 @@ def _validate_final_atoms(
             raise AssertionError(f"来源连通分量 {component_id} 跨 split")
 
 
+def _validate_draft_atoms(atoms: list[dict[str, Any]], schema_path: Path) -> None:
+    """先验证第 03 步草稿，防止最终化阶段接受伪造 split 或错误阶段记录。"""
+
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    validator = jsonschema.Draft202012Validator(schema)
+    errors = [
+        f"{atom.get('atom_id', '<missing>')}: {error.message}"
+        for atom in atoms
+        for error in validator.iter_errors(atom)
+    ]
+    if errors:
+        raise ValueError("Source Atom 草稿 Schema 验证失败：" + "; ".join(errors))
+
+
 def _write_jsonl_tmp(output_path: Path, records: Iterable[dict[str, Any]]) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path = output_path.with_name(output_path.name + ".tmp")
@@ -283,7 +296,7 @@ def _upstream_hashes(paths: dict[str, Path]) -> dict[str, str]:
         for name in ("inventory", "raw_segments")
         if paths[name].exists()
     }
-    hashes["source_video_atoms_draft"] = _sha256(paths["atoms"])
+    hashes["source_video_atoms_draft"] = _sha256(paths["draft_atoms"])
     return hashes
 
 
@@ -291,9 +304,10 @@ def run(config_path: Path) -> tuple[Path, Path, Path]:
     """生成 split map，重写最终 atoms，并最后才发布 SUCCESS 标记。"""
 
     config, split_policy, paths = _load_paths(config_path)
-    draft_atoms = _read_jsonl(paths["atoms"])
+    draft_atoms = _read_jsonl(paths["draft_atoms"])
     if not draft_atoms:
         raise ValueError("不允许为零个 Source Atom 发布 SUCCESS 标记")
+    _validate_draft_atoms(draft_atoms, paths["draft_schema"])
     # split 只能从冻结 policy 推导；不允许按后续模型生成质量重新分配来源。
     components, duplicate_links = _source_components(draft_atoms, split_policy)
     assignments = _assign_splits(components, split_policy)
@@ -334,7 +348,7 @@ def run(config_path: Path) -> tuple[Path, Path, Path]:
         "row_count": len(finalized_atoms),
         "contract_version": config["contract_version"],
         "config_version": config["config_version"],
-        "schema_versions": {"source_video_atom": "v1.0.0"},
+        "schema_versions": {"source_video_atom": "v1.1.0", "source_video_atom_draft": "v1.1.0"},
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "upstream_hashes": upstream_hashes,
         "artifact_hashes": artifact_hashes,

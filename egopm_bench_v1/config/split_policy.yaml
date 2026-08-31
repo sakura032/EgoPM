@@ -1,6 +1,6 @@
-contract_version: v1.0.0
-config_version: v1.0.0
-policy_version: v1.0.0
+contract_version: v1.1.0
+config_version: v1.1.0
+policy_version: v1.1.0
 freeze_once_before_generation: true
 random_seed: 20260829
 ratios:
@@ -14,15 +14,14 @@ grouping:
   hard_group_keys:
     - session_id
     - world_event_id
-  adjacency_grouping:
-    enabled: true
-    max_gap_seconds: 30
   near_duplicate:
     enabled: true
     normalized_text: unicode_nfkc_lowercase_collapse_whitespace
     algorithm: char_3gram_jaccard
     similarity_threshold: 0.92
-    comparison_scope: same_or_adjacent_session
+    comparison_scope: all_sessions_same_participant_source_day
+    cross_session_time_order: prohibited
+    max_gap_seconds: null
   family_integrity: all_family_members_and_referenced_atoms_same_split
 
 requirements:

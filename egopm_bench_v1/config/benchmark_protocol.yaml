@@ -1,5 +1,5 @@
-contract_version: v1.0.0
-config_version: v1.0.0
+contract_version: v1.1.0
+config_version: v1.1.0
 protocol_structure_version: v1.0.0
 parameterization_status: pending_full_dataset_statistics
 parameterization_gate: PROTOCOL_PARAMETERS_V1

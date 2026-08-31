@@ -30,7 +30,7 @@ import yaml
 
 
 BENCHMARK_ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_VERSION = "v1.0.0"
+CONTRACT_VERSION = "v1.1.0"
 REPRODUCTION_COMMAND = (
     "python egopm_bench_v1/scripts/11_validate_all.py "
     "--config egopm_bench_v1/config/benchmark_protocol.yaml"
@@ -799,7 +799,7 @@ def counterfactual_delta_contract_issue(config: RunConfig, collector: IssueColle
         "contract_counterfactual_delta_unverifiable",
         "counterfactual_pairs",
         "冻结且有哈希的 pair manifest，逐对声明唯一历史差异与两侧 log ID",
-        f"v1.0.0 未定义该文件 schema/SUCCESS 哈希；T4 不能安全读取 {pair_path.name}",
+        f"v1.1.0 未定义该文件 schema/SUCCESS 哈希；T4 不能安全读取 {pair_path.name}",
         "T0 contract CHANGE_REQUEST",
     )
 

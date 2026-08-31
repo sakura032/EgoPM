@@ -1,7 +1,7 @@
 {
   "atom_id": "src_SYNTH_DAY1_000001",
   "atom_kind": "source_video_atom",
-  "atom_stage": "final",
+  "atom_stage": "draft",
   "participant_source_id": "SYNTH",
   "source_day": "DAY1",
   "session_id": "SYNTH_DAY1_SESSION1",
@@ -24,5 +24,5 @@
   "visible_text": "A person starts preparing food in a kitchen.",
   "modality_coverage": "both",
   "provenance": "egolife_srt",
-  "split": "train"
+  "split": null
 }

@@ -23,8 +23,11 @@ import jsonschema
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTRACT_VERSION = "v1.0.0"
-CONFIG_VERSION = "v1.0.0"
+CONTRACT_VERSION = "v1.1.0"
+CONFIG_VERSION = "v1.1.0"
+SOURCE_SCHEMA_VERSION = "v1.1.0"
+CUE_SCHEMA_VERSION = "v1.0.0"
+TRIGGER_LURE_SCHEMA_VERSION = "v1.0.0"
 SUCCESS_REQUIRED_FIELDS = {
     "artifact_path",
     "sha256",
@@ -79,7 +82,7 @@ TRIGGER_LURE_SCHEMA: dict[str, Any] = {
         },
         "retrieval_method": {"const": "lexical_jaccard_v1"},
         "run_id": {"type": "string", "minLength": 1},
-        "schema_version": {"const": CONTRACT_VERSION},
+        "schema_version": {"const": TRIGGER_LURE_SCHEMA_VERSION},
     },
 }
 
@@ -251,7 +254,7 @@ def build_lure_sets(
                 ],
                 "retrieval_method": "lexical_jaccard_v1",
                 "run_id": run_id,
-                "schema_version": CONTRACT_VERSION,
+                "schema_version": TRIGGER_LURE_SCHEMA_VERSION,
             }
         )
     return rows
@@ -323,9 +326,9 @@ def run(args: argparse.Namespace) -> int:
             "contract_version": CONTRACT_VERSION,
             "config_version": CONFIG_VERSION,
             "schema_versions": {
-                "source_video_atom": CONTRACT_VERSION,
-                "cue_candidate": CONTRACT_VERSION,
-                "trigger_lure_set": CONTRACT_VERSION,
+                "source_video_atom": SOURCE_SCHEMA_VERSION,
+                "cue_candidate": CUE_SCHEMA_VERSION,
+                "trigger_lure_set": TRIGGER_LURE_SCHEMA_VERSION,
             },
             "generated_at": utc_now(),
             "upstream_hashes": {
