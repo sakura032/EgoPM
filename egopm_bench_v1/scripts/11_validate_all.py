@@ -108,6 +108,7 @@ CUE_V2_MARKER_FIELDS = {
     "model_id",
     "prompt_version",
     "cue_execution_policy_version",
+    "protocol_hash_payload_version",
     "cue_execution_protocol_sha256",
     "cue_prompt_sha256",
     "cue_inference_schema",
@@ -312,8 +313,17 @@ def cue_v2_execution_contract(
     if not isinstance(package, dict):
         collector.add("BLOCKER", "cue_execution_contract_fields", "cue", "冻结 package_policy", repr(package), owner)
         return None
-    required = {"model_id", "prompt_version", "schema_version"}
-    execution_required = {"cue_execution_policy_version"}
+    required = {
+        "model_id",
+        "thinking_enabled",
+        "reasoning_effort",
+        "temperature",
+        "prompt_version",
+        "schema",
+        "schema_version",
+    }
+    service_required = {"default_endpoint", "default_region", "credential_policy", "raw_response_policy"}
+    execution_required = {"cue_execution_policy_version", "protocol_hash_payload_version"}
     package_required = {
         "maximum_atoms",
         "maximum_request_utf8_bytes",
@@ -321,13 +331,13 @@ def cue_v2_execution_contract(
         "inference_schema",
         "inference_schema_version",
     }
-    if required.difference(cue) or execution_required.difference(execution) or package_required.difference(package):
+    if required.difference(cue) or service_required.difference(registry) or execution_required.difference(execution) or package_required.difference(package):
         collector.add(
             "BLOCKER",
             "cue_execution_contract_fields",
             "cue",
             "完整的 v2 模型、协议和 package 冻结字段",
-            f"cue 缺少 {sorted(required.difference(cue))}；execution 缺少 {sorted(execution_required.difference(execution))}；package 缺少 {sorted(package_required.difference(package))}",
+            f"cue 缺少 {sorted(required.difference(cue))}；service 缺少 {sorted(service_required.difference(registry))}；execution 缺少 {sorted(execution_required.difference(execution))}；package 缺少 {sorted(package_required.difference(package))}",
             owner,
         )
         return None
@@ -345,23 +355,35 @@ def cue_v2_execution_contract(
         return None
     prompt_sha256 = sha256_file(prompt_path)
     inference_schema_sha256 = sha256_file(inference_schema_path)
-    # 该八字段载荷与 T2 package 恢复门使用同一规范编码。它故意不包含 Source 哈希：
-    # Source 属于本次运行的输入血缘，协议本身则必须能复用于同一冻结执行规则的独立 run。
+    # 协议哈希必须覆盖完整冻结执行合同，而不只覆盖打包尺寸。否则重试、限流、受控
+    # 字段、账本口径、恢复语义或价格发生变化时，旧 package 仍可能被错误地当作可恢复。
+    # Source 哈希故意不在这里：它属于每次运行的输入血缘，单独由 SUCCESS 字段验证。
     protocol_payload = {
-        "policy": execution["cue_execution_policy_version"],
-        "model": cue["model_id"],
-        "prompt": cue["prompt_version"],
-        "prompt_sha256": prompt_sha256,
-        "inference_sha256": inference_schema_sha256,
-        "max_atoms": package["maximum_atoms"],
-        "max_bytes": package["maximum_request_utf8_bytes"],
-        "tokens_per_atom": package["output_tokens_per_atom"],
+        "payload_version": execution["protocol_hash_payload_version"],
+        "model": {
+            "model_id": cue["model_id"],
+            "thinking_enabled": cue["thinking_enabled"],
+            "reasoning_effort": cue["reasoning_effort"],
+            "temperature": cue["temperature"],
+            "prompt_version": cue["prompt_version"],
+            "final_cue_schema": cue["schema"],
+            "final_cue_schema_version": cue["schema_version"],
+        },
+        "service": {
+            "endpoint": registry["default_endpoint"],
+            "region": registry["default_region"],
+            "credential_policy": registry["credential_policy"],
+            "raw_response_policy": registry["raw_response_policy"],
+        },
+        "execution": execution,
+        "cue_prompt_sha256": prompt_sha256,
+        "cue_inference_schema_sha256": inference_schema_sha256,
     }
     return {
         "model_id": cue["model_id"],
         "prompt_version": cue["prompt_version"],
-        "cue_schema_version": cue["schema_version"],
         "cue_execution_policy_version": execution["cue_execution_policy_version"],
+        "protocol_hash_payload_version": execution["protocol_hash_payload_version"],
         "cue_prompt_sha256": prompt_sha256,
         "cue_inference_schema": package["inference_schema"],
         "cue_inference_schema_version": package["inference_schema_version"],
@@ -387,8 +409,6 @@ def validate_cue_v2_execution_lineage(
         return False
     valid = True
     for field_name, expected in contract.items():
-        if field_name == "cue_schema_version":
-            continue
         actual = marker.get(field_name)
         if actual != expected:
             collector.add("BLOCKER", "cue_execution_lineage_mismatch", f"cue:{field_name}", repr(expected), repr(actual), owner)

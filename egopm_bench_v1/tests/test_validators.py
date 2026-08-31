@@ -16,6 +16,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "contract"
@@ -198,6 +200,26 @@ def test_cue_v2_success_rejects_wrong_hash_version_and_usage_totals(tmp_path: Pa
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
     issue_types = {issue["issue_type"] for issue in collector.issues}
     assert {"cue_execution_lineage_mismatch", "cue_usage_summary_tokens"}.issubset(issue_types)
+
+
+def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) -> None:
+    """限流等 execution 语义变化即使不改最终 Cue Schema，也必须令旧协议哈希失效。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    registry_path = config.config_dir / "model_registry.yaml"
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    registry["models"]["cue_extraction"]["execution"]["rate_limit_policy"]["target_requests_per_minute"] = 301
+    registry_path.write_text(yaml.safe_dump(registry, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(
+        issue["issue_type"] == "cue_execution_lineage_mismatch"
+        and issue["failure_id"] == "cue:cue_execution_protocol_sha256"
+        for issue in collector.issues
+    )
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:
