@@ -1,5 +1,12 @@
 # T2 千问候选生成交接
 
+## CR-2026-007：Cue v2 无 API 实施
+
+- 第 05 步已迁移至 `cue_extractor_v2` 协议：按 `atom_id` 排序，每逻辑 shard 最多 `500` 条 Atom，并以最多 `5` 条、序列化请求不超过 `24000` UTF-8 字节自适应组成 package；每包输出上限固定为 `128 × package Atom 数`。
+- 模型输入仅为 `items[].item_index` 与 `items[].text`。推理数组经过 `cue_inference_batch_v1.schema.json` 验证、索引全覆盖和同 Atom 原文片段检查后，程序才回填最终 Cue 的身份、split、原文、模型、提示词、Schema 和 run 字段。
+- package 清单、结果片段、无正文账本、完成或失败标记均绑定 Source 哈希和 `cue_execution_protocol_sha256`；该协议哈希是提示词字节、推理 Schema 字节和冻结执行字段的规范 JSON 哈希。完整 package 才跳过，失败 package 仅可由显式 `--rerun-failed-packages` 进入重跑。
+- 默认命令仍只读；本次没有执行 `--execute`，没有读取密钥、联网或生成任何正式 Cue/SUCCESS。合成测试验证五条自适应包、最小输入、私传受控字段/跨 Atom 原文拒绝、协议与账本哈希恢复及重试费用上界。
+
 ## 第 05 步离线分片建设补充（未调用 API）
 
 - 本次只实现第 05 步的离线启动修复和可恢复分片框架；没有读取 `DASHSCOPE_API_KEY`，没有调用千问，也没有写入 `cues/cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json`、任何正式 Cue 或 Seed。
