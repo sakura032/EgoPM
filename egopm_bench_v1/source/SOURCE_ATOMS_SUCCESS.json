@@ -1,0 +1,24 @@
+{
+  "artifact_hashes": {
+    "atom_build_report": "9296482af9e792d8ffc61eaf78d346bc43ef9c8d885ccede972292c7cbb7138e",
+    "raw_srt_segments": "1767315c2e852b4d74a058c4da32560d19053206ec9a82f43826059c71e97778",
+    "source_inventory": "90a87fbe2cf2ef5dcc799264fb218d2bb0b9fb0cd79dc3eff8b4ab705da87d70",
+    "source_split_map": "59ef3e8efd0a4b496b4a894779de2e923da126f5ab5a741e321be9efff3f2278",
+    "source_video_atoms": "be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e"
+  },
+  "artifact_path": "source/source_video_atoms.jsonl",
+  "config_version": "v1.1.0",
+  "contract_version": "v1.1.0",
+  "generated_at": "2026-08-31T12:14:58.330464+00:00",
+  "row_count": 370799,
+  "schema_versions": {
+    "source_video_atom": "v1.1.0",
+    "source_video_atom_draft": "v1.1.0"
+  },
+  "sha256": "be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e",
+  "upstream_hashes": {
+    "inventory": "90a87fbe2cf2ef5dcc799264fb218d2bb0b9fb0cd79dc3eff8b4ab705da87d70",
+    "raw_segments": "1767315c2e852b4d74a058c4da32560d19053206ec9a82f43826059c71e97778",
+    "source_video_atoms_draft": "e931c1b42b0abb9dceef7a92a1e564c5a14df46192b38cc134d6c587096aebca"
+  }
+}
