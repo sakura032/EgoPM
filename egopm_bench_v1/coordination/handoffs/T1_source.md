@@ -1,6 +1,9 @@
 # T1 Source 交接
 
-- 分支 / 代码提交：`detached HEAD` / `debc422b29438c5fbee4628b1345fbfb6afd766e`
+- 分支 / 当前提交：`detached HEAD` / `1b869738c805aea75a282a3ab3f9a6e732e0007a`
+- 供 T0 合并的完整提交链（必须按此顺序，后者以前者为直接父提交）：
+  1. `debc422b29438c5fbee4628b1345fbfb6afd766e`：Source Atom Wave 1 代码与单元测试。
+  2. `1b869738c805aea75a282a3ab3f9a6e732e0007a`：T1 Source 交接文件。
 - 合同版本：本 worktree 中可核验的治理合同、冻结配置与 Schema 均为 `v1.0.0`；已补充中文 Python 模块说明和关键“为什么”注释，未自行合并 `main`。
 - 完成内容：完成 Wave 1 的 fixture-only Source Atom 开发。`01` 递归清点双模态 SRT；`02` 解析字幕块并保留失败/过滤原因；`03` 以 Dense Caption 为主窗口按显式容差对齐并宽松保留单模态原子；`04` 按来源连通分量和近重复规则冻结 split、校验 Source Atom Schema、原子替换产物并最后写 SUCCESS 标记。
 - 修改文件：
@@ -16,8 +19,8 @@
   - `egopm_bench_v1/config/split_policy.yaml`：`dd2b9bb361762f66bf500fbf0b0da2b48fae2d8d9965a59365d9d51ba098dbb0`
   - `egopm_bench_v1/schemas/source_video_atom.schema.json`：`a97d72984a0b41fccca87832f79d38f3b15d8c1e54c24e439f38005b2d0967e6`
 - 输出及 SHA256：未产生任何正式 `source/**` 产物或 SUCCESS 标记，符合 Wave 1 禁止正式生产的授权边界。单元测试只在 pytest 临时目录创建 synthetic SRT 和输出，进程结束后不构成数据集产物。
-- 测试命令：`$env:PYTHONDONTWRITEBYTECODE = '1'; python -m pytest -q`
-- 测试结果：通过，`5 passed in 0.56s`。另已执行 `git diff --check`，无空白错误。
+- 复核命令：`$env:PYTHONDONTWRITEBYTECODE = '1'; python -m pytest -q`；`$env:PYTHONPYCACHEPREFIX = Join-Path $env:TEMP 'egopm_t1_pycompile_cache'; python -m py_compile egopm_bench_v1/scripts/01_inventory_srt.py egopm_bench_v1/scripts/02_parse_srt.py egopm_bench_v1/scripts/03_align_modal_text.py egopm_bench_v1/scripts/04_make_source_splits.py`；`git diff --check`。
+- 复核结果：通过，`pytest` 为 `5 passed in 0.61s`；四个 T1 脚本的 `py_compile` 成功；`git diff --check` 无错误。编译缓存仅写入系统临时目录，不会产生正式 Source 产物或启动正式 SRT 建库。
 - 未解决问题：正式运行前必须由 T0 决定下列 `CHANGE_REQUEST`；当前实现不调用千问，未生成 cue、Seed、Life Log 或任何 `remind`/`silent` gold。
 - 无关工作树内容：保留未跟踪的 `.codex/`，未读取、修改或暂存。
 
