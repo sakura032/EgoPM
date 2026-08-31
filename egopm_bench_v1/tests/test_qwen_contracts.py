@@ -341,11 +341,14 @@ def test_default_preflight_is_read_only_and_final_success_has_payload_version(tm
     }
     assert module.run(module.argparse.Namespace(**common, execute=False)) == 0
     assert not common["run_root"].exists() and not common["success_marker"].exists()
+    with pytest.raises(module.ContractError, match="项目目录内"):
+        module.managed_relative_path(tmp_path.parent / "outside" / "cue_library.jsonl")
 
     monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic-only")
     monkeypatch.setattr(module, "urlopen", lambda *_args, **_kwargs: FakeHTTPResponse(fake_chat_response(1)))
     assert module.run(module.argparse.Namespace(**common, execute=True)) == 0
     success = module.read_json(common["success_marker"])
+    assert success["artifact_path"] == "cue_library.jsonl"
     assert success["protocol_hash_payload_version"] == "v1.0.0"
     assert success["model_id"] == "qwen3.7-flash-2026-07-15"
     assert success["usage_summary"]["total_tokens"] == 18

@@ -201,6 +201,16 @@ def verified_source(artifact: Path, marker_path: Path) -> dict[str, Any]:
     return marker
 
 
+def managed_relative_path(path: Path) -> str:
+    """将正式产物标记为 benchmark 根相对路径，令 T4 可跨机器复现地校验它。"""
+
+    try:
+        return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError as error:
+        # 允许任意绝对输出会使 SUCCESS 在另一台机器上失效，也绕过 T4 的受管路径门。
+        raise ContractError("正式 Cue 输出必须位于 egopm_bench_v1 项目目录内") from error
+
+
 def settings_from_registry(path: Path) -> Settings:
     """读取 T0 冻结的 Cue v2 运行配置，并拒绝未走变更流程的参数漂移。"""
 
@@ -675,7 +685,7 @@ def run(arguments: argparse.Namespace) -> int:
     count = merge_completed_packages(manifests, run_root, settings, arguments.output)
     # SUCCESS 必须最后写，才能让下游只读取完整合并结果和全部 package 账本。
     atomic_write_json(arguments.success_marker, {
-        "artifact_path": str(arguments.output.resolve()), "sha256": sha256_file(arguments.output), "row_count": count,
+        "artifact_path": managed_relative_path(arguments.output), "sha256": sha256_file(arguments.output), "row_count": count,
         "contract_version": CONTRACT_VERSION, "config_version": CONFIG_VERSION, "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION},
         "generated_at": utc_now(), "upstream_hashes": {"source_atoms": marker["sha256"]}, "model_id": settings.model_id,
         "prompt_version": settings.prompt_version, "cue_execution_policy_version": settings.execution["cue_execution_policy_version"],
