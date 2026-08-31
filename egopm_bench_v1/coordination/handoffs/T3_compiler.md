@@ -5,7 +5,7 @@
 - 治理合同版本：`v1.1.0`。
 - 数据合同版本：`v1.0.0`。
 - 分支：`codex/t3-wave1-compiler`。
-- 提交：本交接随 T3 Wave 1 提交；提交哈希见提交后的 Git 记录。
+- Wave 1 实现提交：`ba3eb30504a9005d140fadb9e83ba68ec368b7c7`（本交接的提交补充在该提交之后）。
 - 工作范围：`scripts/08_freeze_seed_audit.py`、`scripts/09_build_lifelog_families.py`、`scripts/10_run_oracle.py`、`rules/**`、`tests/test_state_machine.py` 与本文件。未修改 `config/**`、`schemas/**`、source、cues 或候选 Seed。
 
 ## Wave 1 已完成内容
