@@ -81,3 +81,19 @@ python egopm_bench_v1/scripts/12_build_statistics.py --config egopm_bench_v1/con
 - 合成测试：`tests/test_validators.py` 新增“Transcript 仅至 10 秒、Dense 至 20 秒而 atom 窗口为 12–18 秒”不产生 `source_time_out_of_srt`，并验证 Transcript-only 的 8–12 秒窗口仍被 10 秒 SRT 阻断。`python -m pytest -q egopm_bench_v1/tests/test_validators.py` 结果为 `8 passed`；`python -m pytest -q` 结果为 `30 passed`；`git diff --check` 通过。
 - 中文代码验收：`scripts/11_validate_all.py` 的首个有效内容仍为完整中文模块说明；新增主时间窗口选择、双路径可解析性检查及其防止误报的原因性中文注释。`tests/test_validators.py` 的首个有效内容仍为完整中文模块说明，新增测试文档说明为中文。
 - 审计边界：此修复提交不接受先前含 `392` 条 `source_time_out_of_srt` 的审计输出；提交后必须以同一代码重跑 `11_validate_all.py`，再据新 `validation_errors.jsonl` 和 `leakage_report.json` 判断 Source stage 是否零 blocker。Cue、candidate、frozen、lifelog、decisions 尚未准备的门禁将仅作为预期下游阻断，不得归责 Source。
+
+## 正式 Source QA 重跑结果
+
+- 验证器代码提交：`4c81eec2427acecd122bf4057b663fa9e1bee129`。
+- 已在主项目 `D:\scientific\EgoPM` 的 `main` 分支唯一实例执行：
+
+```powershell
+python egopm_bench_v1/scripts/11_validate_all.py --config egopm_bench_v1/config/benchmark_protocol.yaml
+```
+
+- 本次只读读取已冻结的 Source SUCCESS 边界与其正式 Source JSONL；未读取、下载、复制或处理 MP4，未调用千问，未生成 Cue、Seed、Life Log 或 Decision。
+- `SOURCE_ATOMS_SUCCESS.json` 的 SHA256、行数、版本、Schema 声明、上游哈希及正式 Source 产物哈希均通过；`source_video_atoms.jsonl` 哈希仍为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`，行数为 `370799`。
+- Source stage 阻断数：`0`。修复前的 `392` 条 `source_time_out_of_srt` 已全部消失；没有 Source Schema、来源路径、时间戳、主时间窗口、split、近重复、视频伪造或 SUCCESS/哈希阻断。
+- 新审计输出：`audit/validation_errors.jsonl` 共 `5` 行，SHA256 为 `4910f18f983d24d086fe68357dd8cc7897549f29f9201dcca7a82d09d112407d`；`audit/leakage_report.json` 报告总阻断数 `5`、答案泄漏 `0`、split 泄漏 `0`。五条均是预期下游未准备：Cue 缺少 SUCCESS 一条，candidate、frozen、lifelog、decisions 各一条上游未就绪。它们不属于 Source 阶段。
+- 运行耗时：精确跨 session 近重复复核在正式规模下耗时约 33 分钟，但持续运行并以原子替换写入审计结果；未出现中断、半成品或并发写入。
+- T0 下一门结论：可以将 `Source QA` 提升为 `DONE` 并冻结 `SOURCE_ATOMS_SUCCESS.json` 哈希；随后 T2 可以在该冻结哈希和 T4 Source QA DONE 的边界下启动 Cue 阶段。
