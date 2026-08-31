@@ -75,16 +75,36 @@ def test_split_policy_forbids_cross_session_relative_time_order() -> None:
 
 
 def test_cue_execution_policy_freezes_no_api_recovery_contract() -> None:
-    """Cue 运行前必须冻结可恢复 shard、用量账本和保守限流，而非由执行时临时猜测。"""
+    """Cue v2 必须冻结五条 package、回填字段和无 API 恢复边界。"""
 
     registry = yaml.safe_load((CONFIG_DIR / "model_registry.yaml").read_text(encoding="utf-8"))
-    execution = registry["models"]["cue_extraction"]["execution"]
-    assert registry["registry_version"] == "v1.1.0"
-    assert execution["cue_execution_policy_version"] == "v1.0.0"
+    cue = registry["models"]["cue_extraction"]
+    execution = cue["execution"]
+    assert registry["registry_version"] == "v1.2.0"
+    assert registry["raw_response_policy"] == "forbidden"
+    assert cue["prompt_version"] == "cue_extractor_v2"
+    assert execution["cue_execution_policy_version"] == "v2.0.0"
     assert execution["mode"] == "explicit_execute_only"
     assert execution["shard_size_atoms"] == 500
-    assert execution["max_tokens"] == 512
     assert execution["max_retries"] == 2
+    assert execution["transport"] == "realtime_chat_completions"
+    assert execution["package_policy"] == {
+        "maximum_atoms": 5,
+        "maximum_request_utf8_bytes": 24000,
+        "ordering": "atom_id_lexicographic",
+        "output_tokens_per_atom": 128,
+        "output_max_tokens_formula": "output_tokens_per_atom_times_package_atom_count",
+        "inference_schema": "cue_inference_batch_v1.schema.json",
+        "inference_schema_version": "v1.0.0",
+        "response_top_level_field": "items",
+        "response_correlation_field": "item_index",
+    }
+    assert execution["controlled_field_policy"] == {
+        "model_input_fields": ["item_index", "text"],
+        "model_output_fields": ["item_index", "entities", "scene_type", "activity_type", "cue_type", "normalized_predicate", "supporting_text_span", "confidence", "ambiguity_reason", "validation_status"],
+        "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"],
+        "raw_model_response_storage": "forbidden",
+    }
     assert execution["pricing_snapshot"] == {
         "pricing_version": "2026-09-01_cn-beijing_list",
         "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",
@@ -105,6 +125,20 @@ def test_cue_execution_policy_freezes_no_api_recovery_contract() -> None:
     assert execution["token_accounting"]["raw_response_storage"] == "forbidden"
     assert execution["recovery"] == {
         "require_matching_source_hash": True,
-        "rerun_only_incomplete_or_failed_shards": True,
+        "require_matching_protocol_hash": True,
+        "rerun_only_incomplete_or_failed_packages": True,
         "completion_marker_requires_sha256": True,
     }
+
+
+def test_cue_inference_schema_excludes_program_controlled_fields() -> None:
+    """v2 推理 Schema 只能容纳模型推理字段，最终血缘字段必须留给程序回填。"""
+
+    schema = json.loads((SCHEMA_DIR / "cue_inference_batch_v1.schema.json").read_text(encoding="utf-8"))
+    item = schema["$defs"]["item"]
+    controlled = {"cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"}
+    assert item["additionalProperties"] is False
+    assert controlled.isdisjoint(item["properties"])
+    jsonschema.Draft202012Validator(schema).validate({
+        "items": [{"item_index": 0, "entities": ["手机"], "scene_type": None, "activity_type": "拿取", "cue_type": "object", "normalized_predicate": {"all_of": [{"slot": "object", "operator": "present", "value": "手机"}]}, "supporting_text_span": "拿着手机", "confidence": 0.9, "ambiguity_reason": None, "validation_status": "accepted"}]
+    })

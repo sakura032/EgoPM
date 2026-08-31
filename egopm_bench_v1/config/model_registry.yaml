@@ -1,9 +1,9 @@
 contract_version: v1.1.0
 config_version: v1.1.0
-registry_version: v1.1.0
+registry_version: v1.2.0
 credential_environment_variable: DASHSCOPE_API_KEY
 credential_policy: environment_only
-raw_response_policy: local_only_not_for_git
+raw_response_policy: forbidden
 default_region: cn-beijing
 default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
 
@@ -13,15 +13,30 @@ models:
     thinking_enabled: false
     reasoning_effort: none
     temperature: 0
-    prompt_version: cue_extractor_v1
+    prompt_version: cue_extractor_v2
     schema: cue_candidate.schema.json
     schema_version: v1.0.0
     execution:
-      cue_execution_policy_version: v1.0.0
+      cue_execution_policy_version: v2.0.0
       mode: explicit_execute_only
       shard_size_atoms: 500
-      max_tokens: 512
       max_retries: 2
+      transport: realtime_chat_completions
+      package_policy:
+        maximum_atoms: 5
+        maximum_request_utf8_bytes: 24000
+        ordering: atom_id_lexicographic
+        output_tokens_per_atom: 128
+        output_max_tokens_formula: output_tokens_per_atom_times_package_atom_count
+        inference_schema: cue_inference_batch_v1.schema.json
+        inference_schema_version: v1.0.0
+        response_top_level_field: items
+        response_correlation_field: item_index
+      controlled_field_policy:
+        model_input_fields: [item_index, text]
+        model_output_fields: [item_index, entities, scene_type, activity_type, cue_type, normalized_predicate, supporting_text_span, confidence, ambiguity_reason, validation_status]
+        program_backfilled_fields: [cue_id, atom_id, split, source_text, model_id, prompt_version, schema_version, run_id]
+        raw_model_response_storage: forbidden
       rate_limit_policy:
         target_requests_per_minute: 300
         target_total_tokens_per_minute: 1000000
@@ -45,14 +60,17 @@ models:
         retry_attempts_billed_independently: true
       shard_layout:
         root: cues/shards
+        package_directory: packages
         input_manifest_suffix: .input.jsonl
-        output_suffix: .output.jsonl
+        output_suffix: .result.jsonl
         ledger_suffix: .ledger.jsonl
         completion_suffix: .complete.json
+        failed_suffix: .failed.json
         merge_order: numeric_shard_index_ascending
       recovery:
         require_matching_source_hash: true
-        rerun_only_incomplete_or_failed_shards: true
+        require_matching_protocol_hash: true
+        rerun_only_incomplete_or_failed_packages: true
         completion_marker_requires_sha256: true
   seed_generation:
     model_id: qwen3.7-plus-2026-05-26
@@ -85,3 +103,12 @@ run_manifest_required_fields:
   - parse_status
   - retry_count
   - validation_errors
+  - cue_execution_policy_version
+  - cue_prompt_sha256
+  - cue_inference_schema_sha256
+  - source_atoms_sha256
+  - package_maximum_atoms
+  - package_maximum_request_utf8_bytes
+  - output_tokens_per_atom
+  - package_count
+  - usage_summary
