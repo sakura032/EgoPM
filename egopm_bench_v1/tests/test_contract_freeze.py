@@ -84,6 +84,7 @@ def test_cue_execution_policy_freezes_no_api_recovery_contract() -> None:
     assert registry["raw_response_policy"] == "forbidden"
     assert cue["prompt_version"] == "cue_extractor_v2"
     assert execution["cue_execution_policy_version"] == "v2.0.0"
+    assert execution["protocol_hash_payload_version"] == "v1.0.0"
     assert execution["mode"] == "explicit_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2

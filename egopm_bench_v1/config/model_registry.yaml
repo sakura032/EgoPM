@@ -18,6 +18,8 @@ models:
     schema_version: v1.0.0
     execution:
       cue_execution_policy_version: v2.0.0
+      # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
+      protocol_hash_payload_version: v1.0.0
       mode: explicit_execute_only
       shard_size_atoms: 500
       max_retries: 2
