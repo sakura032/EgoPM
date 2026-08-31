@@ -1,63 +1,65 @@
-# T1 Source 交接
+# T1 Source 正式建库交接
 
-- 分支 / 当前提交：`detached HEAD` / `1b869738c805aea75a282a3ab3f9a6e732e0007a`
-- 供 T0 合并的完整提交链（必须按此顺序，后者以前者为直接父提交）：
-  1. `debc422b29438c5fbee4628b1345fbfb6afd766e`：Source Atom Wave 1 代码与单元测试。
-  2. `1b869738c805aea75a282a3ab3f9a6e732e0007a`：T1 Source 交接文件。
-- 合同版本：本 worktree 中可核验的治理合同、冻结配置与 Schema 均为 `v1.0.0`；已补充中文 Python 模块说明和关键“为什么”注释，未自行合并 `main`。
-- 完成内容：完成 Wave 1 的 fixture-only Source Atom 开发。`01` 递归清点双模态 SRT；`02` 解析字幕块并保留失败/过滤原因；`03` 以 Dense Caption 为主窗口按显式容差对齐并宽松保留单模态原子；`04` 按来源连通分量和近重复规则冻结 split、校验 Source Atom Schema、原子替换产物并最后写 SUCCESS 标记。
-- 修改文件：
-  - `egopm_bench_v1/scripts/01_inventory_srt.py`
-  - `egopm_bench_v1/scripts/02_parse_srt.py`
-  - `egopm_bench_v1/scripts/03_align_modal_text.py`
-  - `egopm_bench_v1/scripts/04_make_source_splits.py`
-  - `egopm_bench_v1/tests/test_source_pipeline.py`
-- 只读输入及 SHA256：
-  - `AGENTS.md`：`43f9f55d6de74939abfcf666799afd8cfe20b3fd7b3419dfe2854390fc9adb1f`
-  - `EgoPM_Bench_v1_完整生产流水线统筹指南.md`：`b6a3beb8a9bc4d0bd8cc9eec4d2afcedc5505ddc82d12bd4e5da332b8760e743`
-  - `egopm_bench_v1/config/paths.yaml`：`ea470eab7287aa8a82b997d15ab4c96713e7d05b1e1d3f6d4082e3dd9cb2aa86`
-  - `egopm_bench_v1/config/split_policy.yaml`：`dd2b9bb361762f66bf500fbf0b0da2b48fae2d8d9965a59365d9d51ba098dbb0`
-  - `egopm_bench_v1/schemas/source_video_atom.schema.json`：`a97d72984a0b41fccca87832f79d38f3b15d8c1e54c24e439f38005b2d0967e6`
-- 输出及 SHA256：未产生任何正式 `source/**` 产物或 SUCCESS 标记，符合 Wave 1 禁止正式生产的授权边界。单元测试只在 pytest 临时目录创建 synthetic SRT 和输出，进程结束后不构成数据集产物。
-- 复核命令：`$env:PYTHONDONTWRITEBYTECODE = '1'; python -m pytest -q`；`$env:PYTHONPYCACHEPREFIX = Join-Path $env:TEMP 'egopm_t1_pycompile_cache'; python -m py_compile egopm_bench_v1/scripts/01_inventory_srt.py egopm_bench_v1/scripts/02_parse_srt.py egopm_bench_v1/scripts/03_align_modal_text.py egopm_bench_v1/scripts/04_make_source_splits.py`；`git diff --check`。
-- 复核结果：通过，`pytest` 为 `5 passed in 0.61s`；四个 T1 脚本的 `py_compile` 成功；`git diff --check` 无错误。编译缓存仅写入系统临时目录，不会产生正式 Source 产物或启动正式 SRT 建库。
-- 未解决问题：正式运行前必须由 T0 决定下列 `CHANGE_REQUEST`；当前实现不调用千问，未生成 cue、Seed、Life Log 或任何 `remind`/`silent` gold。
-- 无关工作树内容：保留未跟踪的 `.codex/`，未读取、修改或暂存。
+- 分支：`main`。
+- Source 近重复精确索引修复提交：`f730cdf0bbac2995fd9c7d4d07f83d9af4ee41ef`。
+- 正式 Source 产物提交：`ada03ec12ef6a485e71e171f6121cf4bbfa907ab`。
+- 治理合同版本：`v1.1.0`；配置合同版本：`v1.1.0`；Source Atom 与草稿 Schema 版本：`v1.1.0`。
 
-## CHANGE_REQUEST（待 T0 登记）
+## 授权边界与执行内容
 
-### T1-CR-001：冻结 Source 文本对齐与原子合并参数
+已在主项目 `D:\scientific\EgoPM` 的 `main` 分支按顺序执行：
 
-- 提出者 / handoff：T1 / `egopm_bench_v1/coordination/handoffs/T1_source.md`
-- 当前合同版本：`v1.0.0`
-- 受影响字段与产物：建议在 T0 管理的 Source 配置中新增 `alignment_tolerance_seconds`、相邻原子合并的最小/最大时长及连续性规则；影响 `03_align_modal_text.py`、`source_video_atoms.jsonl` 和 `atom_build_report.json`。
-- 现有合同无法表达该需求的原因：生产指南要求对齐阈值写入配置，并允许按明确规则将连续短描述合并为 5–30 秒原子；现有 `paths.yaml` 与 `split_policy.yaml` 没有任何可冻结的容差、合并阈值或连续性定义。
-- 建议的兼容修改或迁移方式：T0 在合同版本化配置中增加完整 Source 对齐块；T1 将 `03` 的临时 CLI 容差替换为冻结字段，并仅在 T0 批准后启用合并。
-- 必须重新生成的上游/下游产物：所有正式 `source/**`、其 SUCCESS 标记，以及全部下游 cue、Seed、Life Log、Decision 和审计产物。
-- 证明该问题的测试：`test_alignment_rejects_negative_tolerance` 证明容差当前必须显式传入；端到端 fixture 测试以 `0.5` 秒仅验证代码行为，不主张这是正式参数。
+```powershell
+python egopm_bench_v1/scripts/01_inventory_srt.py --config egopm_bench_v1/config/paths.yaml
+python egopm_bench_v1/scripts/02_parse_srt.py --config egopm_bench_v1/config/paths.yaml
+python egopm_bench_v1/scripts/03_align_modal_text.py --config egopm_bench_v1/config/paths.yaml
+python egopm_bench_v1/scripts/04_make_source_splits.py --config egopm_bench_v1/config/paths.yaml
+```
 
-### T1-CR-002：区分未 split 草稿原子与最终 Source Atom
+仅递归读取 `raw/EgoLifeCap/Transcript` 的 `402` 个 SRT 与 `raw/EgoLifeCap/DenseCaption` 的 `406` 个 SRT。未读取、下载、复制、拼接或处理 MP4，也未调用千问、生成 Cue、Seed 或 Life Log。
 
-- 提出者 / handoff：T1 / `egopm_bench_v1/coordination/handoffs/T1_source.md`
-- 当前合同版本：`v1.0.0`
-- 受影响字段与产物：`source_video_atom.schema.json` 的必填 `split`、`paths.yaml` 的 `source_atoms` 产物语义，以及 `03` 到 `04` 的中间接口。
-- 现有合同无法表达该需求的原因：第 03 步按指南生成原子、第 04 步才冻结 split，但冻结 Schema 要求每个 Source Atom 已有 `train`、`dev` 或 `test`。现有合同既没有 draft Schema，也没有单独的 draft artifact。为了让当前接口可测试，`03` 只能写入未冻结的 `split: "train"` 占位；无 SUCCESS 标记时下游不会读取它，但该占位不应成为正式语义。
-- 建议的兼容修改或迁移方式：优先新增私有 `source_video_atoms_draft.jsonl` 与 draft Schema（允许 `split: null` 或 `unassigned`），由 `04` 独占生成符合现有最终 Schema 的 `source_video_atoms.jsonl`；若 T0 选择保持单一文件，则需明确允许中间占位的版本化语义与验证边界。
-- 必须重新生成的上游/下游产物：所有正式 `source/**` 及全部下游产物。
-- 证明该问题的测试：`test_source_pipeline_fixture_only_end_to_end` 在第 04 步后才对最终原子执行冻结 Schema 校验。
+首次正式第 04 步在写入任何最终产物前发现最终 split 校验对每个成员扫描全表、会在正式规模退化为二次复杂度，已安全中止；当时没有 `source_video_atoms.jsonl`、`source_split_map.jsonl`、SUCCESS 或临时文件。修复以精确前缀倒排索引筛选不可能的候选对，并仍以完整 `char_3gram_jaccard`、阈值 `0.92` 复核；比较范围仍是同一 participant 与 `source_day` 的全部不同 session，不使用时间排序、近似检索或降采样。
 
-### T1-CR-003：定义“相邻 session”的可复现顺序
+## 修改文件与中文代码验收
 
-- 提出者 / handoff：T1 / `egopm_bench_v1/coordination/handoffs/T1_source.md`
-- 当前合同版本：`v1.0.0`
-- 受影响字段与产物：`split_policy.yaml` 的 `near_duplicate.comparison_scope` 与 `adjacency_grouping`，以及 `04_make_source_splits.py` 的跨 session 近重复比较。
-- 现有合同无法表达该需求的原因：策略规定比较同一或相邻 session，却未提供不同 SRT session 的全局顺序或可比较的 session 起止时间；现有 `normalized_*` 仅是 session 内相对秒。当前 Wave 1 代码采用同 participant/day、按最早 session 相对时间和 session ID 的确定性后备排序，不能声称它就是数据合同指定的真实相邻关系。
-- 建议的兼容修改或迁移方式：T0 冻结从文件名解析的 session 序号、录制开始时间或明确的 session 排序字段，并定义 `max_gap_seconds` 的跨 session 适用条件；否则将近重复比较范围改为可由现有字段严格表达的范围。
-- 必须重新生成的上游/下游产物：所有正式 split map、Source SUCCESS 和全部下游产物。
-- 证明该问题的测试：端到端 fixture 用相邻的 `session_one`/`session_two` 验证近重复连通；该 fixture 不涉及真实 session 顺序。
+- `egopm_bench_v1/scripts/04_make_source_splits.py`：正式近重复比较改为精确索引，保留同一连通性语义；首个有效内容为中文模块说明，新增的复杂度与精确性理由均为中文注释。
+- `egopm_bench_v1/tests/test_source_pipeline.py`：新增索引边集合与朴素全对参考完全一致的 synthetic 测试；首个有效内容为中文模块说明。
+- `egopm_bench_v1/source/**`：由脚本通过 `*.tmp`、`os.replace` 和最后的 SUCCESS 写入生成，未手改 JSONL 或 JSON。
+- `egopm_bench_v1/coordination/handoffs/T1_source.md`：本交接。
 
-## 下一阶段
+已复核 `01_inventory_srt.py`、`02_parse_srt.py`、`03_align_modal_text.py`、`04_make_source_splits.py`：每个文件均以明确输入、输出与流水线阶段的中文模块说明开头；时间对齐、过滤、跨 session 约束、原子替换、哈希/SUCCESS 门和异常处理均有中文的原因性注释。
 
-- Wave 1 的 T4 Source QA 验证器开发：可以启动，接口与 fixture-only 测试已具备。
-- Wave 2 正式 SRT 生产：不可启动，需先由 T0 决定上述请求并冻结参数；正式产物生成后还须通过 T4 Source QA，T0 才能冻结 `SOURCE_ATOMS_SUCCESS` 哈希。
-- T2 读取 Source 正式产物：不可启动。
+## 输入与输出哈希
+
+只读配置及 Schema 输入：
+
+- `egopm_bench_v1/config/paths.yaml`：冻结版本 `v1.1.0`。
+- `egopm_bench_v1/config/split_policy.yaml`：冻结版本 `v1.1.0`。
+- `egopm_bench_v1/schemas/source_video_atom.schema.json` 与 `source_video_atom_draft.schema.json`：冻结版本 `v1.1.0`。
+
+可追溯上游哈希：
+
+- `srt_inventory.csv`：`90a87fbe2cf2ef5dcc799264fb218d2bb0b9fb0cd79dc3eff8b4ab705da87d70`，共 `808` 条已发现 SRT。
+- `raw_srt_segments.jsonl`：`1767315c2e852b4d74a058c4da32560d19053206ec9a82f43826059c71e97778`。
+- `source_video_atoms_draft.jsonl`：`e931c1b42b0abb9dceef7a92a1e564c5a14df46192b38cc134d6c587096aebca`，共 `370799` 条草稿原子。
+
+正式输出与核验哈希：
+
+- `source_video_atoms.jsonl`：`be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`，共 `370799` 条最终原子。
+- `source_split_map.jsonl`：`59ef3e8efd0a4b496b4a894779de2e923da126f5ab5a741e321be9efff3f2278`。
+- `atom_build_report.json`：`9296482af9e792d8ffc61eaf78d346bc43ef9c8d885ccede972292c7cbb7138e`。
+- `SOURCE_ATOMS_SUCCESS.json`：已存在；`sha256`、`row_count`、合同与配置版本、Schema 版本、三个上游哈希与全部正式产物哈希均已逐项复算一致。生成时间为 `2026-08-31T20:14:58.330464+08:00`。
+
+## 测试与下一门
+
+```powershell
+python -m pytest -q egopm_bench_v1/tests/test_source_pipeline.py
+python -m pytest -q
+git diff --check
+```
+
+结果：Source pipeline 测试 `3 passed`；全量测试 `28 passed`；`git diff --check` 通过。精确索引测试逐边比较索引结果与朴素跨 session 全对 `char_3gram_jaccard` 参考，结果完全一致。
+
+未解决问题：无待处理 `CHANGE_REQUEST`；`CR-2026-002`、`CR-2026-003`、`CR-2026-004` 已由 v1.1.0 决议冻结。
+
+下一门：`SOURCE_ATOMS_SUCCESS.json` 已具备，T4 可以执行 Source QA。T2 仍须等待 T4 Source QA 通过且 T0 冻结该 SUCCESS 哈希后才能启动。

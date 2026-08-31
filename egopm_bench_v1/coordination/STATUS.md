@@ -7,9 +7,9 @@
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
-| Source atoms | T1 | TODO | 配置合同与 Source Atom Schema `v1.1.0`；无正式产物 | 无 | 可启动正式 01–04；完成后交由 T4 执行 Source QA |
-| Source QA | T4 | BLOCKED | Wave 1 验证器已合并；无正式产物 | `SOURCE_ATOMS_SUCCESS` 哈希不存在 | T1 正式产物就绪后由 T4 执行 Source QA，T0 审阅后才可 DONE |
-| Cue library | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `SOURCE_ATOMS_SUCCESS` 哈希 + Source QA DONE | 仅在 Source 门完成后运行第 05 步 |
+| Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
+| Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
+| Cue library | T2 | TODO | 已冻结 Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e` | 无 | 可运行第 05 步；仅调用登记的千问 Flash 并生成 `CUE_LIBRARY_SUCCESS.json` |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
@@ -29,3 +29,5 @@
 - Wave 1 合并后以仓库内已忽略的 pytest 临时目录执行 `python -m pytest -q --basetemp .pytest_cache/wave1`，结果为 `25 passed in 0.82s`；`git diff --check` 通过。测试仅使用 synthetic fixture，未运行正式 SRT 建库、未调用千问、未生成 Life Log。
 - `CR-2026-002`、`CR-2026-003` 与 `CR-2026-004` 已由 T0 批准并落实为配置合同与 Source Atom Schema `v1.1.0`：对齐容差固定为 `2.0` 秒，v1 禁止合并窗口，草稿与最终原子使用独立工件/Schema，跨 session 去重比较同一人同一天的全部 session 对。`CR-2026-005` 仍阻断正式 trigger/lure 与 Seed candidates；`CR-2026-006` 仍阻断最终反事实与 Evidence Set 的完整可审计发布。
 - 本次合同升级后以 synthetic fixture 执行 `python -m pytest -q --basetemp .pytest_cache/contract-v11`，结果为 `27 passed in 0.81s`；`git diff --check` 通过。未运行正式 01–04，未调用千问，未生成 Life Log。
+- T1 已在主项目 `main` 正式运行 01–04，仅读取 808 个 EgoLife SRT（Transcript 402、Dense Caption 406），未读取、下载、复制、拼接或处理 MP4。正式 Source 产物提交为 `ada03ec`；近重复精确索引修复为 `f730cdf`。最终原子为 370799 行，冻结 SHA256 为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`。
+- T4 已以 `4c81eec` 将 Source QA 对齐 v1.1 的 Dense Caption 主时间窗口与全 session 精确近重复规则，并在 `7ea18b8` 写入新的只读审计。T0 已独立复算 SUCCESS 原子哈希与行数，结果一致；Source blocker 为 0，`answer_leakage_count` 与 `split_leakage_count` 均为 0。审计中的 5 个 blocker 都仅表示 Cue、candidate、frozen、lifelog、decisions 尚未生成，不归责 Source。
