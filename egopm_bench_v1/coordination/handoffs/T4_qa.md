@@ -2,7 +2,7 @@
 
 ## 交接元数据
 
-- 分支 / 提交：`HEAD (no branch)` / `待本次 T4 Wave 1 提交后回填`。
+- 分支 / Wave 1 实现提交：`HEAD (no branch)` / `08e5d0e6decdc435f198d4c334ffa3025c331649`。
 - 治理合同版本：`v1.1.0`；数据合同版本：`v1.0.0`。
 - 治理合同遵守：本 worktree 未自行合并 T0 的治理合同变更；所有 T4 Python 文件均补有中文模块说明（职责、输入、输出、流水线位置），并为 SUCCESS/哈希门、时间对齐、过滤、状态转移、反事实、答案泄露和异常处理写明“为什么”的中文注释。
 - 本次修改：`scripts/11_validate_all.py`、`scripts/12_build_statistics.py`、`tests/test_validators.py`、`audit/validation_errors.jsonl`、`audit/leakage_report.json` 和本文件。
