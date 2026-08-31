@@ -16,6 +16,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import re
 import sys
 import unicodedata
@@ -87,6 +88,7 @@ class RunConfig:
     config_dir: Path
     project_root: Path
     benchmark_root: Path
+    raw_root: Path
     paths: dict[str, Any]
     protocol: dict[str, Any]
     split_policy: dict[str, Any]
@@ -185,6 +187,7 @@ def load_run_config(config_path: Path) -> RunConfig:
         config_dir=config_dir,
         project_root=(config_dir / paths["project_root"]).resolve(),
         benchmark_root=(config_dir / paths["benchmark_root"]).resolve(),
+        raw_root=(config_dir / paths["raw_root"]).resolve(),
         paths=paths,
         protocol=protocol,
         split_policy=split_policy,
@@ -393,7 +396,64 @@ def resolve_source_path(value: str, config: RunConfig) -> Path:
     candidate = Path(value)
     if candidate.is_absolute():
         return candidate
-    return (config.project_root / candidate).resolve()
+    project_candidate = (config.project_root / candidate).resolve()
+    if project_candidate.is_file():
+        return project_candidate
+    # T1 将来源记录为相对 raw 父目录的 ``EgoLifeCap/...``，不能把它误当成
+    # 项目根下的文件；否则 SRT 存在却会被 QA 全部报为缺失。保留项目根回退可兼容
+    # synthetic fixture，而正式语料则以冻结 raw_root 的父目录为唯一锚点。
+    raw_root = getattr(config, "raw_root", None)
+    if isinstance(raw_root, Path):
+        return (raw_root.parent / candidate).resolve()
+    return project_candidate
+
+
+def source_cross_session_near_duplicate_pairs(
+    records: list[dict[str, Any]], text_grams: dict[str, set[str]], threshold: float, cross_split_only: bool = False
+) -> Iterable[tuple[dict[str, Any], dict[str, Any]]]:
+    """精确枚举同一人同一天、不同 session 的高相似 Source Atom 对。"""
+
+    # v1.1.0 明确禁止从 SRT 相对秒推断跨 session 顺序，故此处只按 participant/day
+    # 分桶并比较该桶的全部不同 session。前缀倒排由 Jaccard 下界推导，不是近似筛选；
+    # 候选仍以完整 3-gram Jaccard 复核，避免百万级笛卡尔枚举使 QA 永远无法完成。
+    gram_frequency = Counter(gram for grams in text_grams.values() for gram in grams)
+    by_person_day: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        by_person_day[(str(record.get("participant_source_id")), str(record.get("source_day")))].append(record)
+
+    for key in sorted(by_person_day):
+        # QA 只关心跨 split 泄漏时可按 split 建子索引，先消去已知安全的同 split
+        # 候选；这不改变任何跨 split 原子对是否经过完整 Jaccard 复核的结论。
+        prefix_index: dict[str, dict[str, list[str]]] = defaultdict(lambda: defaultdict(list))
+        atoms = sorted(by_person_day[key], key=lambda item: str(item.get("atom_id")))
+        atoms_by_id = {str(atom.get("atom_id")): atom for atom in atoms}
+        for atom in atoms:
+            atom_id = str(atom.get("atom_id"))
+            grams = text_grams.get(atom_id, set())
+            if not grams:
+                continue
+            required_overlap = math.ceil(threshold * len(grams))
+            prefix_size = len(grams) - required_overlap + 1
+            prefix = sorted(grams, key=lambda gram: (gram_frequency[gram], gram))[:prefix_size]
+            atom_split = str(atom.get("split"))
+            candidate_ids = {
+                candidate_id
+                for gram in prefix
+                for split, ids in prefix_index[gram].items()
+                if not cross_split_only or split != atom_split
+                for candidate_id in ids
+            }
+            for candidate_id in sorted(candidate_ids):
+                candidate = atoms_by_id[candidate_id]
+                if candidate.get("session_id") == atom.get("session_id"):
+                    continue
+                candidate_grams = text_grams.get(candidate_id, set())
+                if not candidate_grams or min(len(grams), len(candidate_grams)) / max(len(grams), len(candidate_grams)) < threshold:
+                    continue
+                if jaccard(grams, candidate_grams) >= threshold:
+                    yield candidate, atom
+            for gram in prefix:
+                prefix_index[gram][atom_split].append(atom_id)
 
 
 def srt_duration_seconds(path: Path) -> float | None:
@@ -448,6 +508,11 @@ def validate_source(records: list[dict[str, Any]], config: RunConfig, collector:
             world_events[atom["world_event_id"]].add(split)
         paths = atom.get("source_srt_paths")
         if isinstance(paths, dict):
+            # v1.1.0 的 03 步以非空 Dense Caption 作为原子的主时间窗口；Transcript
+            # 只负责提供可追溯的对齐证据，可能在同一 session 内较早结束。因而两个
+            # 引用 SRT 都必须存在且含可解析时间戳，但只有主模态可以约束 atom 的
+            # local_start_sec/local_end_sec，避免把合法的 Dense 窗口误判为越界。
+            primary_modality = "dense_caption" if atom.get("dense_caption") else "transcript"
             for modality in ("transcript", "dense_caption"):
                 raw_path = paths.get(modality)
                 if not isinstance(raw_path, str):
@@ -460,8 +525,17 @@ def validate_source(records: list[dict[str, Any]], config: RunConfig, collector:
                 duration = duration_cache.setdefault(path, srt_duration_seconds(path))
                 if duration is None:
                     collector.add("BLOCKER", "source_srt_timestamp", atom_id, "SRT 含可解析时间戳", str(path), owner)
-                elif isinstance(end, (int, float)) and end > duration + 0.001:
-                    collector.add("BLOCKER", "source_time_out_of_srt", atom_id, f"local_end_sec <= {duration}", str(end), owner)
+                elif modality == primary_modality:
+                    for field_name, value in (("local_start_sec", start), ("local_end_sec", end)):
+                        if isinstance(value, (int, float)) and value > duration + 0.001:
+                            collector.add(
+                                "BLOCKER",
+                                "source_time_out_of_srt",
+                                atom_id,
+                                f"{field_name} <= {duration}（主时间窗口：{primary_modality}）",
+                                str(value),
+                                owner,
+                            )
         video_path = atom.get("source_video_path")
         if isinstance(video_path, str):
             resolved_video = resolve_source_path(video_path, config)
@@ -481,22 +555,23 @@ def validate_source(records: list[dict[str, Any]], config: RunConfig, collector:
     for event_id, splits in world_events.items():
         if len(splits) > 1:
             collector.add("BLOCKER", "split_world_event", event_id, "同一 world_event_id 仅一个 split", str(sorted(splits)), owner)
-    # 高相似字幕跨 split 会使模型通过记住改写文本获益，因此按冻结策略在同/相邻 session 内复查。
+    # 高相似字幕跨 split 会使模型通过记住改写文本获益；必须按冻结策略复查同一人同一天
+    # 的全部不同 session，不能根据 session 编号或相对秒缩小范围。
     threshold = float(config.split_policy["grouping"]["near_duplicate"]["similarity_threshold"])
-    for index, left in enumerate(records):
-        for right in records[index + 1 :]:
-            if left.get("split") == right.get("split") or not session_is_same_or_adjacent(left, right):
-                continue
-            similarity = jaccard(text_grams.get(str(left.get("atom_id")), set()), text_grams.get(str(right.get("atom_id")), set()))
-            if similarity >= threshold:
-                collector.add(
-                    "BLOCKER",
-                    "split_near_duplicate",
-                    f"{left.get('atom_id')}|{right.get('atom_id')}",
-                    f"跨 split 字幕相似度 < {threshold}",
-                    f"{similarity:.4f}",
-                    owner,
-                )
+    for left, right in source_cross_session_near_duplicate_pairs(records, text_grams, threshold, cross_split_only=True):
+        if left.get("split") == right.get("split"):
+            continue
+        similarity = jaccard(
+            text_grams.get(str(left.get("atom_id")), set()), text_grams.get(str(right.get("atom_id")), set())
+        )
+        collector.add(
+            "BLOCKER",
+            "split_near_duplicate",
+            f"{left.get('atom_id')}|{right.get('atom_id')}",
+            f"跨 split 字幕相似度 < {threshold}",
+            f"{similarity:.4f}",
+            owner,
+        )
 
 
 def validate_cues(records: list[dict[str, Any]], atoms: dict[str, dict[str, Any]], collector: IssueCollector) -> None:

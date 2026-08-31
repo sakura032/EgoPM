@@ -97,6 +97,11 @@ def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path:
     second = copy.deepcopy(first)
     second["atom_id"] = "src_SYNTH_DAY1_000002"
     second["split"] = "dev"
+    # 使用不相邻的 session 编号，防止 QA 错把“相邻 session”当成 v1.1.0 的比较范围。
+    first["session_id"] = "session_1"
+    first["source_group_id"] = "group_session_1"
+    second["session_id"] = "session_3"
+    second["source_group_id"] = "group_session_3"
     second["local_start_sec"] = 10.0
     second["local_end_sec"] = 18.0
     second["normalized_start_sec"] = 10.0
@@ -108,7 +113,93 @@ def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path:
     collector = qa.IssueCollector()
     qa.validate_source([first, second], config, collector)
     issue_types = {issue["issue_type"] for issue in collector.issues}
-    assert {"source_time_order", "split_source_group", "split_near_duplicate"}.issubset(issue_types)
+    assert {"source_time_order", "split_near_duplicate"}.issubset(issue_types)
+
+
+def test_source_time_boundary_uses_dense_caption_primary_window(tmp_path: Path) -> None:
+    """Dense 主窗口可合法超过较短 Transcript，Transcript-only 仍必须在自身 SRT 内。"""
+
+    qa = load_validator()
+    transcript = tmp_path / "raw" / "transcript.srt"
+    dense = tmp_path / "raw" / "dense.srt"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text("1\n00:00:00,000 --> 00:00:10,000\nTranscript\n", encoding="utf-8")
+    dense.write_text("1\n00:00:00,000 --> 00:00:20,000\nDense caption\n", encoding="utf-8")
+    atom = fixture("source_video_atom.valid.json")
+    atom.update(
+        {
+            "source_srt_paths": {"transcript": "raw/transcript.srt", "dense_caption": "raw/dense.srt"},
+            "transcript": "short transcript evidence",
+            "dense_caption": "dense primary window evidence",
+            "modality_coverage": "both",
+            "local_start_sec": 12.0,
+            "local_end_sec": 18.0,
+        }
+    )
+    config = SimpleNamespace(
+        project_root=tmp_path,
+        split_policy={"grouping": {"near_duplicate": {"similarity_threshold": 0.92}}},
+    )
+    collector = qa.IssueCollector()
+    qa.validate_source([atom], config, collector)
+    assert not any(issue["issue_type"] == "source_time_out_of_srt" for issue in collector.issues)
+
+    transcript_only = copy.deepcopy(atom)
+    transcript_only.update(
+        {
+            "atom_id": "src_SYNTH_DAY1_000099",
+            "source_srt_paths": {"transcript": "raw/transcript.srt", "dense_caption": None},
+            "transcript": "transcript primary window evidence",
+            "dense_caption": None,
+            "modality_coverage": "transcript_only",
+            "local_start_sec": 8.0,
+            "local_end_sec": 12.0,
+        }
+    )
+    transcript_collector = qa.IssueCollector()
+    qa.validate_source([transcript_only], config, transcript_collector)
+    assert any(issue["issue_type"] == "source_time_out_of_srt" for issue in transcript_collector.issues)
+
+
+def test_source_cross_session_duplicate_index_equals_naive_reference() -> None:
+    """精确索引必须完整覆盖同一人同日的全部不同 session，而非只覆盖相邻编号。"""
+
+    qa = load_validator()
+    records = [
+        {"atom_id": "src_P01_DAY1_000001", "participant_source_id": "P01", "source_day": "DAY1", "session_id": "session_1", "split": "train", "visible_text": "the person puts the blue cup on the kitchen table"},
+        {"atom_id": "src_P01_DAY1_000002", "participant_source_id": "P01", "source_day": "DAY1", "session_id": "session_3", "split": "dev", "visible_text": "the person puts the blue cup on the kitchen table"},
+        {"atom_id": "src_P01_DAY1_000003", "participant_source_id": "P01", "source_day": "DAY1", "session_id": "session_9", "split": "dev", "visible_text": "the person places a blue cup onto the kitchen table"},
+        {"atom_id": "src_P01_DAY1_000004", "participant_source_id": "P01", "source_day": "DAY1", "session_id": "session_9", "split": "train", "visible_text": "the person puts the blue cup on the kitchen table"},
+        {"atom_id": "src_P02_DAY1_000001", "participant_source_id": "P02", "source_day": "DAY1", "session_id": "session_1", "split": "test", "visible_text": "the person puts the blue cup on the kitchen table"},
+        {"atom_id": "src_P01_DAY2_000001", "participant_source_id": "P01", "source_day": "DAY2", "session_id": "session_1", "split": "test", "visible_text": "the person puts the blue cup on the kitchen table"},
+    ]
+    threshold = 0.92
+    grams = {record["atom_id"]: qa.char_3grams(record["visible_text"]) for record in records}
+    expected = {
+        tuple(sorted((left["atom_id"], right["atom_id"])))
+        for index, left in enumerate(records)
+        for right in records[index + 1 :]
+        if left["participant_source_id"] == right["participant_source_id"]
+        and left["source_day"] == right["source_day"]
+        and left["session_id"] != right["session_id"]
+        and qa.jaccard(grams[left["atom_id"]], grams[right["atom_id"]]) >= threshold
+    }
+    observed = {
+        tuple(sorted((left["atom_id"], right["atom_id"])))
+        for left, right in qa.source_cross_session_near_duplicate_pairs(records, grams, threshold)
+    }
+    assert observed == expected
+    expected_cross_split = {
+        pair
+        for pair in expected
+        if next(record for record in records if record["atom_id"] == pair[0])["split"]
+        != next(record for record in records if record["atom_id"] == pair[1])["split"]
+    }
+    observed_cross_split = {
+        tuple(sorted((left["atom_id"], right["atom_id"])))
+        for left, right in qa.source_cross_session_near_duplicate_pairs(records, grams, threshold, cross_split_only=True)
+    }
+    assert observed_cross_split == expected_cross_split
 
 
 def test_decision_validator_rejects_answer_labels_in_model_input() -> None:

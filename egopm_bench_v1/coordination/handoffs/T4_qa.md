@@ -71,3 +71,13 @@ python egopm_bench_v1/scripts/12_build_statistics.py --config egopm_bench_v1/con
 ## 下一门
 
 不能启动正式 Cue 生产。T1 先生成并冻结 `SOURCE_ATOMS_SUCCESS.json`，随后 T4 应运行 source QA；只有零阻断且 T0 将 Source QA 提升为 `DONE` 后，T2 才可正式启动 Cue 阶段。
+
+## 正式 Source QA 时间边界修复（待重跑审计）
+
+- 适用提交：本段随 T4 修复提交写入；正式 QA 结果与审计哈希将在该提交之后的独立重跑中补充。
+- 已确认的 T1 正式 Source 输入：`source_video_atoms.jsonl` SHA256 为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`，行数为 `370799`；`SOURCE_ATOMS_SUCCESS.json` 的声明已由前一轮 T4 逐项复算通过。
+- 修复原因：v1.1.0 的第 03 步以非空 `dense_caption` 对应的 Dense Caption SRT 作为 `local_start_sec` / `local_end_sec` 的主时间窗口。Transcript 可作为同一 session 的较早对齐证据而提前结束；把相同 atom 窗口强制限制在两份 SRT 的较短者内，会产生 `source_time_out_of_srt` 假阳性。
+- 修复范围：`scripts/11_validate_all.py` 仍对每条非空 `source_srt_paths.transcript` 和 `source_srt_paths.dense_caption` 检查文件存在与可解析时间戳；仅对主时间窗口模态检查 `local_start_sec` 和 `local_end_sec` 不超过其末时间戳。`dense_caption` 非空时主模态为 Dense Caption，否则为 Transcript。
+- 合成测试：`tests/test_validators.py` 新增“Transcript 仅至 10 秒、Dense 至 20 秒而 atom 窗口为 12–18 秒”不产生 `source_time_out_of_srt`，并验证 Transcript-only 的 8–12 秒窗口仍被 10 秒 SRT 阻断。`python -m pytest -q egopm_bench_v1/tests/test_validators.py` 结果为 `8 passed`；`python -m pytest -q` 结果为 `30 passed`；`git diff --check` 通过。
+- 中文代码验收：`scripts/11_validate_all.py` 的首个有效内容仍为完整中文模块说明；新增主时间窗口选择、双路径可解析性检查及其防止误报的原因性中文注释。`tests/test_validators.py` 的首个有效内容仍为完整中文模块说明，新增测试文档说明为中文。
+- 审计边界：此修复提交不接受先前含 `392` 条 `source_time_out_of_srt` 的审计输出；提交后必须以同一代码重跑 `11_validate_all.py`，再据新 `validation_errors.jsonl` 和 `leakage_report.json` 判断 Source stage 是否零 blocker。Cue、candidate、frozen、lifelog、decisions 尚未准备的门禁将仅作为预期下游阻断，不得归责 Source。
