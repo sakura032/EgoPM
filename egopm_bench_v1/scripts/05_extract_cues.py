@@ -24,6 +24,8 @@ class ContractError(RuntimeError): """冻结合同、输入、响应或恢复边
 class Settings:
     endpoint:str; credential:str; shard_size:int; max_atoms:int; max_bytes:int; tokens_per_atom:int; retries:int; rpm:int; tpm:int
     layout:dict[str,str]; input_price:float; output_price:float; context_tokens:int
+    execution:dict[str,Any]
+    protocol_context:dict[str,Any]
 
 def sha(path:Path)->str:
     h=hashlib.sha256()
@@ -49,11 +51,14 @@ def rows(path:Path)->list[dict[str,Any]]:
     return out
 def write_json(path:Path,v:Any)->None:
     path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_name(path.name+".tmp")
-    tmp.write_text(json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+"\n",encoding="utf-8");tmp.replace(path)
+    with tmp.open("w",encoding="utf-8",newline="\n") as f:
+        f.write(json.dumps(v,ensure_ascii=False,sort_keys=True,indent=2)+"\n");f.flush();os.fsync(f.fileno())
+    tmp.replace(path)
 def write_rows(path:Path,items:Iterable[dict[str,Any]])->None:
     path.parent.mkdir(parents=True,exist_ok=True);tmp=path.with_name(path.name+".tmp")
     with tmp.open("w",encoding="utf-8",newline="\n") as f:
         for x in items:f.write(json.dumps(x,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n")
+        f.flush();os.fsync(f.fileno())
     tmp.replace(path)
 def validator(path:Path)->jsonschema.Draft202012Validator:return jsonschema.Draft202012Validator(read_json(path))
 def check(v:jsonschema.Draft202012Validator,x:dict[str,Any],label:str)->None:
@@ -76,14 +81,18 @@ def settings(path:Path)->Settings:
     if e.get("controlled_field_policy")!={"model_input_fields":["item_index","text"],"model_output_fields":["item_index","entities","scene_type","activity_type","cue_type","normalized_predicate","supporting_text_span","confidence","ambiguity_reason","validation_status"],"program_backfilled_fields":["cue_id","atom_id","split","source_text","model_id","prompt_version","schema_version","run_id"],"raw_model_response_storage":"forbidden"}:raise ContractError("v2 受控字段策略漂移")
     if layout!={"root":"cues/shards","package_directory":"packages","input_manifest_suffix":".input.jsonl","output_suffix":".result.jsonl","ledger_suffix":".ledger.jsonl","completion_suffix":".complete.json","failed_suffix":".failed.json","merge_order":"numeric_shard_index_ascending"}:raise ContractError("v2 package 布局漂移")
     if l.get("target_requests_per_minute")!=300 or l.get("target_total_tokens_per_minute")!=1000000 or price!={"pricing_version":"2026-09-01_cn-beijing_list","official_pricing_url":"https://help.aliyun.com/zh/model-studio/model-pricing","input_price_cny_per_million_tokens":0.2,"output_price_cny_per_million_tokens":0.8,"price_region":"cn-beijing","input_context_window_tokens":32000,"retry_attempts_billed_independently":True}:raise ContractError("v2 限流或价格快照漂移")
-    return Settings(str(r["default_endpoint"]).rstrip("/"),"DASHSCOPE_API_KEY",500,5,24000,128,2,300,1000000,layout,.2,.8,32000)
+    context={"payload_version":e.get("protocol_hash_payload_version"),"model":{"model_id":c.get("model_id"),"thinking_enabled":c.get("thinking_enabled"),"reasoning_effort":c.get("reasoning_effort"),"temperature":c.get("temperature"),"prompt_version":c.get("prompt_version"),"final_cue_schema":c.get("schema"),"final_cue_schema_version":c.get("schema_version")},"service":{"endpoint":r.get("default_endpoint"),"region":r.get("default_region"),"credential_policy":r.get("credential_policy"),"raw_response_policy":r.get("raw_response_policy")}}
+    if context["payload_version"] != "v1.0.0":raise ContractError("protocol_hash_payload_version 未冻结")
+    return Settings(str(r["default_endpoint"]).rstrip("/"),"DASHSCOPE_API_KEY",500,5,24000,128,2,300,1000000,layout,.2,.8,32000,e,context)
 
 def request(prompt:str,schema:dict[str,Any],atoms:list[dict[str,Any]])->dict[str,Any]:
     # 模型输入刻意只保留局部索引和可见文本；所有标识与血缘字段由程序回填。
     items=[{"item_index":i,"text":a["visible_text"]} for i,a in enumerate(atoms)]
     return {"model":MODEL,"temperature":0,"enable_thinking":False,"max_tokens":128*len(atoms),"stream":False,"messages":[{"role":"system","content":prompt},{"role":"user","content":json.dumps({"items":items},ensure_ascii=False,separators=(",",":"))}],"response_format":{"type":"json_schema","json_schema":{"name":"cue_inference_batch_v1","strict":True,"schema":schema}}}
 def request_bytes(prompt:str,schema:dict[str,Any],atoms:list[dict[str,Any]])->int:return len(json.dumps(request(prompt,schema,atoms),ensure_ascii=False,separators=(",",":")).encode())
-def protocol_hash(config:Settings,prompt:Path,inference:Path)->str:return stable({"policy":"v2.0.0","model":MODEL,"prompt":PROMPT_VERSION,"prompt_sha256":sha(prompt),"inference_sha256":sha(inference),"max_atoms":config.max_atoms,"max_bytes":config.max_bytes,"tokens_per_atom":config.tokens_per_atom})
+def protocol_hash(config:Settings,prompt:Path,inference:Path)->str:
+    """协议哈希覆盖所有冻结执行字段，避免恢复时混用不同模型、价格、限流或布局。"""
+    return stable({**config.protocol_context,"execution":config.execution,"cue_prompt_sha256":sha(prompt),"cue_inference_schema_sha256":sha(inference)})
 def ordered(atoms:list[dict[str,Any]])->list[dict[str,Any]]:
     x=sorted(atoms,key=lambda a:str(a.get("atom_id","")));ids=[a.get("atom_id") for a in x]
     if not all(isinstance(i,str) and i for i in ids) or len(ids)!=len(set(ids)):raise ContractError("atom_id 必须非空且唯一")
@@ -107,9 +116,11 @@ def paths(root:Path,m:dict[str,Any],l:dict[str,str])->dict[str,Path]:
     return {"manifest":b/(n+l["input_manifest_suffix"]),"result":b/(n+l["output_suffix"]),"ledger":b/(n+l["ledger_suffix"]),"complete":b/(n+l["completion_suffix"]),"failed":b/(n+l["failed_suffix"])}
 def complete(m:dict[str,Any],p:dict[str,Path])->bool:
     if not all(p[k].is_file() for k in("manifest","result","ledger","complete")):return False
-    try:c=read_json(p["complete"])
+    try:
+        c=read_json(p["complete"])
+        if rows(p["manifest"]) != [m]:return False
     except ContractError:return False
-    return c.get("source_atoms_sha256")==m["source_atoms_sha256"] and c.get("cue_execution_protocol_sha256")==m["cue_execution_protocol_sha256"] and c.get("input_manifest_sha256")==sha(p["manifest"]) and c.get("result_sha256")==sha(p["result"]) and c.get("ledger_sha256")==sha(p["ledger"])
+    return c.get("package_id")==m["package_id"] and c.get("source_atoms_sha256")==m["source_atoms_sha256"] and c.get("cue_execution_protocol_sha256")==m["cue_execution_protocol_sha256"] and c.get("input_manifest_sha256")==sha(p["manifest"]) and c.get("result_sha256")==sha(p["result"]) and c.get("ledger_sha256")==sha(p["ledger"])
 def pending(ms:list[dict[str,Any]],root:Path,l:dict[str,str],rerun_failed:bool=False)->list[dict[str,Any]]:
     return [m for m in ms if not complete(m,paths(root,m,l)) and (rerun_failed or not paths(root,m,l)["failed"].is_file())]
 def parse_items(response:dict[str,Any],atoms:list[dict[str,Any]],v:jsonschema.Draft202012Validator,final:jsonschema.Draft202012Validator,run:str)->list[dict[str,Any]]:
@@ -125,9 +136,10 @@ def parse_items(response:dict[str,Any],atoms:list[dict[str,Any]],v:jsonschema.Dr
         if cue["validation_status"]=="accepted":result.append(cue)
     return result
 def preflight(ms:list[dict[str,Any]],atoms:list[dict[str,Any]],prompt:str,schema:dict[str,Any],cfg:Settings,protocol:str)->dict[str,Any]:
-    sizes=[]
+    # 预检建立一次映射，避免每个 package 重扫全部 Atom 而把线性核算退化为平方复杂度。
+    atom_map={a["atom_id"]:a for a in atoms};sizes=[]
     for m in ms:
-        subset=[next(a for a in atoms if a["atom_id"]==x["atom_id"]) for x in m["atoms"]];sizes.append(request_bytes(prompt,schema,subset))
+        subset=[atom_map[x["atom_id"]] for x in m["atoms"]];sizes.append(request_bytes(prompt,schema,subset))
     inp=sum(sizes);out=sum(cfg.tokens_per_atom*len(m["atoms"]) for m in ms);factor=cfg.retries+1
     def fee(n:int)->dict[str,float]:
         i=inp*n/1e6*cfg.input_price;o=out*n/1e6*cfg.output_price;return {"input_cny_upper_bound":i,"output_cny_upper_bound":o,"total_cny_upper_bound":i+o}
@@ -144,16 +156,17 @@ def append(path:Path,event:dict[str,Any])->None:
     with path.open("a",encoding="utf-8",newline="\n") as f:f.write(json.dumps(event,ensure_ascii=False,sort_keys=True,separators=(",",":"))+"\n");f.flush();os.fsync(f.fileno())
 def execute_package(m:dict[str,Any],atom_map:dict[str,dict[str,Any]],root:Path,prompt:str,inference:dict[str,Any],iv:jsonschema.Draft202012Validator,fv:jsonschema.Draft202012Validator,cfg:Settings,limit:Limiter)->None:
     """正式分包路径：原始响应只在内存解析，失败写无正文标记且须显式选择后才重跑。"""
-    p=paths(root,m,cfg.layout);write_rows(p["manifest"],m["atoms"]);atoms=[atom_map[x["atom_id"]] for x in m["atoms"]];payload=request(prompt,inference,atoms);body=json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode();reserved=len(body)+payload["max_tokens"];key=os.environ.get(cfg.credential)
+    p=paths(root,m,cfg.layout);write_rows(p["manifest"],[m]);atoms=[atom_map[x["atom_id"]] for x in m["atoms"]];payload=request(prompt,inference,atoms);body=json.dumps(payload,ensure_ascii=False,separators=(",",":")).encode();reserved=len(body)+payload["max_tokens"];key=os.environ.get(cfg.credential)
     if not key:raise ContractError("未设置 DASHSCOPE_API_KEY")
     req=Request(cfg.endpoint+"/chat/completions",data=body,headers={"Authorization":f"Bearer {key}","Content-Type":"application/json"},method="POST");waited=0.0
     for attempt in range(cfg.retries+1):
         waited+=limit.wait(reserved)
         try:
             with urlopen(req,timeout=60) as h:r=json.loads(h.read().decode())
-            raw=json.loads(r["choices"][0]["message"]["content"]);fragment=parse_items(raw,atoms,iv,fv,m["run_id"]);usage=r.get("usage") if isinstance(r.get("usage"),dict) else {};event={"status":"success","attempt_count":attempt+1,"prompt_tokens":usage.get("prompt_tokens"),"completion_tokens":usage.get("completion_tokens"),"total_tokens":usage.get("total_tokens"),"reserved_tokens":reserved,"rate_limit_wait_seconds":waited,"raw_response_saved":False};append(p["ledger"],event);write_rows(p["result"],fragment);write_json(p["complete"],{"source_atoms_sha256":m["source_atoms_sha256"],"cue_execution_protocol_sha256":m["cue_execution_protocol_sha256"],"input_manifest_sha256":sha(p["manifest"]),"result_sha256":sha(p["result"]),"ledger_sha256":sha(p["ledger"]),"completed_at":now(),"accepted_row_count":len(fragment)});return
+            raw=json.loads(r["choices"][0]["message"]["content"]);fragment=parse_items(raw,atoms,iv,fv,m["run_id"]);usage=r.get("usage") if isinstance(r.get("usage"),dict) else {};event={"status":"success","attempt_count":1,"prompt_tokens":usage.get("prompt_tokens"),"completion_tokens":usage.get("completion_tokens"),"total_tokens":usage.get("total_tokens"),"reserved_tokens":reserved,"rate_limit_wait_seconds":waited,"raw_response_saved":False};append(p["ledger"],event);write_rows(p["result"],fragment);write_json(p["complete"],{"package_id":m["package_id"],"source_atoms_sha256":m["source_atoms_sha256"],"cue_execution_protocol_sha256":m["cue_execution_protocol_sha256"],"input_manifest_sha256":sha(p["manifest"]),"result_sha256":sha(p["result"]),"ledger_sha256":sha(p["ledger"]),"completed_at":now(),"accepted_row_count":len(fragment)});return
         except (HTTPError,URLError,TimeoutError,json.JSONDecodeError,ContractError) as e:
-            if attempt==cfg.retries:append(p["ledger"],{"status":"failed","attempt_count":attempt+1,"prompt_tokens":None,"completion_tokens":None,"total_tokens":None,"reserved_tokens":reserved,"rate_limit_wait_seconds":waited,"failure_category":type(e).__name__,"failure_summary":str(e)[:160],"raw_response_saved":False});write_json(p["failed"],{"source_atoms_sha256":m["source_atoms_sha256"],"cue_execution_protocol_sha256":m["cue_execution_protocol_sha256"],"ledger_sha256":sha(p["ledger"]),"failure_category":type(e).__name__});raise
+            event={"status":"failed","attempt_count":1,"prompt_tokens":None,"completion_tokens":None,"total_tokens":None,"reserved_tokens":reserved,"rate_limit_wait_seconds":waited,"failure_category":type(e).__name__,"failure_summary":str(e)[:160],"raw_response_saved":False};append(p["ledger"],event)
+            if attempt==cfg.retries:write_json(p["failed"],{"package_id":m["package_id"],"source_atoms_sha256":m["source_atoms_sha256"],"cue_execution_protocol_sha256":m["cue_execution_protocol_sha256"],"ledger_sha256":sha(p["ledger"]),"failure_category":type(e).__name__});raise
             time.sleep(min(2**attempt,4))
 def merge(ms:list[dict[str,Any]],root:Path,cfg:Settings,target:Path)->int:
     if pending(ms,root,cfg.layout,True):raise ContractError("禁止合并未完成 package")
@@ -162,6 +175,12 @@ def merge(ms:list[dict[str,Any]],root:Path,cfg:Settings,target:Path)->int:
     ids=[x["cue_id"] for x in out]
     if len(ids)!=len(set(ids)):raise ContractError("合并 Cue ID 重复")
     write_rows(target,out);return len(out)
+def usage_summary(ms:list[dict[str,Any]],root:Path,cfg:Settings)->dict[str,Any]:
+    """从已封存 package 账本聚合真实服务端用量；绝不以预检上界或零值伪造账务。"""
+    events=[e for m in ms for e in rows(paths(root,m,cfg.layout)["ledger"])]
+    ok=[e for e in events if e.get("status")=="success"];bad=[e for e in events if e.get("status")!="success"]
+    def total(k:str)->int:return sum(e[k] for e in events if isinstance(e.get(k),int) and e[k]>=0)
+    return {"package_count":len(ms),"attempt_count":len(events),"successful_attempt_count":len(ok),"failed_attempt_count":len(bad),"prompt_tokens":total("prompt_tokens"),"completion_tokens":total("completion_tokens"),"total_tokens":total("total_tokens"),"missing_usage_count":sum(1 for e in events if not all(isinstance(e.get(k),int) and e[k]>=0 for k in ("prompt_tokens","completion_tokens","total_tokens"))),"retry_count":max(0,len(events)-len(ms)),"rate_limit_wait_seconds":sum(float(e.get("rate_limit_wait_seconds",0)) for e in events)}
 def run(args:argparse.Namespace)->int:
     cfg=settings(args.model_registry);source=verified_source(args.source_atoms,args.source_success);sv,iv,fv=validator(args.source_schema),validator(args.inference_schema),validator(args.cue_schema);atoms=ordered(rows(args.source_atoms))
     for a in atoms:check(sv,a,"Source Atom")
@@ -169,7 +188,7 @@ def run(args:argparse.Namespace)->int:
     if not args.execute:print(json.dumps(report,ensure_ascii=False,indent=2,sort_keys=True));return 0
     root=args.run_root/run_id;atom_map={a["atom_id"]:a for a in atoms};limit=Limiter(cfg)
     for m in pending(ms,root,cfg.layout,args.rerun_failed_packages):execute_package(m,atom_map,root,prompt,inference,iv,fv,cfg,limit)
-    count=merge(ms,root,cfg,args.output);write_json(args.success_marker,{"artifact_path":str(args.output.resolve()),"sha256":sha(args.output),"row_count":count,"contract_version":CONTRACT_VERSION,"config_version":CONFIG_VERSION,"schema_versions":{"cue_candidate":CUE_SCHEMA_VERSION},"generated_at":now(),"upstream_hashes":{"source_atoms":source["sha256"]},"cue_execution_protocol_sha256":proto,"cue_execution_policy_version":"v2.0.0","cue_prompt_sha256":sha(args.prompt),"cue_inference_schema_sha256":sha(args.inference_schema),"cue_inference_schema_version":"v1.0.0","cue_inference_schema":"cue_inference_batch_v1.schema.json","source_atoms_sha256":source["sha256"],"usage_summary":{"package_count":len(ms),"attempt_count":0,"successful_attempt_count":0,"failed_attempt_count":0,"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"missing_usage_count":0,"retry_count":0,"rate_limit_wait_seconds":0}});return 0
+    count=merge(ms,root,cfg,args.output);write_json(args.success_marker,{"artifact_path":str(args.output.resolve()),"sha256":sha(args.output),"row_count":count,"contract_version":CONTRACT_VERSION,"config_version":CONFIG_VERSION,"schema_versions":{"cue_candidate":CUE_SCHEMA_VERSION},"generated_at":now(),"upstream_hashes":{"source_atoms":source["sha256"]},"model_id":MODEL,"prompt_version":PROMPT_VERSION,"cue_execution_protocol_sha256":proto,"cue_execution_policy_version":"v2.0.0","cue_prompt_sha256":sha(args.prompt),"cue_inference_schema_sha256":sha(args.inference_schema),"cue_inference_schema_version":"v1.0.0","cue_inference_schema":"cue_inference_batch_v1.schema.json","source_atoms_sha256":source["sha256"],"usage_summary":usage_summary(ms,root,cfg)});return 0
 def parse_args(argv:list[str]|None=None)->argparse.Namespace:
     p=argparse.ArgumentParser(description=__doc__);p.add_argument("--model-registry",type=Path,default=ROOT/"config/model_registry.yaml");p.add_argument("--source-atoms",type=Path,default=ROOT/"source/source_video_atoms.jsonl");p.add_argument("--source-success",type=Path,default=ROOT/"source/SOURCE_ATOMS_SUCCESS.json");p.add_argument("--source-schema",type=Path,default=ROOT/"schemas/source_video_atom.schema.json");p.add_argument("--cue-schema",type=Path,default=ROOT/"schemas/cue_candidate.schema.json");p.add_argument("--inference-schema",type=Path,default=ROOT/"schemas/cue_inference_batch_v1.schema.json");p.add_argument("--prompt",type=Path,default=ROOT/"prompts/cue_extractor_v2.md");p.add_argument("--run-root",type=Path,default=ROOT/"cues/shards");p.add_argument("--output",type=Path,default=ROOT/"cues/cue_library.jsonl");p.add_argument("--success-marker",type=Path,default=ROOT/"cues/CUE_LIBRARY_SUCCESS.json");p.add_argument("--run-id");p.add_argument("--execute",action="store_true");p.add_argument("--rerun-failed-packages",action="store_true");return p.parse_args(argv)
 def main()->int:

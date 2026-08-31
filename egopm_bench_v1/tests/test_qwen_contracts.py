@@ -35,7 +35,7 @@ def test_v2_parser_backfills_and_rejects_private_or_cross_atom_fields()->None:
  with pytest.raises(m.ContractError,match="支撑原文"):m.parse_items(bad,a,inf,final,"run")
 def test_protocol_and_complete_package_hashes_gate_recovery(tmp_path:Path)->None:
  m=load();c=m.settings(ROOT/"config/model_registry.yaml");schema=m.read_json(ROOT/"schemas/cue_inference_batch_v1.schema.json");p=tmp_path/"prompt.md";p.write_text("p",encoding="utf-8");s=tmp_path/"schema.json";s.write_text(json.dumps(schema),encoding="utf-8");proto=m.protocol_hash(c,p,s);pack=m.packages([atom(1)],"source","p",schema,c,proto,"run")[0];files=m.paths(tmp_path,pack,c.layout)
- m.write_rows(files["manifest"],pack["atoms"]);m.write_rows(files["result"],[]);m.write_rows(files["ledger"],[{"status":"success","raw_response_saved":False}]);m.write_json(files["complete"],{"source_atoms_sha256":"source","cue_execution_protocol_sha256":proto,"input_manifest_sha256":m.sha(files["manifest"]),"result_sha256":m.sha(files["result"]),"ledger_sha256":m.sha(files["ledger"])})
+ m.write_rows(files["manifest"],[pack]);m.write_rows(files["result"],[]);m.write_rows(files["ledger"],[{"status":"success","raw_response_saved":False}]);m.write_json(files["complete"],{"package_id":pack["package_id"],"source_atoms_sha256":"source","cue_execution_protocol_sha256":proto,"input_manifest_sha256":m.sha(files["manifest"]),"result_sha256":m.sha(files["result"]),"ledger_sha256":m.sha(files["ledger"])})
  assert m.pending([pack],tmp_path,c.layout)==[]
  files["ledger"].write_text("tampered\n",encoding="utf-8");assert m.pending([pack],tmp_path,c.layout)==[pack]
 def test_preflight_costs_are_read_only_and_retry_conservative()->None:
