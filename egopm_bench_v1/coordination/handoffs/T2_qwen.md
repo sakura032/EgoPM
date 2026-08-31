@@ -6,16 +6,17 @@ T2 已完成 `CR-2026-007` 的无 API 代码与合成测试收尾。第 05 步�
 最多五条 Atom 自适应 package 协议，默认只做只读预检；没有调用千问、没有读取真实
 密钥、没有生成正式 Cue、Seed、`CUE_LIBRARY_SUCCESS.json` 或 `SEED_CANDIDATES_SUCCESS.json`。
 
-本交接对应代码提交为 `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6`。它建立在
-`9b2490e`（v2 初始实现）、`b552b74`（package 完整性补丁）、`88efa16`（协议载荷版本）
-和 `d67aab7`（T4 完整协议 QA）之上。
+本交接对应代码提交为 `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6` 与
+`22862d3d21ac19ca8b8f43d2627641aa9ce1f906`。后者修复最终 SUCCESS 的受管相对路径，
+避免 T4 因绝对路径拒绝正式产物。它们建立在 `9b2490e`（v2 初始实现）、`b552b74`
+（package 完整性补丁）、`88efa16`（协议载荷版本）和 `d67aab7`（T4 完整协议 QA）之上。
 
 ## 交接元数据
 
 | 项目 | 值 |
 | --- | --- |
 | 分支 | `main` |
-| T2 代码提交 | `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6` |
+| T2 代码提交 | `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6`、`22862d3d21ac19ca8b8f43d2627641aa9ce1f906` |
 | 治理合同版本 | `v1.1.0` |
 | 配置合同版本 | `v1.1.0` |
 | 最终 Cue Schema | `v1.0.0` |
@@ -45,7 +46,8 @@ T2 已完成 `CR-2026-007` 的无 API 代码与合成测试收尾。第 05 步�
     不删除历史失败尝试。最终合并按数字 shard/package 顺序进行，任何未完成包都阻断合并。
   - `usage_summary` 仅汇总实际账本中的非负、三字段一致的服务端 usage；缺失 usage 单独计数，
     不会用预检数字或零伪造实际账务。
-  - 最终 `CUE_LIBRARY_SUCCESS.json` 在合并后最后原子写入，包含
+  - 最终 `CUE_LIBRARY_SUCCESS.json` 在合并后最后原子写入；`artifact_path` 强制为
+    `egopm_bench_v1` 根相对 POSIX 路径，ROOT 外输出直接拒绝，包含
     `protocol_hash_payload_version`、完整协议哈希、提示词/推理 Schema 哈希、Source 哈希和
     实际用量汇总，以满足 T4 的 Cue v2 QA 门。
 
