@@ -41,40 +41,38 @@ def copy_config_tree(destination: Path) -> Path:
     return benchmark / "config" / "benchmark_protocol.yaml"
 
 
+def write_valid_marker(qa, config, stage: str, artifact_key: str, marker_key: str, upstream_hashes: dict[str, str]) -> dict:
+    """按阶段冻结表构造测试用 SUCCESS，避免测试把全局版本当作 Schema 版本。"""
+
+    artifact = config.artifact(artifact_key)
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text('{"synthetic":true}\n', encoding="utf-8")
+    versions = qa.STAGE_ARTIFACT_VERSIONS[stage]
+    marker = {
+        "artifact_path": config.canonical_artifact_name(artifact),
+        "sha256": qa.sha256_file(artifact),
+        "row_count": 1,
+        "contract_version": versions["contract_version"],
+        "config_version": versions["config_version"],
+        "schema_versions": dict(versions["schema_versions"]),
+        "generated_at": "2026-08-31T00:00:00+00:00",
+        "upstream_hashes": upstream_hashes,
+    }
+    marker_path = config.marker(marker_key)
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(json.dumps(marker), encoding="utf-8")
+    return marker
+
+
 def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
     qa = load_validator()
     config_path = copy_config_tree(tmp_path)
     config = qa.load_run_config(config_path)
+    marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     artifact = config.artifact("source_atoms")
-    artifact.parent.mkdir(parents=True)
-    artifact.write_text('{"atom_id":"src_test"}\n', encoding="utf-8")
-    marker = {
-        "artifact_path": "source/source_video_atoms.jsonl",
-        "sha256": qa.sha256_file(artifact),
-        "row_count": 1,
-        "contract_version": "v1.1.0",
-        "config_version": "v1.1.0",
-        "schema_versions": {"source_video_atom": "v1.1.0"},
-        "generated_at": "2026-08-31T00:00:00+00:00",
-        "upstream_hashes": {},
-    }
-    marker_path = config.marker("source_atoms")
-    marker_path.parent.mkdir(parents=True, exist_ok=True)
-    marker_path.write_text(json.dumps(marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert qa.marker_is_valid(config, "source", "source_atoms", "source_atoms", "T1 source", collector)
-    cue_artifact = config.artifact("cue_library")
-    cue_artifact.parent.mkdir(parents=True)
-    cue_artifact.write_text('{"cue_id":"cue_test"}\n', encoding="utf-8")
-    cue_marker = dict(marker)
-    cue_marker.update(
-        {
-            "artifact_path": "cues/cue_library.jsonl",
-            "sha256": qa.sha256_file(cue_artifact),
-            "upstream_hashes": {},  # 故意漏掉已验证的 source SHA256。
-        }
-    )
-    config.marker("cue_library").write_text(json.dumps(cue_marker), encoding="utf-8")
+    cue_marker = write_valid_marker(qa, config, "cue", "cue_library", "cue_library", {})
     upstream_collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", upstream_collector)
     assert any(issue["issue_type"] == "success_marker_upstream_hash" for issue in upstream_collector.issues)
@@ -82,6 +80,48 @@ def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
     tampered_collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "source", "source_atoms", "source_atoms", "T1 source", tampered_collector)
     assert any(issue["issue_type"] == "success_marker_hash" for issue in tampered_collector.issues)
+
+
+def test_stage_version_map_accepts_frozen_source_and_cue_schema_versions(tmp_path: Path) -> None:
+    """Source v1.1 与 Cue v1.0 应各自按冻结版本通过，不能由全局版本混淆。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    source_collector = qa.IssueCollector()
+    assert qa.marker_is_valid(config, "source", "source_atoms", "source_atoms", "T1 source", source_collector)
+
+    write_valid_marker(
+        qa,
+        config,
+        "cue",
+        "cue_library",
+        "cue_library",
+        {"source_atoms": source_marker["sha256"]},
+    )
+    cue_collector = qa.IssueCollector()
+    assert qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", cue_collector)
+
+
+def test_stage_version_map_rejects_wrong_cue_schema_version(tmp_path: Path) -> None:
+    """Cue 标记若把其 v1.0 Schema 声明成 v1.1，必须在读取 JSONL 前被阻断。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    cue_marker = write_valid_marker(
+        qa,
+        config,
+        "cue",
+        "cue_library",
+        "cue_library",
+        {"source_atoms": source_marker["sha256"]},
+    )
+    cue_marker["schema_versions"] = {"cue_candidate": "v1.1.0"}
+    config.marker("cue_library").write_text(json.dumps(cue_marker), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "success_marker_schema_versions" for issue in collector.issues)
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:

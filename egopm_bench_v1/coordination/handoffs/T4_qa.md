@@ -1,5 +1,12 @@
 # T4 Wave 1 独立 QA 交接
 
+## 第 05 步无 API 启动修复：阶段冻结 Schema 版本
+
+- 适用提交：本段随本次 T4 提交写入；未运行正式 Cue、Seed 或完整生产 QA，未调用千问。
+- 修复范围：`scripts/11_validate_all.py` 将 SUCCESS 校验从“所有 Schema 版本必须等于全局 `CONTRACT_VERSION`”改为显式 `STAGE_ARTIFACT_VERSIONS`。它分别冻结 Source 的 `source_video_atom` 与 `source_video_atom_draft` 为 `v1.1.0`，Cue 的 `cue_candidate` 为 `v1.0.0`，candidate/frozen 的 `reminder_seed` 为 `v1.0.0`，lifelog 的 `lifelog` 为 `v1.0.0`，decisions 的 `decision_instance` 为 `v1.0.0`；伴随正式产物的 `state_machine_policy`、`reminder_seed`、`lifelog` 声明也逐项保留校验。
+- SUCCESS 版本边界：每个阶段同时固定自己的 `contract_version` 和 `config_version`。因此未来执行配置升级不会追溯否定已冻结的 Source `v1.1.0` 标记；每个下游新阶段须由 T0 在其正式启动前确认并更新对应冻结表，不能以全局版本猜测。
+- 合成测试：新增 Source `v1.1.0` 标记可通过、携带已验证 Source 哈希的 Cue `cue_candidate: v1.0.0` 标记可通过、错误 Cue `v1.1.0` 声明被 `success_marker_schema_versions` 阻断的无 API 测试。测试只在临时目录写 synthetic 文件，不会触碰任何正式 JSONL 或 SUCCESS。
+
 ## 交接元数据
 
 - 分支 / Wave 1 实现提交：`HEAD (no branch)` / `08e5d0e6decdc435f198d4c334ffa3025c331649`。

@@ -45,6 +45,53 @@ STAGES: tuple[tuple[str, str, str, str, str], ...] = (
     ("lifelog", "lifelogs", "lifelogs", "lifelog.schema.json", "T3 compiler"),
     ("decisions", "decisions", "decision_instances", "decision_instance.schema.json", "T3 compiler"),
 )
+# 每个阶段在首次正式产物发布时冻结自己的合同、配置和 Schema 版本。后续执行配置
+# 可以升级，但已经完成且被下游引用的 Source 不能因此被追溯判为无效；反过来，不能
+# 用全局合同版本替代具体 Schema 版本，否则会把仍为 v1.0.0 的 Cue 误判为错误。
+STAGE_ARTIFACT_VERSIONS: dict[str, dict[str, Any]] = {
+    "source": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {
+            "source_video_atom": "v1.1.0",
+            "source_video_atom_draft": "v1.1.0",
+        },
+    },
+    "cue": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {"cue_candidate": "v1.0.0"},
+    },
+    "candidate": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {"reminder_seed": "v1.0.0"},
+    },
+    "frozen": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {
+            "reminder_seed": "v1.0.0",
+            "state_machine_policy": "v1.0.0",
+        },
+    },
+    "lifelog": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {
+            "lifelog": "v1.0.0",
+            "reminder_seed": "v1.0.0",
+        },
+    },
+    "decisions": {
+        "contract_version": "v1.1.0",
+        "config_version": "v1.1.0",
+        "schema_versions": {
+            "decision_instance": "v1.0.0",
+            "lifelog": "v1.0.0",
+        },
+    },
+}
 STAGE_DEPENDENCIES = {
     "source": (),
     "cue": ("source",),
@@ -283,26 +330,50 @@ def marker_is_valid(
     if actual_name not in expected_names:
         collector.add("BLOCKER", "success_marker_artifact", stage, f"artifact_path 为 {sorted(expected_names)}", actual_name, owner)
         valid = False
-    if marker["contract_version"] != CONTRACT_VERSION or marker["config_version"] != CONTRACT_VERSION:
+    expected_versions = STAGE_ARTIFACT_VERSIONS[stage]
+    expected_contract_version = expected_versions["contract_version"]
+    expected_config_version = expected_versions["config_version"]
+    if (
+        marker["contract_version"] != expected_contract_version
+        or marker["config_version"] != expected_config_version
+    ):
         collector.add(
             "BLOCKER",
             "success_marker_version",
             stage,
-            f"contract_version/config_version 均为 {CONTRACT_VERSION}",
+            "contract_version/config_version 分别为 "
+            f"{expected_contract_version}/{expected_config_version}",
             f"{marker['contract_version']}/{marker['config_version']}",
             owner,
         )
         valid = False
     schema_versions = marker["schema_versions"]
-    if isinstance(schema_versions, dict):
-        declared_versions = set(str(value) for value in schema_versions.values())
-    elif isinstance(schema_versions, list):
-        declared_versions = set(str(value) for value in schema_versions)
-    else:
-        declared_versions = set()
-    if CONTRACT_VERSION not in declared_versions:
-        collector.add("BLOCKER", "success_marker_schema_versions", stage, f"声明 schema 版本 {CONTRACT_VERSION}", repr(schema_versions), owner)
+    expected_schema_versions = expected_versions["schema_versions"]
+    if not isinstance(schema_versions, dict):
+        collector.add(
+            "BLOCKER",
+            "success_marker_schema_versions",
+            stage,
+            f"对象类型且包含 {expected_schema_versions}",
+            repr(schema_versions),
+            owner,
+        )
         valid = False
+    else:
+        # 标记必须用 Schema 名称逐项声明，不能只出现相同的版本字符串；否则 v1.0.0
+        # 的 Cue 与 v1.1.0 的 Source 会在同一执行合同下被混淆，失去可复现的边界。
+        for schema_key, expected_schema_version in expected_schema_versions.items():
+            actual_schema_version = schema_versions.get(schema_key)
+            if actual_schema_version != expected_schema_version:
+                collector.add(
+                    "BLOCKER",
+                    "success_marker_schema_versions",
+                    stage,
+                    f"schema_versions[{schema_key!r}] 为 {expected_schema_version}",
+                    repr(actual_schema_version),
+                    owner,
+                )
+                valid = False
     try:
         timestamp = str(marker["generated_at"]).replace("Z", "+00:00")
         datetime.fromisoformat(timestamp)
