@@ -1,107 +1,106 @@
-# T2 千问候选生成交接
+# T2 交接：Cue v2 无 API 执行器收尾
 
-## CR-2026-007：Cue v2 无 API 实施
+## 当前结论
 
-- 第 05 步已迁移至 `cue_extractor_v2` 协议：按 `atom_id` 排序，每逻辑 shard 最多 `500` 条 Atom，并以最多 `5` 条、序列化请求不超过 `24000` UTF-8 字节自适应组成 package；每包输出上限固定为 `128 × package Atom 数`。
-- 模型输入仅为 `items[].item_index` 与 `items[].text`。推理数组经过 `cue_inference_batch_v1.schema.json` 验证、索引全覆盖和同 Atom 原文片段检查后，程序才回填最终 Cue 的身份、split、原文、模型、提示词、Schema 和 run 字段。
-- package 清单、结果片段、无正文账本、完成或失败标记均绑定 Source 哈希和 `cue_execution_protocol_sha256`；该协议哈希是提示词字节、推理 Schema 字节和冻结执行字段的规范 JSON 哈希。完整 package 才跳过，失败 package 仅可由显式 `--rerun-failed-packages` 进入重跑。
-- 默认命令仍只读；本次没有执行 `--execute`，没有读取密钥、联网或生成任何正式 Cue/SUCCESS。合成测试验证五条自适应包、最小输入、私传受控字段/跨 Atom 原文拒绝、协议与账本哈希恢复及重试费用上界。
+T2 已完成 `CR-2026-007` 的无 API 代码与合成测试收尾。第 05 步现在使用固定的
+最多五条 Atom 自适应 package 协议，默认只做只读预检；没有调用千问、没有读取真实
+密钥、没有生成正式 Cue、Seed、`CUE_LIBRARY_SUCCESS.json` 或 `SEED_CANDIDATES_SUCCESS.json`。
 
-## 第 05 步离线分片建设补充（未调用 API）
+本交接对应代码提交为 `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6`。它建立在
+`9b2490e`（v2 初始实现）、`b552b74`（package 完整性补丁）、`88efa16`（协议载荷版本）
+和 `d67aab7`（T4 完整协议 QA）之上。
 
-- 本次只实现第 05 步的离线启动修复和可恢复分片框架；没有读取 `DASHSCOPE_API_KEY`，没有调用千问，也没有写入 `cues/cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json`、任何正式 Cue 或 Seed。
-- `05_extract_cues.py` 现在将 `SOURCE_ATOMS_SUCCESS.json` 的相对 `artifact_path` 严格解释为 `egopm_bench_v1` 项目根相对路径，接受已冻结的 `source/source_video_atoms.jsonl`，拒绝绝对错误目标、`..` 越界和以 SUCCESS 所在目录猜测路径的旧行为。
-- 模型与执行参数全部从 T0 冻结的 `models.cue_extraction.execution` 读取并逐字段校验：`explicit_execute_only`、每 shard `500` 个 Atom、`max_tokens=512`、`max_retries=2`、目标 `300` RPM / `1,000,000` TPM、服务端 `response_usage` 为权威、原始响应禁止落盘，以及固定的 shard 文件后缀和数值顺序合并规则。
-- 实际执行分支在每一个 HTTP 尝试（包括重试）之前执行保守无突发节流：token 预留为该次实际序列化 UTF-8 请求字节数加 `max_tokens`，间隔取 `60/RPM` 与 `预留 token×60/TPM` 中较严格者。逐请求账本持久化单次/累计预留 token、累计实际等待秒数和尝试数；该信息不含模型正文，也不替代服务端 `response_usage` 的实际结算统计。
-- `pricing_snapshot` 现由第 05 步精确校验：`2026-09-01_cn-beijing_list`、官方价格页、北京不超过 `32K` 输入窗口、输入 `¥0.2/百万 token`、输出 `¥0.8/百万 token` 与重试独立计费均不可漂移。只读预检在每个请求 UTF-8 token 上界不超过该窗口时，显式给出基准每 Atom 一次尝试以及每 Atom 均耗尽 `2` 次重试（共 `3` 次尝试）的输入、输出和总计 `CNY` 保守上界；超出窗口则拒绝把该快照用于费用估算。
-- 默认启动为只读 `preflight`：验证 SUCCESS/Schema、按 `atom_id` 排序、核算 shard 与严格的请求 UTF-8 字节 token 上界，并打印报告；该路径不会读取环境变量、不会网络访问、不会创建运行目录。只有显式传入 `--execute` 才允许进入读取凭据和模型调用的分支。
-- 正式执行分片时，每个 shard 独立保存输入 Atom ID/规范行哈希清单、输出 JSONL、逐请求账本和完成标记；完成标记绑定来源哈希、输入清单 SHA256、输出 SHA256 和账本 SHA256。恢复时只跳过完全匹配当前清单与哈希的完成 shard，缺失、失败或失配 shard 会被单独重跑；合并拒绝任何未完成 shard，并按数字 shard 编号固定顺序进行。
-- 恢复完整性补丁：完成判定现在强制要求账本文件存在，且完成标记的 `ledger_sha256` 必须匹配当前账本；账本缺失或任一字节被篡改都会把 shard 重新列为待处理，不能被恢复逻辑跳过。对应合成测试覆盖这两种情况。
-- 账本逐请求记录 `usage.prompt_tokens`、`usage.completion_tokens`、`usage.total_tokens`、重试次数、失败类别/截断摘要、模型和 Atom 身份；缺少服务端 usage 显式写为 `null`。账本不写 `choices`、模型正文或原始 HTTP 响应。
-- 新增无 API 合成测试覆盖：项目内相对路径与越界拒绝、固定请求参数、服务端 usage 选择、确定性分片覆盖及顺序、完成 shard 跳过、未完成 shard 拒绝合并、账本无正文、预检只读和冻结执行配置读取。所有测试文件均在 `pytest` 临时目录，不会写正式输出。
+## 交接元数据
 
-## 仍需 T0 决策
-
-该项已由 T0 的 `pricing_snapshot` 冻结并由第 05 步校验；预检可在价格窗口覆盖时给出可审计费用上界。无新增 `CHANGE_REQUEST`。
-
-## 当前状态
-
-- 治理合同版本：`v1.1.0`。
-- 数据合同版本：`v1.0.0`。
-- 分支 / 基线提交：游离 `HEAD` / `be6f05f`；T2 Wave 1 实现提交：`484945a`；本交接回填提交会在该实现提交之后创建。
-- 已遵守治理合同 `v1.1.0` 的代码说明门禁：本次维护的每个 Python 文件均以中文模块说明交代职责、输入/输出与流水线位置；SUCCESS/哈希门、过滤、检索、模型调用、异常处理与原子写入均补充了说明其原因的中文注释。未修改 `AGENTS.md`、`config/**` 或 `schemas/**`。
-- 第 1 波的接口与 `Schema` 合同开发已完成；没有读取 `source/`，没有调用远端千问，也没有创建任何正式线索、种子或 `SUCCESS` 产物。
-- 当前门禁：线索库与种子候选仍为 `BLOCKED`，原因是不存在 `SOURCE_ATOMS_SUCCESS.json`，且来源质检尚未由 T4 标记为 `DONE`。
-
-## 修改文件
-
-- `prompts/cue_extractor_v1.md`
-- `prompts/seed_generator_v1.md`
-- `prompts/seed_auditor_v1.md`
-- `scripts/05_extract_cues.py`
-- `scripts/06_retrieve_trigger_lures.py`
-- `scripts/07_generate_seed_candidates.py`
-- `tests/test_qwen_contracts.py`
-- 本交接文件。
-
-## 治理说明验收
-
-- `scripts/05_extract_cues.py`：中文模块说明已写明第 05 阶段职责、来源输入、线索库输出与前后门；SUCCESS/哈希门、固定模型、可见文本过滤、异常重试、原文可追溯检查与原子写入均有中文“为什么”注释。
-- `scripts/06_retrieve_trigger_lures.py`：中文模块说明已写明第 06 阶段的来源/线索输入、检索集合输出和第 07 阶段关系；SUCCESS/哈希门、同 split 过滤、至少两个诱饵、排序可重现性、临时 JSON Schema 与原子写入均有中文“为什么”注释。
-- `scripts/07_generate_seed_candidates.py`：中文模块说明已写明第 07 阶段的三类上游输入、种子候选输出和人工审计前位置；血缘哈希链、固定模型、环境凭据、触发/诱饵过滤、终止条件、异常重试与原子写入均有中文“为什么”注释。
-- `tests/test_qwen_contracts.py`：中文模块说明已写明合成输入、断言输出和仅用于来源冻结前的开发位置；测试通过假的 HTTP 调用器保证不会访问远端模型。
-
-## 实现与验证
-
-- `05_extract_cues.py` 仅在 `SOURCE_ATOMS_SUCCESS.json` 存在、`artifact_path`、行数和 `SHA256` 均匹配时读取来源原子；以 `qwen3.7-flash-2026-07-15` 和严格 `json_schema` 逐 `atom` 生成线索，并验证原文连续子串、`split`、`Schema` 和受控元数据。
-- `06_retrieve_trigger_lures.py` 同时验证来源与线索的成功标记，以可复现的词项 `Jaccard` 排序生成至少两个不同的同 `split` 诱饵；写入前以脚本内严格 `JSON Schema` 验证，其输出仅是受控的候选输入，不包含金标。
-- `07_generate_seed_candidates.py` 验证来源、线索和检索输入的 `SUCCESS` 哈希链，以 `qwen3.7-plus-2026-05-26` 和严格 `json_schema` 生成 `candidate` 种子，并检查 `trigger`、两个同 `split lure`、谓词包含关系、有效窗口和四种终止不触发条件。
-- `API Key` 没有命令行参数、配置文件回退或日志回显；调用代码只读取 `DASHSCOPE_API_KEY`。成功标记及每条 `Schema` 记录保存 `model`、`prompt`、`schema`、`run` 等元数据；原始模型响应不写入仓库。
-- 手写合成对象仅位于 `test_qwen_contracts.py` 与 `pytest` 临时目录，用假的 `HTTP opener` 验证请求和响应；它们不属于 `P0`、`P1`、`smoke` 或正式数据。
-
-## 只读输入哈希
-
-| 输入 | `SHA256` |
+| 项目 | 值 |
 | --- | --- |
-| `config/model_registry.yaml` | `e65af16b73f831e170cb17625fe2df375c3189b8fcbf9ceba857f217c4ec6a9f` |
-| `schemas/source_video_atom.schema.json` | `a97d72984a0b41fccca87832f79d38f3b15d8c1e54c24e439f38005b2d0967e6` |
-| `schemas/cue_candidate.schema.json` | `d92316a1202470c20402ed855563c8b20d42b58d885eb06b5575f6ace81b1b5d` |
-| `schemas/reminder_seed.schema.json` | `a5e7ba9d34d7e0f38a83e943d8032144d49e57204acb15b335cab12015c58e95` |
+| 分支 | `main` |
+| T2 代码提交 | `6628eb02d7fa0a6ad12c566654c408ec9d9d61b6` |
+| 治理合同版本 | `v1.1.0` |
+| 配置合同版本 | `v1.1.0` |
+| 最终 Cue Schema | `v1.0.0` |
+| 推理批次 Schema | `cue_inference_batch_v1.schema.json` / `v1.0.0` |
+| 生产调用状态 | 未授权、未执行 |
 
-## 输出哈希
+## 本次修改
 
-本次没有正式输出，因此没有 `CUE_LIBRARY_SUCCESS.json`、`SEED_CANDIDATES_SUCCESS.json` 或正式 `JSONL` 哈希。测试临时文件在 `pytest` 结束后已删除。
+- `scripts/05_extract_cues.py`
+  - 默认路径只验证 Source SUCCESS、Schema、排序、分包和费用上界；不读取环境变量、不联网、
+    不创建运行目录。
+  - 以 `atom_id` 固定排序；每逻辑 shard 最多 `500` 条 Atom，再以最多 `5` 条和实际
+    序列化请求不超过 `24000` UTF-8 字节双门限组成 package。
+  - 模型输入仅含 `item_index` 和 `text`；程序只在推理 Schema、索引覆盖、同 Atom 原文
+    子串和谓词槽位检查均通过后，回填 `cue_id`、`atom_id`、`split`、`source_text`、模型、
+    提示词、Schema 与 `run_id`。
+  - 使用和 T4 完全一致的 canonical 协议载荷哈希：`payload_version`、模型字段、服务字段、
+    完整 `execution`、提示词 SHA256 与推理 Schema SHA256。该哈希变更会使旧 package
+    不可恢复。
+  - package 清单绑定 `run_id`、Source 哈希、协议哈希及每条 Atom 的 canonical SHA256。
+    `complete` 只有在当前清单完全相等、包 ID/Source/协议匹配、清单/结果/账本 SHA256
+    全匹配时才可复用。
+  - 每个 HTTP 尝试都以 fsync 追加无正文账本：run/package/Atom、请求时间、模型与服务
+    参数、重试次数、本次限流等待、三个 `usage` 字段、解析状态、失败类别摘要和血缘哈希。
+    不保存请求正文、模型正文、原始 HTTP 响应或 API Key。
+  - 失败 package 只有显式传入 `--rerun-failed-packages` 才会重跑；重跑增加账本周期，
+    不删除历史失败尝试。最终合并按数字 shard/package 顺序进行，任何未完成包都阻断合并。
+  - `usage_summary` 仅汇总实际账本中的非负、三字段一致的服务端 usage；缺失 usage 单独计数，
+    不会用预检数字或零伪造实际账务。
+  - 最终 `CUE_LIBRARY_SUCCESS.json` 在合并后最后原子写入，包含
+    `protocol_hash_payload_version`、完整协议哈希、提示词/推理 Schema 哈希、Source 哈希和
+    实际用量汇总，以满足 T4 的 Cue v2 QA 门。
 
-## 测试
+- `tests/test_qwen_contracts.py`
+  - 新增或恢复纯合成测试：最小模型输入、五条自适应分包、受控字段和跨 Atom 原文拒绝、
+    T4 一致的完整协议载荷、清单/账本篡改恢复拒绝、逐次尝试账本及真实 usage 汇总、默认
+    只读预检、最终 SUCCESS 的 `protocol_hash_payload_version`。
+  - 恢复第 06 阶段同 split 两个诱饵和第 07 阶段 Seed 请求/终止静默条件回归，避免 v2
+    测试取代既有第 06/07 覆盖。
+
+## 只读输入与冻结哈希
+
+| 输入 | SHA256 |
+| --- | --- |
+| `source/source_video_atoms.jsonl` | `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e` |
+| `config/model_registry.yaml` | `d453e39359b8970b5afba116fa8e19796d3dfe6d6766979175490c5d7d71a59a` |
+| `prompts/cue_extractor_v2.md` | `af927b5979d5f97954187a68142f4e5a039619ce08037caf2b5f7852eaef7257` |
+| `schemas/cue_inference_batch_v1.schema.json` | `47a63f306184e60e22d155ddf7380d05791f9d0fc9c4b825650d5c3290b6cf25` |
+| `schemas/cue_candidate.schema.json` | `c69c700f7be237b3f06bceffc2685ef3d32e3b7e5e306b7e62fcaa60d3fb3139` |
+
+本次没有正式输出哈希：没有写入任何生产 Cue JSONL、Seed JSONL、SUCCESS 标记或模型响应。
+测试工件只在 pytest 临时目录内创建并由测试框架清理。
+
+## 中文说明与注释验收
+
+- `scripts/05_extract_cues.py` 的首个有效内容为中文模块说明，明确第 05 阶段职责、输入、
+  输出与流水线位置。
+- Source SUCCESS 相对路径和哈希、完整协议哈希、双门限分包、fsync 原子写入、完成复用、
+  显式失败重跑、每次限流等待、无正文异常、确定性合并和 SUCCESS 最后写入均有中文注释，
+  说明对应的数据血缘、成本或评测约束。
+- `tests/test_qwen_contracts.py` 的首个有效内容为中文模块说明；所有 fixture 均标记为合成，
+  且假 HTTP 响应只在内存中使用。
+
+## 验证结果
 
 ```powershell
-python -m py_compile egopm_bench_v1/scripts/05_extract_cues.py egopm_bench_v1/scripts/06_retrieve_trigger_lures.py egopm_bench_v1/scripts/07_generate_seed_candidates.py
+python -m py_compile egopm_bench_v1/scripts/05_extract_cues.py egopm_bench_v1/tests/test_qwen_contracts.py
 # 通过
 
-python -m pytest -q egopm_bench_v1/tests/test_qwen_contracts.py
-# 6 passed
-
-python -m pytest -q --basetemp .pytest_cache/t2
+python -m pytest -q egopm_bench_v1/tests/test_qwen_contracts.py --basetemp .pytest_cache/t2-v2-targeted
 # 9 passed
+
+python -m pytest -q --basetemp .pytest_cache/t2-v2-final
+# 41 passed
 
 git diff --check
 # 通过
 ```
 
-## CHANGE_REQUEST 状态
+## CHANGE_REQUEST 与下一门
 
-以下建议尚未登记，等待 T0 按数据合同 `v1.0.0` 的变更流程分配编号与决定：
-
-### CR-2026-待分配：生产级触发/诱饵语义检索合同
-
-- 提出者 / handoff：T2 / `coordination/handoffs/T2_qwen.md`。
-- 当前合同版本：治理合同 `v1.1.0`；数据合同 `v1.0.0`。
-- 受影响字段与产物：`config/model_registry.yaml` 中的检索模型、版本、端点与凭据策略；`config/paths.yaml` 中的 `trigger_lure_sets.jsonl` 路径及 SUCCESS 标记；新增或冻结的检索集合 `JSON Schema`；`cues/trigger_lure_sets.jsonl` 与其成功标记；依赖该集合的候选 Seed。
-- 现有合同无法表达该需求的原因：生产指南提到 `BGE-M3`，但冻结 config 未登记模型 ID、版本、端点、依赖、嵌入/排序参数或可复现性设置；现有 schemas 与 paths 也未定义 `trigger_lure_sets.jsonl`、其 Schema 或 SUCCESS 哈希血缘。因此 T2 无法把该中间产物视为冻结的正式语义检索结果。
-- 建议的兼容修改或迁移方式：T0 明确并登记生产检索模型（若选择 `BGE-M3`，须包括精确模型版本）、端点/凭据、依赖锁定、候选池、相似度、排序与并列规则；在 paths 和 schemas 中冻结检索 artifact、SUCCESS 标记和上游哈希字段。若不采用语义模型，应正式登记确定性词项检索算法及其全部参数。`06` 当前的 `Jaccard` 实现仅可用于接口 fixture 开发，不能作为冻结的正式语义检索方案。
-- 必须重新生成的上游/下游产物：合同接受后重新生成检索集合及其成功标记；若模型或格式发生变化，重新生成受影响的正式 Seed candidates、后续审计冻结、规则、life log、decision 与 QA 产物。
-- 证明该问题的测试：`python -m pytest -q egopm_bench_v1/tests/test_qwen_contracts.py` 验证当前临时严格结构与同 split 条件；该测试不能证明未登记的生产语义模型、版本、端点或排序参数。
-
-## 下一门
-
-当前下一门不能启动。仅在 T0 冻结 `SOURCE_ATOMS_SUCCESS.json` 的哈希且 T4 的来源质检为 `DONE` 后，T2 才可运行 `05_extract_cues.py` 生成正式线索库；在线索成功标记经 T4 线索质检通过、且上述检索 CHANGE_REQUEST 已由 T0 决定后，才可运行 `06` 和 `07`。T2 不负责冻结种子或生成提醒/静默金标。
+- `CR-2026-007`：无 API v2 代码实现已由 T2 完成，仍待 T0 审阅、合并并在状态板确认。
+  不涉及 T2 改动 `config/**` 或 `schemas/**`；协议冻结由 T0 提交维护。
+- Cue 正式生产仍为 `BLOCKED`：必须先由用户明确确认预算、执行范围和分批方案。该确认前，
+  禁止传入 `--execute`、调用千问、写 `cues/cue_library.jsonl` 或写
+  `cues/CUE_LIBRARY_SUCCESS.json`。
+- T4 应在 T0 合并后审阅本交接中的全量协议哈希、SUCCESS 字段和无 API 测试结果；该 QA
+  审阅不构成生产调用授权。
