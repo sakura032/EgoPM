@@ -6,7 +6,7 @@
 
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| Contract v1 | T0 | DONE | v1.0.0；初始 Git 提交待完成 | 无 | 允许 Wave 1 的 fixture-only 开发 |
+| Contract v1 | T0 | DONE | v1.0.0；`487fa9a` | 无 | 允许 Wave 1 的 fixture-only 开发 |
 | Source atoms | T1 | TODO | — | 代码开发无阻断；正式输出前须经 T4 source QA | 实现并单测 01–04 |
 | Source QA | T4 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 | 以 synthetic fixture 实现验证器 |
 | Cue library | T2 | BLOCKED | — | `SOURCE_ATOMS_SUCCESS` 哈希 + Source QA DONE | 仅实现客户端与合同 |
@@ -20,7 +20,7 @@
 
 ## T0 审阅记录
 
-- 仓库已在 Wave 0 初始化。`raw/` 中有 808 个 SRT 文件并已被忽略；没有源媒体或源数据加入 Git。
+- Wave 0 合同冻结提交为 `487fa9a`。`raw/` 中有 808 个 SRT 文件并已被忽略；没有源媒体或源数据加入 Git。
 - 本合同冻结数据形状、路径语义、文件所有权、SUCCESS 标记语义、来源 split 策略、模型登记表和评测协议结构。
 - 数值型记忆预算与重复提醒参数刻意保持待定。这符合研究规范，并阻断所有正式 oracle 输出。
 - 全部 Markdown 正文必须中文撰写；字段名、命令、路径和不可翻译专名除外。T0 将以此作为合并硬门禁。
