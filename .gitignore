@@ -1,0 +1,37 @@
+# Secrets and environment-specific credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*credentials*.json
+
+# Read-only source corpora and media must never enter this repository.
+raw/
+Egolife/
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.wav
+*.mp3
+
+# Model raw responses can contain third-party text and must remain local.
+egopm_bench_v1/logs/model_runs/**
+
+# Atomic-production intermediates and local caches
+*.tmp
+*.tmp.*
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/

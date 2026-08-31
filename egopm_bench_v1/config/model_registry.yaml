@@ -1,0 +1,48 @@
+contract_version: v1.0.0
+config_version: v1.0.0
+registry_version: v1.0.0
+credential_environment_variable: DASHSCOPE_API_KEY
+credential_policy: environment_only
+raw_response_policy: local_only_not_for_git
+default_region: cn-beijing
+default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+models:
+  cue_extraction:
+    model_id: qwen3.7-flash-2026-07-15
+    thinking_enabled: false
+    reasoning_effort: none
+    temperature: 0
+    prompt_version: cue_extractor_v1
+    schema: cue_candidate.schema.json
+  seed_generation:
+    model_id: qwen3.7-plus-2026-05-26
+    thinking_enabled: true
+    reasoning_effort: medium
+    temperature: 0
+    prompt_version: seed_generator_v1
+    schema: reminder_seed.schema.json
+  seed_audit:
+    model_id: qwen3.7-max-2026-06-08
+    thinking_enabled: true
+    reasoning_effort: high
+    temperature: 0
+    prompt_version: seed_auditor_v1
+    schema: reminder_seed.schema.json
+
+run_manifest_required_fields:
+  - run_id
+  - model_id
+  - region
+  - endpoint
+  - thinking_enabled
+  - reasoning_effort
+  - temperature
+  - prompt_version
+  - schema_version
+  - request_time
+  - input_atom_ids
+  - raw_response_path
+  - parse_status
+  - retry_count
+  - validation_errors

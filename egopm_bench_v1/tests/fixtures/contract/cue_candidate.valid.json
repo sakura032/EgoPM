@@ -1,0 +1,23 @@
+{
+  "cue_id": "cue_SYNTH_000001",
+  "atom_id": "src_SYNTH_DAY1_000001",
+  "split": "train",
+  "entities": ["kitchen", "cooking"],
+  "scene_type": "kitchen",
+  "activity_type": "cooking",
+  "cue_type": "activity",
+  "normalized_predicate": {
+    "all_of": [
+      {"slot": "activity", "operator": "starts", "value": "cooking"}
+    ]
+  },
+  "supporting_text_span": "starts preparing food",
+  "source_text": "A person starts preparing food in a kitchen.",
+  "confidence": 0.9,
+  "ambiguity_reason": null,
+  "model_id": "synthetic-fixture",
+  "prompt_version": "fixture",
+  "schema_version": "v1.0.0",
+  "run_id": "run_fixture_001",
+  "validation_status": "accepted"
+}

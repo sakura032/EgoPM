@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "egopm-bench"
+version = "1.0.0"
+description = "Reproducible production contracts and validators for EgoPM-Bench v1"
+requires-python = ">=3.10"
+dependencies = [
+  "jsonschema>=4.22,<5",
+  "PyYAML>=6.0,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0,<9",
+]
+
+[tool.setuptools]
+# The production tree contains data directories and standalone numbered scripts;
+# it is deliberately not auto-discovered as a Python package distribution.
+packages = []
+
+[tool.pytest.ini_options]
+testpaths = ["egopm_bench_v1/tests"]
+addopts = "-ra"
+python_files = ["test_*.py"]
+
+[tool.egopm]
+contract_version = "v1.0.0"
+config_root = "egopm_bench_v1/config"
+schema_root = "egopm_bench_v1/schemas"
+test_command = "python -m pytest -q"
+full_validation_command = "python egopm_bench_v1/scripts/11_validate_all.py --config egopm_bench_v1/config/benchmark_protocol.yaml"

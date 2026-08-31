@@ -1,0 +1,38 @@
+{
+  "decision_id": "dec_SYNTH_000001",
+  "lifelog_id": "log_SYNTH_positive_short",
+  "family_id": "family_SYNTH_000001",
+  "split": "train",
+  "target_intention_id": "int_SYNTH_000001",
+  "decision_type": "trigger",
+  "counterfactual_pair_id": "cf_SYNTH_000001",
+  "difficulty": "short",
+  "model_input": {
+    "stream_position": 1,
+    "current_event_id": "evt_SYNTH_000002",
+    "virtual_time": "D01 09:30",
+    "visible_text": "A person starts preparing food in a kitchen."
+  },
+  "valid_window": {
+    "start_virtual_time": "D01 09:30",
+    "end_virtual_time": "D01 09:31"
+  },
+  "gold_action": {
+    "kind": "remind",
+    "intention_ids": ["int_SYNTH_000001"]
+  },
+  "oracle_annotation": {
+    "state_before": "active_unreminded",
+    "state_after": "active_reminded",
+    "rule_id": "rule_SYNTH_000001"
+  },
+  "evidence_support_groups": [
+    {
+      "support_group_id": "eg_SYNTH_000001",
+      "items": [
+        {"event_id": "evt_SYNTH_000001", "role": "intention_definition", "necessity": "essential"},
+        {"event_id": "evt_SYNTH_000002", "role": "trigger_condition", "necessity": "essential"}
+      ]
+    }
+  ]
+}
