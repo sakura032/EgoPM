@@ -1,5 +1,19 @@
 # T2 千问候选生成交接
 
+## 第 05 步离线分片建设补充（未调用 API）
+
+- 本次只实现第 05 步的离线启动修复和可恢复分片框架；没有读取 `DASHSCOPE_API_KEY`，没有调用千问，也没有写入 `cues/cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json`、任何正式 Cue 或 Seed。
+- `05_extract_cues.py` 现在将 `SOURCE_ATOMS_SUCCESS.json` 的相对 `artifact_path` 严格解释为 `egopm_bench_v1` 项目根相对路径，接受已冻结的 `source/source_video_atoms.jsonl`，拒绝绝对错误目标、`..` 越界和以 SUCCESS 所在目录猜测路径的旧行为。
+- 模型与执行参数全部从 T0 冻结的 `models.cue_extraction.execution` 读取并逐字段校验：`explicit_execute_only`、每 shard `500` 个 Atom、`max_tokens=512`、`max_retries=2`、目标 `300` RPM / `1,000,000` TPM、服务端 `response_usage` 为权威、原始响应禁止落盘，以及固定的 shard 文件后缀和数值顺序合并规则。
+- 默认启动为只读 `preflight`：验证 SUCCESS/Schema、按 `atom_id` 排序、核算 shard 与严格的请求 UTF-8 字节 token 上界，并打印报告；该路径不会读取环境变量、不会网络访问、不会创建运行目录。只有显式传入 `--execute` 才允许进入读取凭据和模型调用的分支。
+- 正式执行分片时，每个 shard 独立保存输入 Atom ID/规范行哈希清单、输出 JSONL、逐请求账本和完成标记；完成标记绑定来源哈希、输入清单 SHA256、输出 SHA256 和账本 SHA256。恢复时只跳过完全匹配当前清单与哈希的完成 shard，缺失、失败或失配 shard 会被单独重跑；合并拒绝任何未完成 shard，并按数字 shard 编号固定顺序进行。
+- 账本逐请求记录 `usage.prompt_tokens`、`usage.completion_tokens`、`usage.total_tokens`、重试次数、失败类别/截断摘要、模型和 Atom 身份；缺少服务端 usage 显式写为 `null`。账本不写 `choices`、模型正文或原始 HTTP 响应。
+- 新增无 API 合成测试覆盖：项目内相对路径与越界拒绝、固定请求参数、服务端 usage 选择、确定性分片覆盖及顺序、完成 shard 跳过、未完成 shard 拒绝合并、账本无正文、预检只读和冻结执行配置读取。所有测试文件均在 `pytest` 临时目录，不会写正式输出。
+
+## 仍需 T0 决策
+
+`model_registry.yaml` 已冻结执行上限与 token 统计口径，但尚未冻结可审计的人民币输入/输出单价或价格表版本。因此脚本可给出严格 token 上下界与限速下的最短时长下界，不能在不引入未冻结价格假设的前提下自行声明正式费用区间。请 T0 决定是否在配置或发布记录中冻结价格来源、单位价格和生效日期；这不影响离线预检或恢复机制，但会阻断正式预算确认报告中的费用数值。
+
 ## 当前状态
 
 - 治理合同版本：`v1.1.0`。

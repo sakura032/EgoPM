@@ -169,14 +169,49 @@ def test_cue_request_uses_fixed_model_and_strict_schema() -> None:
     script = load_script("05_extract_cues.py")
     atom = source_atom(1, "A person starts cooking in a kitchen.")
     schema = json.loads((ROOT / "schemas" / "cue_candidate.schema.json").read_text(encoding="utf-8"))
+    settings = script.Settings("https://example.invalid/v1", "DASHSCOPE_API_KEY", "cn-beijing", 512, 2, 500, 300, 1_000_000, {
+        "root": "cues/shards", "input_manifest_suffix": ".input.jsonl", "output_suffix": ".output.jsonl",
+        "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json", "merge_order": "numeric_shard_index_ascending",
+    })
     request = script.build_chat_request(
-        prompt="synthetic unit-test prompt", schema=schema, atom=atom, run_id="run_cue_fixture"
+        prompt="synthetic unit-test prompt", schema=schema, atom=atom, run_id="run_cue_fixture", settings=settings
     )
     assert request["model"] == "qwen3.7-flash-2026-07-15"
     assert request["temperature"] == 0
+    assert request["max_tokens"] == 512
+    assert request["enable_thinking"] is False
     assert request["response_format"]["type"] == "json_schema"
     assert request["response_format"]["json_schema"]["strict"] is True
     assert "DASHSCOPE_API_KEY" not in json.dumps(request)
+
+
+def shard_settings(script: ModuleType) -> Any:
+    return script.Settings(
+        "https://example.invalid/v1", "DASHSCOPE_API_KEY", "cn-beijing", 512, 2, 2, 300, 1_000_000,
+        {
+            "root": "cues/shards",
+            "input_manifest_suffix": ".input.jsonl",
+            "output_suffix": ".output.jsonl",
+            "ledger_suffix": ".ledger.jsonl",
+            "completion_suffix": ".complete.json",
+            "merge_order": "numeric_shard_index_ascending",
+        },
+    )
+
+
+def mark_complete(script: ModuleType, manifest: dict[str, Any], run_root: Path, settings: Any) -> None:
+    file_paths = script.paths(run_root, manifest, settings.layout)
+    script.write_jsonl(file_paths["manifest"], manifest["atoms"])
+    script.write_jsonl(file_paths["output"], [])
+    script.write_json(
+        file_paths["complete"],
+        {
+            "shard_id": manifest["shard_id"],
+            "source_atoms_sha256": manifest["source_atoms_sha256"],
+            "input_manifest_sha256": script.sha256_file(file_paths["manifest"]),
+            "output_sha256": script.sha256_file(file_paths["output"]),
+        },
+    )
 
 
 def test_cue_semantic_validation_rejects_non_traceable_span() -> None:
@@ -185,34 +220,15 @@ def test_cue_semantic_validation_rejects_non_traceable_span() -> None:
     candidate = cue_for(atom)
     script.validate_cue_semantics(atom, candidate)
     candidate["supporting_text_span"] = "starts driving"
-    with pytest.raises(script.ContractError, match="连续原文子串"):
+    with pytest.raises(script.ContractError, match="supporting_text_span"):
         script.validate_cue_semantics(atom, candidate)
 
 
-def test_qwen_call_reads_only_environment_key(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_usage_ledger_extracts_only_numeric_usage_without_response_content() -> None:
     script = load_script("05_extract_cues.py")
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "unit-test-key")
-    observed: dict[str, Any] = {}
-
-    def opener(request: Any, timeout: float) -> FakeResponse:
-        observed["url"] = request.full_url
-        observed["authorization"] = request.get_header("Authorization")
-        observed["body"] = json.loads(request.data.decode("utf-8"))
-        return FakeResponse({"choices": [{"message": {"content": "{}"}}]})
-
-    result, retries = script.call_structured_qwen(
-        endpoint="https://example.invalid/v1",
-        api_key_name="DASHSCOPE_API_KEY",
-        payload={"model": "qwen3.7-flash-2026-07-15"},
-        max_retries=0,
-        timeout_sec=1,
-        opener=opener,
-    )
-    assert result == {}
-    assert retries == 0
-    assert observed["url"] == "https://example.invalid/v1/chat/completions"
-    assert observed["authorization"] == "Bearer unit-test-key"
-    assert observed["body"]["model"] == "qwen3.7-flash-2026-07-15"
+    result = script.response_usage({"usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}, "choices": [{"message": {"content": "private model content"}}]})
+    assert result == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
+    assert "private" not in json.dumps(result)
 
 
 def test_success_marker_hash_gate_rejects_tampered_fixture(tmp_path: Path) -> None:
@@ -225,6 +241,63 @@ def test_success_marker_hash_gate_rejects_tampered_fixture(tmp_path: Path) -> No
     artifact.write_text("{}\n", encoding="utf-8")
     with pytest.raises(script.ContractError, match="SHA256"):
         script.require_verified_success(artifact, marker, "v1.1.0")
+
+
+def test_success_marker_accepts_project_relative_path_and_rejects_escape(tmp_path: Path) -> None:
+    script = load_script("05_extract_cues.py")
+    script.ROOT = tmp_path
+    artifact = tmp_path / "source" / "source_video_atoms.jsonl"
+    artifact.parent.mkdir()
+    write_jsonl(artifact, [source_atom(1, "A person starts cooking in a kitchen.")])
+    marker = tmp_path / "source" / "SOURCE_ATOMS_SUCCESS.json"
+    write_success(marker, artifact)
+    contents = json.loads(marker.read_text(encoding="utf-8"))
+    contents["artifact_path"] = "source/source_video_atoms.jsonl"
+    marker.write_text(json.dumps(contents), encoding="utf-8")
+    script.require_verified_success(artifact, marker, "v1.1.0")
+    contents["artifact_path"] = "../source/source_video_atoms.jsonl"
+    marker.write_text(json.dumps(contents), encoding="utf-8")
+    with pytest.raises(script.ContractError, match="artifact_path"):
+        script.require_verified_success(artifact, marker, "v1.1.0")
+
+
+def test_shards_are_ordered_resumable_and_incomplete_merge_is_rejected(tmp_path: Path) -> None:
+    script = load_script("05_extract_cues.py")
+    settings = shard_settings(script)
+    atoms = [source_atom(3, "three starts cooking"), source_atom(1, "one starts cooking"), source_atom(2, "two starts cooking")]
+    manifests = script.manifests(atoms, "source-hash", settings.shard_size, "run_fixture")
+    assert [[item["atom_id"] for item in manifest["atoms"]] for manifest in manifests] == [
+        ["src_SYNTH_DAY1_000001", "src_SYNTH_DAY1_000002"], ["src_SYNTH_DAY1_000003"]
+    ]
+    run_root = tmp_path / "run_fixture"
+    mark_complete(script, manifests[0], run_root, settings)
+    assert [item["shard_id"] for item in script.pending_shards(manifests, run_root, settings.layout)] == ["shard_00001"]
+    with pytest.raises(script.ContractError, match="禁止合并"):
+        script.merge_completed_shards(manifests, run_root, settings.layout, tmp_path / "merged.jsonl")
+    mark_complete(script, manifests[1], run_root, settings)
+    assert script.pending_shards(manifests, run_root, settings.layout) == []
+    assert script.merge_completed_shards(manifests, run_root, settings.layout, tmp_path / "merged.jsonl") == 0
+
+
+def test_ledger_excludes_raw_response_and_preflight_is_read_only(tmp_path: Path) -> None:
+    script = load_script("05_extract_cues.py")
+    settings = shard_settings(script)
+    ledger = tmp_path / "ledger.jsonl"
+    script.append_ledger(ledger, {"status": "failed", "usage": {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "failure_summary": "TimeoutError: 60 seconds", "raw_response_saved": False})
+    assert "response body" not in ledger.read_text(encoding="utf-8")
+    atom = source_atom(1, "A person starts cooking in a kitchen.")
+    schema = json.loads((ROOT / "schemas" / "cue_candidate.schema.json").read_text(encoding="utf-8"))
+    report = script.preflight([atom], {"sha256": "source-hash"}, "synthetic prompt", schema, "run_fixture", settings)
+    assert report["network_called"] is False
+    assert report["credentials_read"] is False
+    assert report["formal_outputs_written"] is False
+    assert not list(tmp_path.glob("**/*cue_library*"))
+
+
+def test_frozen_execution_configuration_is_loaded() -> None:
+    script = load_script("05_extract_cues.py")
+    settings = script.load_runtime_settings(ROOT / "config" / "model_registry.yaml")
+    assert (settings.shard_size, settings.max_tokens, settings.max_retries, settings.rpm, settings.tpm) == (500, 512, 2, 300, 1_000_000)
 
 
 def test_retrieval_returns_two_distinct_same_split_lures() -> None:
