@@ -100,6 +100,33 @@ STAGE_DEPENDENCIES = {
     "lifelog": ("source", "frozen"),
     "decisions": ("source", "frozen", "lifelog"),
 }
+# Cue v2 的最终数据 Schema 保持 v1.0.0，但其执行过程另有冻结的请求协议。下面的
+# 字段是最终 SUCCESS 可审计地指向该协议、冻结 Source 和无正文用量账本的最小边界；
+# 不能仅凭最终 JSONL 合法就接受来自不同提示词、模型或推理 Schema 的混合结果。
+CUE_V2_MARKER_FIELDS = {
+    "source_atoms_sha256",
+    "model_id",
+    "prompt_version",
+    "cue_execution_policy_version",
+    "cue_execution_protocol_sha256",
+    "cue_prompt_sha256",
+    "cue_inference_schema",
+    "cue_inference_schema_version",
+    "cue_inference_schema_sha256",
+    "usage_summary",
+}
+CUE_V2_USAGE_SUMMARY_FIELDS = {
+    "package_count",
+    "attempt_count",
+    "successful_attempt_count",
+    "failed_attempt_count",
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "missing_usage_count",
+    "retry_count",
+    "rate_limit_wait_seconds",
+}
 TERMINAL_STATES = {"completed", "cancelled", "expired"}
 STATE_TRANSITIONS = {
     None: {None, "active_unreminded"},
@@ -204,6 +231,13 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def canonical_sha256(value: Any) -> str:
+    """按 v2 固定 JSON 编码计算协议哈希，避免键顺序或空白造成不可重现的血缘。"""
+
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     # 审计文件也必须避免“读到半个文件”：先完整落盘临时文件，再原子替换正式结果。
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +285,150 @@ def load_json(path: Path, collector: IssueCollector, issue_prefix: str, owner: s
         collector.add("BLOCKER", f"{issue_prefix}_shape", str(path), "JSON 对象", type(value).__name__, owner)
         return None
     return value
+
+
+def cue_v2_execution_contract(
+    config: RunConfig,
+    collector: IssueCollector,
+    owner: str,
+) -> dict[str, Any] | None:
+    """读取并哈希 T0 冻结的 Cue v2 配置、提示词和推理 Schema，不信任生产者自报。"""
+
+    registry_path = config.config_dir / "model_registry.yaml"
+    try:
+        registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as exc:
+        collector.add("BLOCKER", "cue_execution_contract_unreadable", "cue", "可读取 model_registry.yaml", str(exc), owner)
+        return None
+    if not isinstance(registry, dict):
+        collector.add("BLOCKER", "cue_execution_contract_shape", "cue", "model_registry.yaml 为对象", type(registry).__name__, owner)
+        return None
+    cue = registry.get("models", {}).get("cue_extraction")
+    if not isinstance(cue, dict) or not isinstance(cue.get("execution"), dict):
+        collector.add("BLOCKER", "cue_execution_contract_fields", "cue", "冻结 cue_extraction 与 execution", repr(cue), owner)
+        return None
+    execution = cue["execution"]
+    package = execution.get("package_policy")
+    if not isinstance(package, dict):
+        collector.add("BLOCKER", "cue_execution_contract_fields", "cue", "冻结 package_policy", repr(package), owner)
+        return None
+    required = {"model_id", "prompt_version", "schema_version"}
+    execution_required = {"cue_execution_policy_version"}
+    package_required = {
+        "maximum_atoms",
+        "maximum_request_utf8_bytes",
+        "output_tokens_per_atom",
+        "inference_schema",
+        "inference_schema_version",
+    }
+    if required.difference(cue) or execution_required.difference(execution) or package_required.difference(package):
+        collector.add(
+            "BLOCKER",
+            "cue_execution_contract_fields",
+            "cue",
+            "完整的 v2 模型、协议和 package 冻结字段",
+            f"cue 缺少 {sorted(required.difference(cue))}；execution 缺少 {sorted(execution_required.difference(execution))}；package 缺少 {sorted(package_required.difference(package))}",
+            owner,
+        )
+        return None
+    prompt_path = config.benchmark_root / "prompts" / f"{cue['prompt_version']}.md"
+    inference_schema_path = config.benchmark_root / "schemas" / str(package["inference_schema"])
+    if not prompt_path.is_file() or not inference_schema_path.is_file():
+        collector.add(
+            "BLOCKER",
+            "cue_execution_contract_artifact",
+            "cue",
+            "存在冻结提示词与推理 Schema",
+            f"prompt={prompt_path.is_file()}, schema={inference_schema_path.is_file()}",
+            owner,
+        )
+        return None
+    prompt_sha256 = sha256_file(prompt_path)
+    inference_schema_sha256 = sha256_file(inference_schema_path)
+    # 该八字段载荷与 T2 package 恢复门使用同一规范编码。它故意不包含 Source 哈希：
+    # Source 属于本次运行的输入血缘，协议本身则必须能复用于同一冻结执行规则的独立 run。
+    protocol_payload = {
+        "policy": execution["cue_execution_policy_version"],
+        "model": cue["model_id"],
+        "prompt": cue["prompt_version"],
+        "prompt_sha256": prompt_sha256,
+        "inference_sha256": inference_schema_sha256,
+        "max_atoms": package["maximum_atoms"],
+        "max_bytes": package["maximum_request_utf8_bytes"],
+        "tokens_per_atom": package["output_tokens_per_atom"],
+    }
+    return {
+        "model_id": cue["model_id"],
+        "prompt_version": cue["prompt_version"],
+        "cue_schema_version": cue["schema_version"],
+        "cue_execution_policy_version": execution["cue_execution_policy_version"],
+        "cue_prompt_sha256": prompt_sha256,
+        "cue_inference_schema": package["inference_schema"],
+        "cue_inference_schema_version": package["inference_schema_version"],
+        "cue_inference_schema_sha256": inference_schema_sha256,
+        "cue_execution_protocol_sha256": canonical_sha256(protocol_payload),
+    }
+
+
+def validate_cue_v2_execution_lineage(
+    config: RunConfig,
+    marker: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """独立验证最终 Cue SUCCESS 的 v2 执行血缘和无正文账本汇总。"""
+
+    missing = sorted(CUE_V2_MARKER_FIELDS.difference(marker))
+    if missing:
+        collector.add("BLOCKER", "cue_execution_lineage_fields", "cue", "包含全部 v2 执行血缘字段", f"缺少 {missing}", owner)
+        return False
+    contract = cue_v2_execution_contract(config, collector, owner)
+    if contract is None:
+        return False
+    valid = True
+    for field_name, expected in contract.items():
+        if field_name == "cue_schema_version":
+            continue
+        actual = marker.get(field_name)
+        if actual != expected:
+            collector.add("BLOCKER", "cue_execution_lineage_mismatch", f"cue:{field_name}", repr(expected), repr(actual), owner)
+            valid = False
+    # Source 的主 SUCCESS 已在 source stage 验过，但 Cue 仍必须显式重述这一次输入
+    # 的哈希，防止复用相同 JSONL 文件名的另一轮 Source 重建被混入当前运行。
+    source_marker = load_json(config.marker("source_atoms"), collector, "success_marker", "T1 source")
+    source_hash = source_marker.get("sha256") if source_marker else None
+    if marker.get("source_atoms_sha256") != source_hash:
+        collector.add("BLOCKER", "cue_execution_source_hash", "cue", f"冻结 Source SHA256 {source_hash}", repr(marker.get("source_atoms_sha256")), owner)
+        valid = False
+    usage_summary = marker.get("usage_summary")
+    if not isinstance(usage_summary, dict):
+        collector.add("BLOCKER", "cue_usage_summary_shape", "cue", "对象类型的用量账本汇总", type(usage_summary).__name__, owner)
+        return False
+    missing_usage = sorted(CUE_V2_USAGE_SUMMARY_FIELDS.difference(usage_summary))
+    if missing_usage:
+        collector.add("BLOCKER", "cue_usage_summary_fields", "cue", "包含全部冻结用量汇总字段", f"缺少 {missing_usage}", owner)
+        return False
+    integer_fields = CUE_V2_USAGE_SUMMARY_FIELDS - {"rate_limit_wait_seconds"}
+    for field_name in sorted(integer_fields):
+        value = usage_summary[field_name]
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            collector.add("BLOCKER", "cue_usage_summary_value", f"cue:{field_name}", "非负整数", repr(value), owner)
+            valid = False
+    wait_seconds = usage_summary["rate_limit_wait_seconds"]
+    if not isinstance(wait_seconds, (int, float)) or isinstance(wait_seconds, bool) or wait_seconds < 0:
+        collector.add("BLOCKER", "cue_usage_summary_value", "cue:rate_limit_wait_seconds", "非负数值", repr(wait_seconds), owner)
+        valid = False
+    if all(isinstance(usage_summary[name], int) and not isinstance(usage_summary[name], bool) for name in integer_fields):
+        if usage_summary["successful_attempt_count"] + usage_summary["failed_attempt_count"] != usage_summary["attempt_count"]:
+            collector.add("BLOCKER", "cue_usage_summary_attempts", "cue", "successful_attempt_count + failed_attempt_count = attempt_count", repr(usage_summary), owner)
+            valid = False
+        if usage_summary["prompt_tokens"] + usage_summary["completion_tokens"] != usage_summary["total_tokens"]:
+            collector.add("BLOCKER", "cue_usage_summary_tokens", "cue", "prompt_tokens + completion_tokens = total_tokens", repr(usage_summary), owner)
+            valid = False
+        if usage_summary["retry_count"] > usage_summary["attempt_count"]:
+            collector.add("BLOCKER", "cue_usage_summary_retries", "cue", "retry_count 不超过 attempt_count", repr(usage_summary), owner)
+            valid = False
+    return valid
 
 
 def jsonl_row_count(path: Path) -> int:
@@ -401,6 +579,8 @@ def marker_is_valid(
                     owner,
                 )
                 valid = False
+    if stage == "cue" and not validate_cue_v2_execution_lineage(config, marker, collector, owner):
+        valid = False
     if not expected_artifact.is_file():
         collector.add("BLOCKER", "success_marker_artifact_missing", stage, str(expected_artifact), "正式产物不存在", owner)
         return False

@@ -64,6 +64,51 @@ def write_valid_marker(qa, config, stage: str, artifact_key: str, marker_key: st
     return marker
 
 
+def write_cue_v2_contract_artifacts(config: object) -> None:
+    """在临时 benchmark 根建立 T0 冻结文件的最小替身，测试不依赖生产提示词。"""
+
+    benchmark_root = config.benchmark_root
+    prompt = benchmark_root / "prompts" / "cue_extractor_v2.md"
+    schema = benchmark_root / "schemas" / "cue_inference_batch_v1.schema.json"
+    prompt.parent.mkdir(parents=True, exist_ok=True)
+    schema.parent.mkdir(parents=True, exist_ok=True)
+    prompt.write_text("合成 v2 提示词。\n", encoding="utf-8")
+    schema.write_text('{"$id":"synthetic-v1.0.0","type":"object"}\n', encoding="utf-8")
+
+
+def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
+    """构造通过最终 Cue Schema 与 v2 执行血缘门的临时 SUCCESS 标记。"""
+
+    write_cue_v2_contract_artifacts(config)
+    marker = write_valid_marker(
+        qa,
+        config,
+        "cue",
+        "cue_library",
+        "cue_library",
+        {"source_atoms": source_hash},
+    )
+    contract_collector = qa.IssueCollector()
+    contract = qa.cue_v2_execution_contract(config, contract_collector, "T2 cue")
+    assert contract is not None
+    marker.update(contract)
+    marker["source_atoms_sha256"] = source_hash
+    marker["usage_summary"] = {
+        "package_count": 1,
+        "attempt_count": 1,
+        "successful_attempt_count": 1,
+        "failed_attempt_count": 0,
+        "prompt_tokens": 11,
+        "completion_tokens": 7,
+        "total_tokens": 18,
+        "missing_usage_count": 0,
+        "retry_count": 0,
+        "rate_limit_wait_seconds": 0.0,
+    }
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
+    return marker
+
+
 def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
     qa = load_validator()
     config_path = copy_config_tree(tmp_path)
@@ -91,14 +136,7 @@ def test_stage_version_map_accepts_frozen_source_and_cue_schema_versions(tmp_pat
     source_collector = qa.IssueCollector()
     assert qa.marker_is_valid(config, "source", "source_atoms", "source_atoms", "T1 source", source_collector)
 
-    write_valid_marker(
-        qa,
-        config,
-        "cue",
-        "cue_library",
-        "cue_library",
-        {"source_atoms": source_marker["sha256"]},
-    )
+    write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
     cue_collector = qa.IssueCollector()
     assert qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", cue_collector)
 
@@ -109,19 +147,57 @@ def test_stage_version_map_rejects_wrong_cue_schema_version(tmp_path: Path) -> N
     qa = load_validator()
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
-    cue_marker = write_valid_marker(
-        qa,
-        config,
-        "cue",
-        "cue_library",
-        "cue_library",
-        {"source_atoms": source_marker["sha256"]},
-    )
+    cue_marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
     cue_marker["schema_versions"] = {"cue_candidate": "v1.1.0"}
     config.marker("cue_library").write_text(json.dumps(cue_marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
     assert any(issue["issue_type"] == "success_marker_schema_versions" for issue in collector.issues)
+
+
+def test_cue_v2_success_requires_frozen_execution_lineage(tmp_path: Path) -> None:
+    """最终 Cue 保持 Schema v1.0.0，但必须完整声明并匹配 v2 执行协议。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    collector = qa.IssueCollector()
+    assert qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+
+
+def test_cue_v2_success_rejects_missing_or_tampered_execution_lineage(tmp_path: Path) -> None:
+    """协议哈希、Source 哈希或用量汇总缺失/不符时，T4 必须在读 Cue 前阻断。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    marker.pop("cue_execution_protocol_sha256")
+    marker["source_atoms_sha256"] = "wrong-source-hash"
+    marker["usage_summary"]["total_tokens"] = 999
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert "cue_execution_lineage_fields" in {issue["issue_type"] for issue in collector.issues}
+
+
+def test_cue_v2_success_rejects_wrong_hash_version_and_usage_totals(tmp_path: Path) -> None:
+    """字段齐全仍不足够：提示词哈希、推理版本、协议哈希和用量算术都必须可信。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    marker["cue_prompt_sha256"] = "wrong-prompt-hash"
+    marker["cue_inference_schema_version"] = "v9.9.9"
+    marker["cue_execution_protocol_sha256"] = "wrong-protocol-hash"
+    marker["usage_summary"]["total_tokens"] = 999
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert {"cue_execution_lineage_mismatch", "cue_usage_summary_tokens"}.issubset(issue_types)
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:

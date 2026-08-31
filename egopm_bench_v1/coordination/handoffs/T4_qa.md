@@ -1,5 +1,13 @@
 # T4 Wave 1 独立 QA 交接
 
+## CR-2026-007：Cue v2 执行血缘无 API QA
+
+- 适用提交：本段随本次 T4 提交写入。未调用千问、未读取密钥、未写正式 Cue、Seed 或 SUCCESS，也未运行生产 QA。
+- 修复范围：`scripts/11_validate_all.py` 对最终 `CUE_LIBRARY_SUCCESS.json` 增加 v2 执行血缘门，同时保留最终 `cue_candidate: v1.0.0` 的阶段 Schema 校验。标记必须明确声明并匹配冻结 Source SHA256、模型、提示词及其 SHA256、推理 Schema/版本及其 SHA256、`cue_execution_policy_version`、由八字段规范 JSON 独立重算的 `cue_execution_protocol_sha256`，以及无正文 `usage_summary`。
+- 用量汇总门：账本汇总必须含 package、尝试、成功/失败、输入/输出/总 token、缺失 usage、重试和限流等待字段；均为非负值，且成功加失败等于尝试、输入加输出等于总 token、重试不超过尝试。该门不读取模型正文，也不把预检字节伪装为实际服务端 usage。
+- 合成测试：临时目录建立最小提示词和推理 Schema 替身，验证完整且最终 Schema 仍为 `v1.0.0` 的 Cue 标记通过；缺少协议哈希、错 Source/提示词/协议哈希、错推理版本或破坏 token 汇总会被阻断。测试不会使用或生成任何生产工件。
+- 验收命令：`python -m pytest -q egopm_bench_v1/tests/test_validators.py` 与 `python -m pytest -q` 均通过；`git diff --check` 通过。T2 生产者必须在最终标记同时写入 `model_id` 与 `prompt_version`，否则本门按缺字段阻断；在该实现与用户正式授权前，Cue 门仍为 `BLOCKED`。
+
 ## 第 05 步无 API 启动修复：阶段冻结 Schema 版本
 
 - 适用提交：本段随本次 T4 提交写入；未运行正式 Cue、Seed 或完整生产 QA，未调用千问。
