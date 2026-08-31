@@ -1,0 +1,1109 @@
+# EgoPM-Bench v1 完整生产流水线统筹指南
+
+> 版本：v1.0  
+> 更新日期：2026-08-29  
+> 数据定位：video-referenced, text-first, decision-first, counterfactual  
+> 本文面向第一次制作数据集的执行者，说明每一步为什么做、输入是什么、输出是什么、怎样判断可以进入下一步。
+
+---
+
+## 一、先把最终目标说清楚
+
+EgoPM-Bench v1 的研究对象不是“给视频写摘要”，而是：
+
+> 在连续生活记录中，系统必须记住用户此前提出的未来意图；当后来出现满足触发条件的场景时主动提醒；如果任务已经完成、取消、过期或已经提醒，则应保持沉默。
+
+第一版仍然以 EgoLife 视频时间段为可回到的媒体原子，但暂时不读取和拼接 MP4。当前模型实际看到的是同一时间段的 Transcript 与 Dense Caption 文本，manifest 同时保存 SRT 来源和未来 MP4 定位信息。这样做的意义是先把“记忆、状态与主动决策”做对，后面可以在 atom ID、Episode 和 gold 不变的情况下替换为视觉输入。
+
+本项目不使用 Natural Intention，不声称提醒意图和生命周期天然发生在 EgoLife。真实 EgoLife 只提供可观察的生活场景原子；意图、完成、取消、过期等历史由显式规则构造，并保存 provenance。
+
+核心生产公式为：
+
+> 约 60 个候选 Reminder Seed → 审计保留约 35–40 个基础任务 → 每个任务生成 2 个反事实分支 × 3 个记忆难度 → 约 210–240 条 Life Log。
+
+40 不是事先保证的事实。如果只通过 30 个 Seed，只能得到 180 条，不能降低审计标准凑数；应把候选池扩大到 70–80 个，直到至少 35 个合格 Seed。100–120 小时指 manifest 中所有正式 Life Log 引用的时间总量，同时还必须报告去重后的真实来源时长和虚拟时间跨度。
+
+本项目不建立 P0、P1 或 smoke 数据集。每条通过同一套完整质量门的数据都属于正式生产数据，但仍必须分阶段冻结 schema、规则和协议。
+
+---
+
+## 二、必须区分的五个数据单位
+
+### 1. Source Video Atom
+
+来自 EgoLife 某个真实时间段的原子事件。v1 用 SRT 文本表示，未来可通过同一媒体定位字段加载 MP4。
+
+### 2. Reminder Seed
+
+一个可复用的基础提醒任务定义，包含：
+
+- 用户意图；
+- trigger predicate；
+- 一个真实 trigger atom；
+- 至少两个真实 lure/distractor atom；
+- completed、cancelled、expired、already_reminded 等沉默条件；
+- 可执行的状态机规则；
+- 数据 split 与审计记录。
+
+### 3. Life-log Family
+
+同一个 Reminder Seed 派生的全部 6 条 Life Log。它们共享核心任务和 trigger，但分别具有 positive/negative 历史以及 short/medium/long 难度。一个 family 必须整体进入同一个 split。
+
+### 4. Life Log
+
+一条按 virtual_time 排列的完整事件流，由真实 Source Video Atom 与明确标记的构造事件共同组成。它不是一个真实 EgoLife 人物自然发生的一整天。
+
+### 5. Decision Instance
+
+Life Log 每到达一个规定决策点，就产生一次模型输入和 gold action。gold 只能由冻结的 oracle 状态机产生，动作是 remind(intent_id) 或 silent。
+
+---
+
+## 三、模型到底怎么选
+
+### 1. 最终选型
+
+本项目不使用 GPT，统一通过阿里云百炼调用千问：
+
+| 工作 | 固定模型 | 模式 | 原因 |
+| --- | --- | --- | --- |
+| 批量人物、地点、物体、活动、状态、cue 候选抽取 | qwen3.7-flash-2026-07-15 | 非思考；JSON Schema | 量大、结构固定、成本低 |
+| Reminder Seed、trigger predicate、lure 与生命周期候选生成 | qwen3.7-plus-2026-05-26 | 思考；reasoning_effort=medium；JSON Schema | 质量与成本平衡，是主生产模型 |
+| 困难规则、争议样本与全部 Seed 终审 | qwen3.7-max-2026-06-08 | 思考；reasoning_effort=high；JSON Schema | 只处理高价值难例 |
+| SRT 解析、时间对齐、去重、划分、状态转移与 gold | Python 确定性脚本 | 不调用大模型 | 必须可复现，不能让模型猜 |
+| 相似 trigger/lure 检索 | BAAI/bge-m3，必要时增加 reranker | 向量检索 | 比逐条让生成模型比较稳定且便宜 |
+
+如果暂时只能开通一个千问模型，使用 qwen3.7-plus-2026-05-26 完成 Flash 与 Plus 的工作；Max 审计阶段不要跳过，可以等规则库形成后再集中调用。
+
+不把 qwen3.8-max 作为论文正式生产默认值，原因不是它能力弱，而是目前采用滚动模型 ID，论文复现更适合固定日期快照。若未来官方发布固定 qwen3.8-max 快照，可以通过提升 model_registry 版本替换，但已经冻结的数据不能混用型号。
+
+### 2. 模型绝对不能做什么
+
+千问可以提出候选标签、候选规则和语言表达，但不得直接决定：
+
+- source_start_sec 与 source_end_sec；
+- Transcript 与 Dense Caption 是否在时间上重合；
+- train/dev/test；
+- remind 或 silent 金标；
+- completed/cancelled/expired 状态迁移；
+- 反事实两支是否满足“只改变一个历史条件”；
+- 数据是否通过最终验证。
+
+这些都由脚本和人工审计决定。
+
+### 3. 每次调用必须记录
+
+建立 model_registry.yaml 和 run manifest，至少记录：
+
+- model_id；
+- region 与 API endpoint；
+- thinking_enabled；
+- reasoning_effort；
+- temperature；
+- prompt_version；
+- schema_version；
+- request_time；
+- input_atom_ids；
+- raw_response_path；
+- parse_status；
+- retry_count；
+- validation_errors。
+
+正式抽取任务尽量 temperature=0 或平台允许的最低值。API Key 只放 DASHSCOPE_API_KEY 环境变量，不能写进脚本、Markdown、JSON 或 Git。
+
+型号与能力以阿里云百炼官方页面为准：
+
+- [文本生成模型列表](https://help.aliyun.com/zh/model-studio/text-generation-model)
+- [结构化输出说明](https://help.aliyun.com/zh/model-studio/qwen-structured-output)
+- [模型发布与更新记录](https://help.aliyun.com/zh/model-studio/newly-released-models)
+
+---
+
+## 四、推荐目录结构
+
+不要移动已经下载好的 SRT，也不要在各个生成脚本中复制多份。新建一个生产目录，只引用现有原始数据：
+
+~~~text
+D:\scientific\EgoPM\
+├─ AGENTS.md
+├─ .gitignore
+├─ pyproject.toml
+├─ Egolife/
+│  └─ raw/
+│     └─ EgoLifeCap/
+│        ├─ Transcript/<person>/DAYx/*.srt
+│        └─ DenseCaption/<person>/DAYx/*.srt
+└─ egopm_bench_v1/
+   ├─ README.md
+   ├─ config/
+   │  ├─ paths.yaml
+   │  ├─ model_registry.yaml
+   │  ├─ split_policy.yaml
+   │  └─ benchmark_protocol.yaml
+   ├─ schemas/
+   │  ├─ source_video_atom.schema.json
+   │  ├─ cue_candidate.schema.json
+   │  ├─ reminder_seed.schema.json
+   │  ├─ lifelog.schema.json
+   │  └─ decision_instance.schema.json
+   ├─ prompts/
+   │  ├─ cue_extractor_v1.md
+   │  ├─ seed_generator_v1.md
+   │  └─ seed_auditor_v1.md
+   ├─ source/
+   │  ├─ srt_inventory.csv
+   │  ├─ raw_srt_segments.jsonl
+   │  ├─ source_video_atoms.jsonl
+   │  ├─ source_split_map.jsonl
+   │  └─ atom_build_report.json
+   ├─ cues/
+   │  ├─ cue_candidates_raw.jsonl
+   │  ├─ cue_candidates_valid.jsonl
+   │  └─ cue_library.jsonl
+   ├─ seeds/
+   │  ├─ reminder_seed_candidates.jsonl
+   │  ├─ reminder_seed_audit.csv
+   │  └─ reminder_seeds_frozen.jsonl
+   ├─ rules/
+   │  ├─ rule_bank.jsonl
+   │  └─ state_machine_policy.yaml
+   ├─ lifelogs/
+   │  ├─ family_specs.jsonl
+   │  ├─ lifelogs.jsonl
+   │  └─ counterfactual_pairs.jsonl
+   ├─ benchmark/
+   │  ├─ decision_instances.jsonl
+   │  ├─ evidence_sets.jsonl
+   │  └─ dataset_card.md
+   ├─ audit/
+   │  ├─ human_review.csv
+   │  ├─ validation_errors.jsonl
+   │  ├─ leakage_report.json
+   │  └─ final_statistics.json
+   ├─ logs/
+   │  └─ model_runs/
+   ├─ coordination/
+   │  ├─ STATUS.md
+   │  ├─ CHANGE_REQUESTS.md
+   │  └─ handoffs/
+   │     ├─ T1_source.md
+   │     ├─ T2_qwen.md
+   │     ├─ T3_compiler.md
+   │     └─ T4_qa.md
+   ├─ tests/
+   │  ├─ fixtures/
+   │  ├─ test_source_pipeline.py
+   │  ├─ test_qwen_contracts.py
+   │  ├─ test_state_machine.py
+   │  └─ test_validators.py
+   └─ scripts/
+      ├─ 01_inventory_srt.py
+      ├─ 02_parse_srt.py
+      ├─ 03_align_modal_text.py
+      ├─ 04_make_source_splits.py
+      ├─ 05_extract_cues.py
+      ├─ 06_retrieve_trigger_lures.py
+      ├─ 07_generate_seed_candidates.py
+      ├─ 08_freeze_seed_audit.py
+      ├─ 09_build_lifelog_families.py
+      ├─ 10_run_oracle.py
+      ├─ 11_validate_all.py
+      └─ 12_build_statistics.py
+~~~
+
+脚本编号表示正式数据的依赖顺序：前一步没有通过质量门，就不能运行下一步正式生产。不同模块的代码和单元测试可以按下一节并行开发。
+
+---
+
+## 五、多对话与多终端的实际协作方案
+
+### 1. 最合适的数量：5 个长期对话，最多 4 个同时运行
+
+建议在 Codex 中为 D:\scientific\EgoPM 建立 5 个固定对话，不要为每个脚本新开一个对话：
+
+| 对话编号 | 对话名称 | 核心职责 | 是否直接生成正式数据 |
+| --- | --- | --- | --- |
+| T0 | EgoPM-统筹与合并 | 冻结 schema/config、分配任务、审阅交付、处理变更、合并代码 | 只负责最终提升和冻结 |
+| T1 | EgoPM-SourceAtoms | SRT 清点、解析、时间对齐、去重、source split | 是，负责 source/ |
+| T2 | EgoPM-QwenCuesSeeds | 千问客户端、cue 抽取、检索、Seed 候选生成 | 是，负责 cues/ 和未冻结 seeds |
+| T3 | EgoPM-CompilerOracle | Seed 冻结编译、状态机、反事实、难度、Life Log、oracle | 是，负责 rules/、lifelogs/、benchmark 中间产物 |
+| T4 | EgoPM-QARelease | 独立测试、全量验证、泄漏检查、统计与发布检查 | 不修改生产者结果，只报告问题和生成审计产物 |
+
+开始：       T0
+写代码阶段： T1 + T2 + T3 + T4
+建原子库：   T1 + T4
+抽 Cue：     T2 + T4
+审计 Seed：  T0 + T2 + T4
+编译数据：   T3 + T4
+发布：       T0 + T4
+
+建立 5 个对话是为了让每个对话长期保留自己那部分上下文；“最多 4 个同时运行”是为了避免你同时处理太多审批和冲突。T0 大部分时间处于等待/审阅状态，因此常见并行状态是 T1、T2、T3、T4 编写互不重叠的代码，或者 T0 合并时只让另外 2–3 个工作对话继续。
+
+不建议建立 8–12 个对话。这个项目真正能够独立并行的工作流只有四条；继续拆分会让 schema、路径和字段约定反复合并，节省的运行时间小于沟通成本。
+
+### 2. 先把项目变成 Git 仓库
+
+多对话同时在同一个 Windows 目录直接写文件风险很高。推荐：
+
+1. 以 D:\scientific\EgoPM 作为唯一主项目；
+2. 初始化 Git；
+3. 先由 T0 建立目录、AGENTS.md、.gitignore、pyproject.toml、config 和 schemas；
+4. 完成一次“合同冻结”提交；
+5. T1–T4 分别从这次提交创建独立 branch/worktree；
+6. 只有 T0 可以把工作分支合入主分支。
+
+如果使用 Codex 桌面版，应把 D:\scientific\EgoPM 保存为项目。项目成为 Git 仓库后，各实现对话使用独立 worktree；不要让多个对话选择“直接使用同一个已保存目录”并同时修改。独立 worktree 是临时开发副本，最终项目仍然是 D:\scientific\EgoPM。
+
+建议的分支名称：
+
+~~~text
+main
+coord/contracts
+worker/source-atoms
+worker/qwen-cues-seeds
+worker/compiler-oracle
+worker/qa-release
+~~~
+
+如果暂时不使用 Git worktree，也必须执行后面的“唯一文件所有权”；同一时间不能有两个对话改同一个文件。
+
+### 3. 唯一文件所有权
+
+| 路径或文件 | 唯一写入者 | 其他对话权限 |
+| --- | --- | --- |
+| AGENTS.md、README.md、pyproject.toml、.gitignore | T0 | 只读；提出 change request |
+| config/**、schemas/** | T0 | 只读；不得私自加字段 |
+| scripts/01–04、source/**、tests/test_source_pipeline.py | T1 | T4 可读和验证 |
+| prompts/cue_extractor*、prompts/seed_generator*、scripts/05–07、cues/**、seeds/reminder_seed_candidates.jsonl | T2 | T0/T4 只读审计 |
+| scripts/08–10、rules/**、lifelogs/**、benchmark/decision_instances.jsonl、benchmark/evidence_sets.jsonl | T3 | T4 只读验证 |
+| scripts/11–12、tests/test_validators.py、audit/**、benchmark/dataset_card.md | T4 | T0 审阅并提升 |
+| seeds/reminder_seed_audit.csv | T0/人工负责人 | T2、T3、T4 只读 |
+| seeds/reminder_seeds_frozen.jsonl | T3 依据已冻结 audit 编译 | T0 审批，其他只读 |
+| coordination/STATUS.md | 仅 T0 | 所有人读取 |
+| coordination/CHANGE_REQUESTS.md、tests/fixtures/** | 仅 T0 | 工作对话在自己的 handoff 中提出请求 |
+| coordination/handoffs/T*.md | 对应对话 | T0 读取 |
+
+最重要的规则是：任何工作对话如果发现 schema 或 config 不够用，不能顺手修改。它必须把需求写入自己的 handoff 或在 T0 对话中说明；只有 T0 可以汇总到 coordination/CHANGE_REQUESTS.md 并判断是否修改合同。合同改变后，T0 通知受影响的工作对话同步。
+
+### 4. 生产输出采用“临时文件 → 原子替换 → 成功标记”
+
+不能让 T4 在 T1/T2/T3 正在写一半 JSONL 时开始验证。每个生产脚本应遵循：
+
+1. 先写同目录的 filename.tmp；
+2. 完成全部写入并关闭文件；
+3. 执行本阶段内部校验；
+4. 用原子重命名替换正式 filename；
+5. 最后写 stage_name_SUCCESS.json，包含行数、SHA256、schema_version、config_version、生成时间和上游输入哈希。
+
+下游对话只在看到 SUCCESS 文件并核对哈希后读取正式产物。上游重新生成时先产生新临时文件，不能先清空正式文件。
+
+建议成功标记：
+
+~~~text
+source/SOURCE_ATOMS_SUCCESS.json
+cues/CUE_LIBRARY_SUCCESS.json
+seeds/SEED_CANDIDATES_SUCCESS.json
+seeds/SEEDS_FROZEN_SUCCESS.json
+lifelogs/LIFELOGS_SUCCESS.json
+benchmark/DECISIONS_SUCCESS.json
+audit/FINAL_VALIDATION_SUCCESS.json
+~~~
+
+### 5. 五个对话可直接复制的首条提示词
+
+#### T0：统筹与合并
+
+~~~text
+你负责 D:\scientific\EgoPM 的统筹、数据合同与合并。你是 AGENTS.md、
+pyproject.toml、config/**、schemas/** 和 coordination/STATUS.md 的唯一写入者。
+不要替其他工作流大规模实现脚本，也不要直接手改生成 JSONL。
+
+你的任务是：
+1. 读取完整生产指南；
+2. 建立并冻结目录、schema、配置和测试命令；
+3. 为 T1–T4 明确输入、输出、允许写入路径和验收门；
+4. 审阅各对话提交，按依赖顺序合并；
+5. 处理 CHANGE_REQUEST，记录协议版本；
+6. 只有在上游 SUCCESS 哈希和 T4 验证通过后，才允许下游开始。
+
+每次答复都报告：当前冻结版本、已完成门、阻断问题、下一项可启动任务。
+禁止把 API Key、原始大文件或模型原始日志提交到 Git。
+~~~
+
+#### T1：Source Video Atom
+
+~~~text
+你只负责 Source Video Atom 流水线。允许写：
+scripts/01_inventory_srt.py、02_parse_srt.py、03_align_modal_text.py、
+04_make_source_splits.py、source/**、tests/test_source_pipeline.py
+以及 coordination/handoffs/T1_source.md。
+
+config/** 和 schemas/** 只读；发现合同问题时停止相关字段实现并向 T0
+提交 change request，不得自己修改。原始 SRT 只读，不移动、不改名。
+
+完成全量 inventory、SRT block 解析、Transcript/Dense Caption 时间对齐、
+宽松保留、来源分组和 split。先写单元测试，再运行全量正式数据。
+输出 SOURCE_ATOMS_SUCCESS.json、atom_build_report.json 和交接说明。
+不得调用千问，不得生成 cue、Seed 或 Life Log。
+~~~
+
+#### T2：千问 Cue 与 Seed 候选
+
+~~~text
+你只负责千问调用与候选生成。允许写：
+prompts/cue_extractor_v1.md、seed_generator_v1.md、seed_auditor_v1.md，
+scripts/05_extract_cues.py、06_retrieve_trigger_lures.py、
+07_generate_seed_candidates.py、cues/**、
+seeds/reminder_seed_candidates.jsonl、tests/test_qwen_contracts.py
+以及 coordination/handoffs/T2_qwen.md。
+
+只能读取已带 SOURCE_ATOMS_SUCCESS.json 的 source 输出。
+使用固定模型：qwen3.7-flash-2026-07-15 做 cue 候选，
+qwen3.7-plus-2026-05-26 做 Seed 候选。
+所有输出强制 JSON Schema，并保存 model/prompt/schema/run 元数据。
+API Key 只从环境变量读取。
+
+不要修改 schema/config，不要冻结 Seed，不要写 remind/silent 金标。
+先使用人工编写的合成 fixture 验证接口与 schema；fixture 只用于单元测试，
+不属于 P0、P1、smoke 或正式数据。上游冻结后再全量运行。
+~~~
+
+#### T3：编译器与 Oracle
+
+~~~text
+你只负责确定性 benchmark 编译。允许写：
+scripts/08_freeze_seed_audit.py、09_build_lifelog_families.py、
+10_run_oracle.py、rules/**、lifelogs/**、
+benchmark/decision_instances.jsonl、benchmark/evidence_sets.jsonl、
+tests/test_state_machine.py 以及 coordination/handoffs/T3_compiler.md。
+
+你可以在真实 Seed 冻结前，用纯手写合成 fixture 开发状态机和反事实生成器；
+fixture 只做单元测试，不计入数据集。正式运行必须等待
+SEEDS_FROZEN_SUCCESS.json。
+
+gold 只能由状态机生成，不能调用任何大模型决定 remind/silent。
+每个 Seed 必须派生 positive/negative × short/medium/long 六条 Life Log。
+不要修改上游 source/cues/candidate Seed，不要修改 schema/config。
+~~~
+
+#### T4：独立质检与发布
+
+~~~text
+你是独立 QA，不替生产者修改其实现。允许写：
+scripts/11_validate_all.py、12_build_statistics.py、tests/test_validators.py、
+audit/**、benchmark/dataset_card.md 和 coordination/handoffs/T4_qa.md。
+
+你可以读取所有产物，但只有在对应 SUCCESS 文件存在且哈希一致时才验证。
+发现问题时在 validation_errors.jsonl 和交接说明中记录：
+严重度、复现命令、失败 ID、预期、实际、建议修复阶段。
+把问题退回唯一生产者，不直接修改 scripts/01–10 或生成 JSONL。
+
+必须覆盖 schema、来源时间、状态迁移、反事实动作翻转、难度一致性、
+split 泄漏、近重复、答案泄露、三种时长和可复现哈希。
+FINAL_VALIDATION_SUCCESS.json 只能在零阻断错误时生成。
+~~~
+
+### 6. 实际并行波次
+
+#### Wave 0：合同冻结，只运行 T0
+
+T0 完成：
+
+- Git、目录与 .gitignore；
+- Python 环境与统一测试命令；
+- 五个 JSON Schema；
+- paths、model registry、split policy、benchmark protocol；
+- AGENTS.md 文件所有权；
+- 少量手写 synthetic fixtures；
+- contract_version=v1.0.0 提交。
+
+这一阶段不要让 T1–T4提前创建各自理解的字段，否则后面会大量返工。
+
+#### Wave 1：四条代码线并行，不运行正式数据
+
+可以同时进行：
+
+- T1：开发并测试 scripts/01–04；
+- T2：开发百炼客户端、JSON Schema 解析、重试和 scripts/05–07；
+- T3：开发状态机、反事实与难度生成器、scripts/08–10；
+- T4：开发 validators、统计器和故意错误的测试用例。
+
+这一波使用的 synthetic fixtures 只是程序单元测试，不是小规模数据集，不进入论文规模，也不是 smoke。四个对话只写自己的文件，不依赖真实下游产物。
+
+Wave 1 合并顺序：
+
+1. T1 的单元测试与脚本；
+2. T4 针对 source 的验证器；
+3. T2 的 API/结构化输出客户端；
+4. T3 的状态机与编译器；
+5. T4 其余验证器。
+
+每次由 T0 合并，工作对话之间不要彼此 merge。
+
+#### Wave 2：全量 Atom 建库
+
+同时运行上限为 3 个：
+
+- T1：对全部 SRT 运行 inventory、parse、align、split；
+- T4：等待 T1 产生每个阶段 SUCCESS 后做独立验证；
+- T2：只完善 prompt 和成本估算，不读取未冻结 atom；
+- T3：继续扩大状态机边界测试，不运行正式 Life Log。
+
+T1 通过后，T0 冻结 SOURCE_ATOMS_SUCCESS 哈希。若 T4 报错，只退回 T1 修复；T4 不改 source 文件。
+
+#### Wave 3：全量 Cue 与候选 Seed
+
+依赖顺序是先 Cue、后检索、再 Seed，不能让三个对话各自生成一份：
+
+1. T2 用 Flash 全量生成 cue candidates；
+2. 程序过滤后生成 cue library 和 CUE_LIBRARY_SUCCESS；
+3. T4 验证 cue schema、原文证据和幻觉比例；
+4. T2 用 BGE-M3 检索 trigger/lure；
+5. T2 用 Plus 生成约 60 个 Seed candidates；
+6. T4 运行候选硬条件验证；
+7. T0 接收可供人工审核的候选。
+
+此时 T1 可以补充来源统计，T3 可以准备编译环境，但都不能修改 cues 或 candidates。
+
+#### Wave 4：Seed 审计，减少并行
+
+这一阶段质量比速度重要，建议只让 T0、T2、T4 工作：
+
+- T2 调用 qwen3.7-max-2026-06-08 提供审计意见；
+- T0/人工逐个给出 accept、revise、reject；
+- T4 检查每个 Seed 的 trigger、两个 lure、terminal/silent 与 split 硬条件；
+- revise 只退回 T2 修改候选；
+- T0 冻结 reminder_seed_audit.csv；
+- T3 运行 08_freeze_seed_audit.py，生成 SEEDS_FROZEN_SUCCESS。
+
+若通过数少于 35，T2 扩大候选池到 70–80；不允许 T3 或 T4降低规则。
+
+#### Wave 5：Life Log 与 Gold 全量编译
+
+可以同时进行：
+
+- T3：生成所有 6-way families、210–240 条 Life Log、Decision Instance 和 Evidence Set；
+- T4：只验证已完成并带 SUCCESS 的批次；
+- T2：整理模型运行元数据、成本与拒绝原因；
+- T1：整理 source 覆盖和 unique_source_hours。
+
+正式输出可按 family_id 分 shard，例如 part-000.jsonl、part-001.jsonl。每个 shard 完成后写独立哈希，最终再由 T3 生成总 manifest。T4 不能读取 .tmp 或未完成 shard。
+
+#### Wave 6：最终验收与发布
+
+- T4 全量运行验证器、泄漏检查和统计；
+- T0 审阅所有阻断错误；
+- 问题按所有权退回 T1、T2 或 T3；
+- 修复后只重跑受影响阶段及其全部下游；
+- T4 零阻断后生成 FINAL_VALIDATION_SUCCESS，并更新 dataset card；
+- T0 更新 README、发布版本和最终 manifest。
+
+### 7. 哪些事情可以同步，哪些绝对不能
+
+| 工作组合 | 是否可并行 | 原因 |
+| --- | --- | --- |
+| SRT parser 与状态机代码开发 | 可以 | 文件和数据依赖独立 |
+| 千问 API 客户端与 validator 开发 | 可以 | 都可使用 synthetic fixtures |
+| 全量 SRT 解析与状态机单元测试 | 可以 | 一个主要用磁盘/CPU，一个规模很小 |
+| T1 写 atom 与 T4读取同一未完成 JSONL | 不可以 | 会读到半文件 |
+| Cue 抽取与 Seed 生成 | 不可以 | Seed 依赖冻结 cue library |
+| Seed 生成与 Seed 终审 | 不可以对同一批同时进行 | 审计对象必须稳定 |
+| Max 审计与人工独立阅读 | 可以 | 两者先独立判断，再汇总 |
+| Life Log 生成与已完成 shard 验证 | 可以 | 以 SUCCESS/hash 为边界 |
+| 两个对话并行调用 Flash 处理同一 atom 集合 | 不可以 | 会重复计费并产生版本分叉 |
+| T3 生成 gold 与千问生成 gold | 不可以 | gold 只有 oracle 一条来源 |
+| T4 报错与生产者修复 | 可以 | T4写 issue，生产者写自己的代码 |
+| 多个对话同时改 config/schema | 绝对不可以 | 数据合同会失控 |
+
+### 8. 终端如何分配
+
+每个 worktree 只开一个主要 PowerShell 终端：
+
+| 终端 | 工作目录 | 用途 |
+| --- | --- | --- |
+| Terminal 0 | D:\scientific\EgoPM | T0 合并、完整测试、最终命令 |
+| Terminal 1 | SourceAtoms worktree | T1 单测与全量 SRT 任务 |
+| Terminal 2 | Qwen worktree | T2 API 调用、batch 状态和重试 |
+| Terminal 3 | Compiler worktree | T3 状态机、Life Log 和 oracle |
+| Terminal 4 | QA worktree | T4 只读验证和统计 |
+
+不要用多个普通 PowerShell 窗口同时在 D:\scientific\EgoPM 主目录运行会写输出的命令。长时间任务留在它所属对话的终端；另开窗口只能查看日志，不能启动第二份同名生产任务。
+
+本地 BGE-M3 若使用 GPU，Terminal 2 独占 GPU；不要同时在 Terminal 3 启动视觉/VLM 实验。当前 v1 不读视频，因此其他阶段主要是 CPU、磁盘或 API 负载，可以并行。
+
+### 9. 每个对话结束时必须交接
+
+对应 handoff 文件使用统一模板：
+
+~~~text
+# Tn Handoff
+
+- branch / commit:
+- contract_version:
+- 完成内容:
+- 修改文件:
+- 只读输入及 SHA256:
+- 输出及 SHA256:
+- 测试命令:
+- 测试结果:
+- 未解决问题:
+- 是否产生 CHANGE_REQUEST:
+- 下一阶段是否可启动: yes / no
+~~~
+
+T0 不接受“已经弄好了”这种交接。没有 commit、命令、测试结果、输入输出哈希和已知问题，就不算完成。
+
+### 10. 状态板
+
+coordination/STATUS.md 只由 T0 更新，建议使用：
+
+| Gate | Owner | Status | Frozen artifact/hash | Blocker | Next |
+| --- | --- | --- | --- | --- | --- |
+| Contract v1 | T0 | TODO | — | — | freeze schemas |
+| Source atoms | T1 | BLOCKED | — | Contract v1 | implement 01–04 |
+| Source QA | T4 | BLOCKED | — | Source atoms | validate |
+| Cue library | T2 | BLOCKED | — | Source QA | run Flash |
+| Seed candidates | T2 | BLOCKED | — | Cue library | generate 60 |
+| Seed audit | T0/T4 | BLOCKED | — | Candidates | audit |
+| Families/oracle | T3 | BLOCKED | — | Frozen Seeds | compile |
+| Final QA | T4 | BLOCKED | — | Decisions | validate |
+| Release | T0 | BLOCKED | — | Final QA | publish |
+
+状态只能使用 TODO、IN_PROGRESS、BLOCKED、DONE。只有 T0 能把 Gate 改成 DONE。
+
+---
+
+## 六、第一阶段：从全部 SRT 得到 Source Video Atom 库
+
+这是现在最先要完成的工作。
+
+### 1. atom 里到底保存 SRT 还是 MP4 路径
+
+两者都保存，作用不同：
+
+- source_srt_paths：当前 v1 真正读取的 Transcript/Dense Caption 文件和文本时间戳来源，用于追溯、纠错和复现；
+- source_video_path：未来恢复视觉输入时对应的 MP4 媒体定位信息；
+- source_video_path 不代表当前已经下载了 MP4，也不代表文件一定存在；
+- 如果暂时不能由文件名可靠推断视频路径，就设为 null，并记录 video_mapping_status=pending，不能编造路径；
+- 构造意图、取消、完成等事件没有 EgoLife 原视频，source_srt_paths 与 source_video_path 都是 null，同时必须保存 rule_id 和 generation_record。
+
+建议的 atom 示例：
+
+~~~json
+{
+  "atom_id": "src_A1_JAKE_DAY1_000123",
+  "atom_kind": "source_video_atom",
+  "participant_source_id": "A1_JAKE",
+  "source_day": "DAY1",
+  "session_id": "DAY1_A1_JAKE_11000000",
+  "source_srt_paths": {
+    "transcript": "EgoLifeCap/Transcript/A1_JAKE/DAY1/example.srt",
+    "dense_caption": "EgoLifeCap/DenseCaption/A1_JAKE/DAY1/example.srt"
+  },
+  "source_video_path": null,
+  "video_mapping_status": "pending",
+  "source_start_sec": 587.1,
+  "source_end_sec": 595.7,
+  "transcript_segment_ids": ["tr_00124", "tr_00125"],
+  "dense_caption_segment_ids": ["dc_00087"],
+  "transcript": "Okay, then we need a stopwatch.",
+  "dense_caption": "Jake is speaking with the others at a table.",
+  "visible_text": "Jake is speaking with others at a table. They mention needing a stopwatch.",
+  "provenance": "egolife_srt",
+  "split": "train"
+}
+~~~
+
+source_start_sec/source_end_sec 必须说明是文件内相对秒、session 相对秒还是全局秒。推荐同时保存 local_start_sec 与 normalized_start_sec，绝不能只留一个含义不明的数字。
+
+### 2. 具体生成步骤
+
+#### A. 清点文件
+
+01_inventory_srt.py 递归扫描 Transcript 与 DenseCaption，输出 srt_inventory.csv。每行包括：
+
+- modality；
+- participant；
+- day；
+- file_name；
+- relative_path；
+- file_size；
+- parse_status；
+- 从文件名解析出的 session/video UID；
+- 是否找到同 session 的另一种 SRT。
+
+输出后先检查所有已下载 SRT 都出现在清单中。
+
+#### B. 解析每个 SRT block
+
+02_parse_srt.py 把每个字幕块转成 raw_srt_segments.jsonl。程序负责：
+
+- 读取字幕序号；
+- 把 HH:MM:SS,mmm 转成秒；
+- 保留原始文本；
+- 规范空白字符；
+- 删除空块和完全重复的相邻块；
+- 保留原文件相对路径和原字幕序号；
+- 解析失败写 error，不静默跳过。
+
+这一阶段不调用千问。
+
+#### C. 对齐 Transcript 与 Dense Caption
+
+03_align_modal_text.py 先按 participant、day、session_id 分组，再按时间重叠对齐：
+
+- Dense Caption 时间段作为主要可观察动作窗口；
+- 把与其重叠或在允许容差内的 Transcript 片段挂到同一 atom；
+- 允许一对多和多对一，不要求每条字幕严格一一对应；
+- 如果只有一种模态，也可以保留为 atom，并标记 modality_coverage；
+- 相邻短描述若场景与动作连续，可按明确规则合并成 5–30 秒的 atom；
+- 不让千问修改原始起止时间。
+
+对齐阈值写入 config，不要散落在代码里。需要输出配对率、单模态 atom 比例、时长分布、异常长片段与未解析文件列表。
+
+#### D. 宽松保留
+
+只删除：
+
+- 空字幕；
+- 严重乱码；
+- 无法恢复有效时间；
+- 完全无法理解的噪声；
+- 相邻完全重复描述。
+
+只要具有可理解的人物、地点、物体、活动、对话、时间或环境状态之一就保留。不要因为它暂时“不像提醒 cue”而删除。原子库的职责是提供可检索生活事实，不是提前筛完整提醒故事。
+
+#### E. 来源去重并先划分
+
+04_make_source_splits.py 在生成任务前冻结 train/dev/test：
+
+- 同一 session、相邻片段和近重复文本不得跨 split；
+- 同一共享世界事件的多参与者视角整体分组；
+- 同一 atom 只能有一个 split；
+- 后续一个 family 中所有 trigger、lure 和派生数据必须来自同一 split；
+- split 不能根据模型生成质量反复挪动。
+
+### 3. 本阶段通过标准
+
+- 全部 SRT 文件都有 inventory 记录；
+- 每个成功 atom 都可追溯到至少一个真实 SRT 字幕块；
+- 起止时间合法且 start < end；
+- source_srt_paths 实际存在；
+- video_mapping_status 不得缺失；
+- 所有解析错误有日志；
+- 不存在跨 split 的相同或近重复来源组；
+- atom_build_report.json 完整报告数量、时长、对齐率和失败原因。
+
+---
+
+## 七、第二阶段：建立宽松 Cue Library
+
+### 1. Cue taxonomy
+
+一个 atom 可以有多个 cue：
+
+- time：虚拟时间、时间段、持续时长；
+- person：某人出现、离开、靠近、开始交互；
+- place：进入或处于某地点；
+- object：某物体出现、拿起、放下、缺失或改变状态；
+- activity：开始、持续、结束或切换某活动；
+- state_change：可观察的环境、人物或物体状态变化。
+
+时间 cue 后续主要由虚拟时间轴构造，因此真实 Seed 中可以少；person、place、activity 应占较大比例；object 居中；state_change 最难，宁少勿模糊。
+
+### 2. 千问 Flash 的工作
+
+05_extract_cues.py 将一个 atom 或相邻小窗口发送给 qwen3.7-flash-2026-07-15，只要求返回候选 JSON：
+
+- entities；
+- scene_type；
+- activity_type；
+- observable_cues；
+- cue_type；
+- normalized_predicate；
+- supporting_text_span；
+- confidence；
+- ambiguity_reason。
+
+模型输出只是候选。程序必须检查 cue 的实体或动作能在输入文本中找到支持，过滤 schema 错误、空 predicate 和明显幻觉。低置信度不必立即删除，可以送给 Plus 或人工复核。
+
+### 3. Cue Library 的输出
+
+cue_library.jsonl 中每条 cue 都要包含 atom_id、source split、原始支持文本、规范谓词、模型版本与 validation_status。后续检索永远回到 atom_id，而不是只保留大模型改写文本。
+
+---
+
+## 八、第三阶段：决策优先生成 60 个候选 Reminder Seed
+
+### 1. 为什么决策优先
+
+不要先让模型写一周虚拟故事，再从故事里寻找提醒。那样很容易得到漂亮但不可判定的数据。正确顺序是：
+
+> 真实 trigger atom → 可执行触发谓词 → 需要提醒的未来意图 → 相似 lure → 终止/沉默条件 → 再组装完整 Life Log。
+
+这样每个最终决策点先天可解，而且能明确需要记住什么。
+
+### 2. 每个候选 Seed 的硬条件
+
+- 恰好一个核心提醒意图；
+- 至少一个真实 Source Video Atom 能明确满足 trigger；
+- 至少两个同 split 的真实 lure/distractor；
+- lure 与 trigger 相似，但至少有一个关键谓词不满足；
+- completed、cancelled、expired 或 already_reminded 中至少一种能形成困难 silent；
+- trigger predicate 能被程序或有限规则判断，不是“看起来合适”；
+- 当前 trigger 不能单独泄露此前是否有意图；
+- 所有真实 atom 来自同一 split；
+- 能构造成正反事实对。
+
+### 3. 候选分布不是最终硬配额
+
+先生成约 60 个覆盖面广的候选，建议范围如下：
+
+| 主 cue 类型 | 候选建议 | 预期 |
+| --- | ---: | --- |
+| person | 10–14 | EgoLife 中较常见 |
+| place | 8–12 | 较容易形成进入/处于场景 |
+| activity | 10–14 | 最适合形成主动触发 |
+| object | 8–12 | 需要防止仅靠关键词判断 |
+| time | 4–6 | 主要由虚拟时间构造，数量少 |
+| state_change | 6–10 | 多生成候选，但预计淘汰率最高 |
+
+这些是候选覆盖范围，不要求总数机械相加等于 60，也不要求最终保留相同比例。一个 Seed 可以有主 cue 和辅助 cue。最终分布由审计质量决定。
+
+### 4. 具体生成方式
+
+1. 用 BGE-M3 在 cue library 中按类型、场景和语义检索 trigger 候选；
+2. 对每个 trigger 检索最相似的同 split atom；
+3. 让 qwen3.7-plus-2026-05-26 根据 trigger 提出 1–3 个提醒意图、精确 predicate 与 lure 差异；
+4. 程序验证候选 atom 与 split、时间、来源关系；
+5. Plus 生成最小的完成、取消、过期和已提醒规则候选；
+6. 人工删除不自然、不可观察、无法状态机化或当前画面直接泄露答案的候选；
+7. 每个 Seed 保存 accept/revise/reject 状态与理由。
+
+### 5. Seed 示例逻辑
+
+真实 trigger atom：人物进入厨房并开始准备食物。  
+构造意图：下次开始做饭时提醒我把冷藏药品拿出来。  
+trigger predicate：place=kitchen AND activity_start=cooking。  
+lure 1：人物在厨房聊天，但没有开始做饭。  
+lure 2：人物在餐桌吃饭，但地点和活动都不满足。  
+negative history：这项任务此前已取消。  
+正分支 gold：到 trigger 时 remind。  
+负分支 gold：同一 trigger 时 silent。
+
+这只是结构示例，正式 Seed 必须引用真实 atom_id，不能凭空写 scene。
+
+---
+
+## 九、第四阶段：Seed 审计与 Rule Bank 冻结
+
+### 1. 两级审计
+
+第一层由 qwen3.7-max-2026-06-08 检查：
+
+- trigger 是否真的满足所有谓词；
+- lure 是否只相似而不满足；
+- lifecycle 是否有明确状态转移；
+- matched counterfactual 是否可构造；
+- 是否存在答案泄露；
+- 是否出现模型臆造的来源事实。
+
+第二层由人工逐个审计全部 60 个候选。Max 只能提供意见，不能替代人工签字。
+
+### 2. 审计结果
+
+每个候选只能是：
+
+- accept：无需语义修改，可冻结；
+- revise：保留核心，但需要修改 predicate、lure 或 lifecycle；
+- reject：不可观察、不可解、泄露、无合格 lure、规则含糊或跨 split。
+
+目标是保留 35–40 个。若少于 35 个，回到 cue library 扩大候选池，优先增加 person、place、activity 和 object；不要把不清晰 state_change 强行保留。
+
+### 3. 冻结后不得随意改
+
+冻结 reminder_seeds_frozen.jsonl、rule_bank.jsonl 与 state_machine_policy.yaml 后，派生 6 条 Life Log。若修改某个 Seed 的核心 predicate 或 terminal policy，必须重新生成其整个 family 和所有 gold。
+
+---
+
+## 十、第五阶段：状态机与成对反事实
+
+### 1. 最小状态集合
+
+建议每个 intention 至少有：
+
+- active_unreminded；
+- active_reminded；
+- completed；
+- cancelled；
+- expired。
+
+状态转移由构造事件和规则驱动。例如：
+
+- create_intention → active_unreminded；
+- completion_event → completed；
+- cancel_event → cancelled；
+- virtual_time 超过 deadline → expired；
+- trigger 且仍 active_unreminded → 输出 remind，然后进入 active_reminded。
+
+### 2. Oracle 决策逻辑
+
+~~~text
+if trigger_predicate(current_atom) is false:
+    silent
+elif intention_state is not active_unreminded:
+    silent
+elif current_time is outside valid_window:
+    silent
+else:
+    remind(intent_id)
+~~~
+
+金标必须由这个冻结逻辑产生。千问可以帮助写规则草案，但不能直接为每一行填 remind/silent。
+
+### 3. 成对反事实要求
+
+每个 positive 与 matched-negative 必须：
+
+- 使用完全相同的当前 trigger atom；
+- 使用相同的核心意图文本与 trigger predicate；
+- 只改变一个足以翻转动作的历史条件；
+- 负分支从 never_created、completed、cancelled、expired、already_reminded 中选择；
+- 除必要差异外，尽量匹配事件数、token 数、背景意图和干扰 atom；
+- 由 validator 检查正分支为 remind、负分支为 silent。
+
+不同 family 应轮换负例类型，不能全部只用 cancelled。
+
+---
+
+## 十一、第六阶段：同一任务生成短、中、长三种记忆难度
+
+难度不是把同一视频机械拉长，也不是仅改变分钟数。它由“必须记住的信息与干扰之间的距离和负载”定义：
+
+| 难度 | 建议事件数 | 背景意图 | 干扰密度 | 建议虚拟跨度 |
+| --- | ---: | ---: | --- | --- |
+| short | 12–20 | 0–1 | 低 | 30–90 分钟 |
+| medium | 35–60 | 2–4 | 中 | 2–8 小时 |
+| long | 90–150 | 5–10 | 高 | 12–48 小时，可跨日 |
+
+三种版本必须保持：
+
+- 相同核心意图；
+- 相同 trigger atom；
+- 相同反事实条件；
+- 相同正确动作；
+- 相同 trigger predicate。
+
+只改变：
+
+- 意图到 trigger 的距离；
+- 背景事件和相似 lure 数量；
+- 并行意图数；
+- 状态更新次数；
+- token 负载；
+- virtual span。
+
+真实 source_time 与 virtual_time 必须分开保存。Source Atom 的内部顺序不能颠倒，但来自不同来源段的 atom 可在明确标记的虚拟时间轴中重新排列。不要声称这些排列是 EgoLife 中真实连续发生的一周。
+
+---
+
+## 十二、第七阶段：Life Log 组装
+
+09_build_lifelog_families.py 读取冻结 Seed，先生成 family spec，再派生 6 条 log：
+
+~~~text
+Seed A
+├─ positive-short
+├─ positive-medium
+├─ positive-long
+├─ negative-short
+├─ negative-medium
+└─ negative-long
+~~~
+
+每个事件至少需要：
+
+- event_id；
+- family_id；
+- lifelog_id；
+- virtual_time；
+- source_time 或 null；
+- atom_id 或 null；
+- event_kind；
+- visible_text；
+- source_srt_paths；
+- source_video_path；
+- rule_id；
+- intention_state_before；
+- intention_state_after；
+- event_role；
+- provenance。
+
+event_role 可包括 intention_creation、background、lure、trigger、completion、cancellation、expiry、reminder_history。该字段属于构建审计信息，正式模型输入中必须移除，避免泄露答案。
+
+组装约束：
+
+- 优先保持同一 Life Log 的场景和人物组合合理；
+- 跨 participant 组合必须避免暗示其为同一真实人物经历；
+- 构造桥接事件只能表达意图和生命周期，不能伪造 EgoLife 视觉事实；
+- 同 family 共用 trigger 和核心 lure；
+- 每个正式 log 记录 referenced_source_seconds；
+- 重复引用同一 atom 可以计入 manifest_referenced_hours，但不能重复计入 unique_source_hours。
+
+---
+
+## 十三、第八阶段：生成 Decision Instance 与 Evidence Set
+
+10_run_oracle.py 逐事件推进状态机。在协议规定的每个决策点输出：
+
+- 当前观察；
+- 允许访问的预算记忆输入；
+- gold action；
+- active intention ledger；
+- lifecycle state；
+- minimal evidence set；
+- counterfactual_pair_id；
+- difficulty；
+- split。
+
+Evidence Set 至少区分：
+
+- intention evidence：用户先前要求什么；
+- trigger evidence：当前为什么满足条件；
+- state evidence：任务是否仍有效；
+- reminder-history evidence：是否已经提醒；
+- distractor evidence：为什么相似事件不应触发。
+
+Evidence Set 用于监督和分析，但不能把 event_role、gold 或规则答案直接拼进模型当前输入。
+
+---
+
+## 十四、第九阶段：全量验证，而不是 smoke
+
+11_validate_all.py 对全部数据逐条执行。任何一条失败都进入 validation_errors.jsonl，修复后从受影响上游阶段重新生成。
+
+### 1. Schema 与来源
+
+- 所有 JSONL 可逐行解析；
+- required 字段完整；
+- 每个 source atom 的 SRT 路径存在；
+- 时间范围合法；
+- atom_id、event_id、lifelog_id 唯一；
+- 构造事件具有 rule_id；
+- 不存在伪造的 MP4 路径。
+
+### 2. 决策与状态
+
+- 每次状态迁移合法；
+- completed/cancelled/expired 后不能再次提醒；
+- already_reminded 满足冷却或一次提醒策略；
+- 正分支在指定窗口 remind；
+- 负分支在相同 trigger silent；
+- 非 trigger 与 lure 不能误触发。
+
+### 3. 反事实与难度
+
+- pair 当前 trigger atom 完全相同；
+- pair 只改变声明的历史变量；
+- gold 必须翻转；
+- 三种难度共享核心规则；
+- short < medium < long 的事件数、距离和 token 负载总体成立；
+- negative 不是通过删除当前 cue 作弊。
+
+### 4. Split 与泄漏
+
+- family 不跨 split；
+- 共享 source atom 不跨 split；
+- 近重复字幕和共享世界事件不跨 split；
+- prompt 中不出现 gold、event_role、规则解释；
+- train 中不存在 test Seed 的改写副本。
+
+### 5. 人工复核
+
+- 全部 Reminder Seed 人工复核；
+- 全部 accept/revise/reject 有原因；
+- 派生 Life Log 按 cue 类型、难度、split、负例类型分层抽取至少 10%；
+- 所有发现的问题都记录 issue_type、修复方式和影响范围。
+
+---
+
+## 十五、时长与规模应该怎样统计
+
+至少同时报告三种时长：
+
+1. manifest_referenced_hours：所有正式 Life Log 引用的 Source Atom 时长之和，反事实与难度重复引用会重复计算；
+2. unique_source_hours：对 atom_id 去重后的真实 EgoLife 来源时长；
+3. virtual_span_hours：每条虚拟时间轴首尾时间差之和。
+
+“覆盖 100–120 小时”默认指第一项，论文中不能把它写成“新增了 100–120 小时互不重复的原视频”。最终统计表还应包括：
+
+- Source Atom 数；
+- Cue 数及类型分布；
+- 60 个候选的接受、修改、拒绝数；
+- 最终 Seed 数；
+- Life Log 数；
+- Decision Instance 数；
+- 各场景、人物、天数、trigger 类型、负例类型和难度分布；
+- 正负配对动作翻转成功率；
+- SRT 对齐率、单模态率和来源失败率；
+- 三种时长。
+
+---
+
+## 十六、完整项目推进表
+
+| 阶段 | 主要输入 | 核心动作 | 必交付物 | 进入下一阶段的门 |
+| --- | --- | --- | --- | --- |
+| A. 原始清点 | 全部 SRT | 文件 inventory | srt_inventory.csv | 无漏扫、错误可追踪 |
+| B. 原子建库 | SRT inventory | 解析、对齐、宽松保留 | source_video_atoms.jsonl | schema、来源、时间全通过 |
+| C. 来源冻结 | atom 库 | 去重、分组、split | source_split_map.jsonl | 无跨 split 泄漏 |
+| D. Cue 建库 | atom 库 | Flash 抽取、程序过滤 | cue_library.jsonl | 每条 cue 有原文证据 |
+| E. Seed 候选 | cue library | 检索、Plus 决策优先生成 | 约 60 个 candidates | 每个有 trigger、2 lure、terminal |
+| F. Seed 冻结 | candidates | Max + 人工审计 | 35–40 个 frozen Seeds | 全部可状态机化 |
+| G. Family 生成 | frozen Seeds | 2 反事实 × 3 难度 | 210–240 Life Logs | 核心规则一致 |
+| H. Gold 编译 | Life Logs + rules | oracle 展开 | decision/evidence JSONL | 金标与状态全通过 |
+| I. 全量验收 | 全部产物 | 验证、泄漏、人工抽检 | audit + statistics | 零阻断错误 |
+| J. 基准发布 | 验收数据 | dataset card、评分器 | benchmark release | 可从配置完整重建 |
+
+一个人执行时，每完成一行就提交对应产物和报告，不同时手工改多个下游 JSON。以后若增加协作者，可以按阶段分工，但 schema、rule bank、split 和 protocol 的冻结权应由同一负责人统一管理。
+
+---
+
+## 十七、现在立刻应该做的事情
+
+按以下顺序开始，不要先生成 60 个故事：
+
+1. 建立 egopm_bench_v1 目录和五个 JSON Schema；
+2. 完成 01_inventory_srt.py，确认所有 Transcript/Dense Caption 都进入清单；
+3. 完成 02_parse_srt.py，得到逐字幕块 raw_srt_segments.jsonl；
+4. 完成 03_align_modal_text.py，得到全量 source_video_atoms.jsonl；
+5. 查看 atom_build_report，人工抽看不同人物、日期和模态的 atom；
+6. 冻结来源 split；
+7. 配置百炼 API 与三个固定千问模型，不把密钥写入项目；
+8. 编写 cue_extractor_v1 prompt 和严格 JSON Schema；
+9. 全量运行 Flash，形成 cue library；
+10. 再开始 60 个 Reminder Seed 的检索与生成。
+
+在第 4 步以前，不需要下载 EgoLife 原视频，也不需要拼接视频。MP4 映射可先保存为 pending；真正做视觉扩展时，只根据最终使用到的 atom manifest 按需下载相关视频，而不是下载整个 EgoLife 视频集合。
+
+---
+
+## 十八、Definition of Done
+
+EgoPM-Bench v1 只有同时满足以下条件才算完成：
+
+- 全部正式 atom 可追溯到 SRT；
+- SRT 路径与 MP4 定位字段含义清楚；
+- 35–40 个合格 Seed 来自约 60 个候选的真实审计结果；
+- 每个 Seed 有真实 trigger、至少两个真实 lure 和完整 silent 逻辑；
+- 每个 Seed 派生 6 条匹配 Life Log；
+- gold 全部由同一冻结 oracle 生成；
+- 正反事实在相同当前 trigger 上稳定翻转动作；
+- short/medium/long 真正改变记忆负载而不改变任务语义；
+- family 与 source group 无跨 split 泄漏；
+- 210–240 条数据通过全量机器验证和分层人工抽检；
+- 三种时长与全部分布统计透明报告；
+- 模型、prompt、schema、规则、随机种子和日志足以复现；
+- 文本主轨道可以独立运行，未来视频轨道能通过相同 atom_id 接入。
+
+达到这些条件后，得到的不是“把 EgoLife 片段随意拼成一周”，而是一个有真实生活场景依据、由明确规则生成、专门考察长期记忆状态与主动提醒决策的可复现 benchmark。
