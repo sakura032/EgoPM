@@ -1,0 +1,11 @@
+{
+  "answer_leakage_count": 0,
+  "blocker_count": 6,
+  "contract_version": "v1.0.0",
+  "generated_at": "2026-08-31T12:57:29.949594+08:00",
+  "issues_by_type": {
+    "success_marker_missing": 1,
+    "upstream_stage_unavailable": 5
+  },
+  "split_leakage_count": 0
+}
