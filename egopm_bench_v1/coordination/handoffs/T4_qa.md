@@ -1,49 +1,46 @@
-# T4：CR-2026-007 Cue v2 无 API QA 交接
+# T4：CR-2026-009 Cue v2.2 Batch File 无 API QA 交接
 
 ## 交接元数据
 
 - 分支：`main`。
-- 本次相关 T4 提交：`da38f78`（Cue v2 执行血缘与用量汇总 QA）和 `d67aab7`（完整执行合同协议哈希 QA）。
+- 本次 T4 提交：待 T0 合并后填写；基线配置提交为 `21e01f6`、`738b7d9`、`b851583`。
 - 治理合同版本：`v1.1.0`。
-- 数据合同版本：Source Atom Schema 为 `v1.1.0`；最终 `cue_candidate` Schema 保持 `v1.0.0`；Cue v2 协议哈希 payload version 为 `v1.0.0`。
+- 数据合同版本：Source Atom Schema 为 `v1.1.0`；最终 `cue_candidate` Schema 仍为 `v1.0.0`；Cue 执行协议为 `v2.2.0`，协议哈希 payload 为 `v2.0.0`。
 - 修改文件：`scripts/11_validate_all.py`、`tests/test_validators.py`、本交接文件。
-- 只读输入：仅使用 T0 冻结的配置与 Schema 定义，以及 pytest 临时目录中的 synthetic 配置、提示词、推理 Schema、Source/Cue 标记和 JSONL；未读取正式 Cue、Seed、Life Log 或模型原始响应。
-- 正式输出：无。未生成或修改任何正式 Cue JSONL、SUCCESS、审计、Seed、Life Log 或 Decision 产物。
+- 只读输入：T0 冻结的 `model_registry.yaml`、最终 Cue Schema、紧凑推理 Schema 与 pytest 临时目录中的合成 Source/Cue 标记和无正文 Batch 元数据。
+- 正式输出：无。未读取或修改正式 Cue、Seed、Life Log、Decision、审计产物或模型原始响应。
 
-## 已完成的 QA 实现
+## 已完成的 QA 门
 
-- 保留按阶段校验的最终 Cue Schema 边界：Cue SUCCESS 必须声明 `cue_candidate: v1.0.0`，不能被全局 `v1.1.0` 合同版本误判。
-- 对 `CUE_LIBRARY_SUCCESS.json` 增加 v2 血缘门。标记必须含冻结 Source SHA256、`model_id`、`prompt_version`、`cue_execution_policy_version`、`protocol_hash_payload_version`、提示词和推理 Schema 的名称/版本/SHA256、`cue_execution_protocol_sha256` 与无正文 `usage_summary`。
-- T4 会从冻结 `model_registry.yaml`、`cue_extractor_v2.md` 和 `cue_inference_batch_v1.schema.json` 独立计算，而不信任生产者自报的哈希。
-- 协议哈希采用 UTF-8、`sort_keys=True`、紧凑分隔符的稳定 JSON SHA256。其 canonical payload 固定包含：payload version；模型 ID、非思考设置、温度、提示词版本、最终 Cue Schema/版本；服务 endpoint、region、凭据策略、原始响应策略；完整 `cue_extraction.execution`（package、受控字段、限流、token 口径、价格、布局和恢复）；提示词 SHA256 与推理 Schema SHA256。运行时数据和 Source 哈希不进入协议哈希，Source 哈希由标记的独立字段验证。
-- 用量汇总必须含 package、尝试、成功/失败、输入/输出/总 token、缺失 usage、重试和限流等待；所有数值非负，且成功加失败等于尝试、输入加输出等于总 token、重试不超过尝试。
-- 缺少字段、错 Source/提示词/推理 Schema/协议哈希、错版本、错用量算术或冻结执行语义漂移均为 `BLOCKER`，并发生在读取最终 Cue JSONL 前。
+- 保留按 stage 冻结的 Schema 校验：正式 Cue 仍必须声明 `cue_candidate: v1.0.0`，不能被全局合同版本误判。
+- T4 从当前 registry、`cue_extractor_v3_compact.md` 与 `cue_inference_batch_compact_v1.schema.json` 独立计算完整 canonical 协议哈希；该哈希覆盖 payload 版本、模型、service、完整 `execution`、紧凑提示词 SHA256 与紧凑 Schema SHA256。
+- 最终 `CUE_LIBRARY_SUCCESS.json` 除既有 Source、提示词、Schema、协议和 usage 字段外，必须声明 `batch_transport`、task 数、无正文 task 汇总清单 SHA256、请求数、原始响应禁止策略及远端清理责任状态。正式 Cue 只接受 `v2.2.0` 的 `batch_file`；历史实时 v2 标记不会放行。
+- 固定读取 `cues/batch/batch_tasks_manifest.jsonl`。每行必须含 T0 冻结的 task 血缘、输入 SHA256、逻辑 shard 范围、远端输入 file ID、状态与无正文 `custom_id: package_id` 双向映射。QA 验证 SHA、文件请求数/分组上限、custom_id 格式、跨 task 唯一性和 package 双向唯一性。
+- 递归拒绝任务元数据和账本中的 `body`、`request`、`response`、`error`、`visible_text`、`source_text` 等正文键；不读取或持久化 Batch 请求、结果或错误正文。
+- 扫描 package ledger 并从冻结 `batch_ledger_policy` 读取必需字段和三种终态：`validated_success`、`service_line_failure_requeueable`、`local_validation_quarantine`。每个 custom ID 只能有一个终态；隔离 package 不得再次重排队或与成功混写；正式 SUCCESS 前所有 task 映射均须有唯一的 `validated_success` 终态。
+- 独立短码展开测试验证短码/默认值可得到最终 `cue_candidate` Schema；未知短码、跨 Atom 支撑片段、非法置信度和不对齐谓词均拒绝。
 
 ## Python 中文说明与关键注释验收
 
 | 文件 | 中文模块说明 | 关键中文注释 | 结论 |
 | --- | --- | --- | --- |
-| `scripts/11_validate_all.py` | 首个有效内容说明第 11 步职责、输入、输出与流水线位置 | 已说明阶段 Schema 边界、SUCCESS/哈希门、完整执行合同哈希、Source 血缘和用量账本算术为何必须独立校验 | 通过 |
-| `tests/test_validators.py` | 首个有效内容说明 synthetic 输入、pytest 输出与非生产边界 | 已说明临时 v2 合同替身、错误哈希/版本/账本与 RPM 漂移的拒绝目的 | 通过 |
+| `scripts/11_validate_all.py` | 说明第 11 步的只读输入、审计输出与流水线位置 | 说明 stage Schema 边界、完整协议哈希、无正文清单、输入哈希、远端清理、隔离不重试和原文子串防线的原因 | 通过 |
+| `tests/test_validators.py` | 说明只使用临时合成输入与 pytest 输出 | 说明 task 元数据篡改、原始正文边界、价格/输出漂移和 quarantine 重排队的拒绝目的 | 通过 |
 
 ## 测试与结果
 
 ```powershell
-python -m pytest -q egopm_bench_v1/tests/test_validators.py --basetemp .pytest_cache/t4-v2p-validators
-# 结果：14 passed
-
-python -m pytest -q --basetemp .pytest_cache/t4-v2p-all
-# 结果：37 passed
+python -m pytest -q egopm_bench_v1/tests/test_validators.py --basetemp .pytest_cache/t4-v22-fourth
+# 结果：18 passed
 
 git diff --check
 # 结果：通过
 ```
 
-上述测试均为无 API synthetic 测试：未读取 `DASHSCOPE_API_KEY`、未访问网络、未调用千问，未写生产输出。
+以上均为无 API synthetic 测试：未读取 `DASHSCOPE_API_KEY`、未联网、未上传/下载 Batch 文件、未创建远端任务，未写正式 Cue 或 SUCCESS。
 
 ## 未解决问题、CR 状态与下一门
 
-- T4 QA 代码没有未解决问题。
-- `CR-2026-007` 状态为“已接受无 API 实施准备；未获正式 API 生产授权”。
-- 下一门仍是用户明确确认预算、执行范围、运行时间窗和失败重跑范围后，T2 才能以 v2 五条 package 方案执行正式第 05 步；在此之前 Cue 门保持 `BLOCKED`。
-- 正式 `CUE_LIBRARY_SUCCESS.json` 出现后，T4 才能执行独立 Cue QA；T0 未提升 Cue QA 为 `DONE` 前，不得启动 Seed 阶段。
+- T4 范围内没有未解决 QA 设计问题；T2 必须使其 v2.2 无 API Batch 执行器输出与本交接的 task/ledger/SUCCESS 字段一致，之后由 T0 进行交叉审阅。
+- `CR-2026-009` 状态为“无 API 实施中；未获 Batch 生产授权”。
+- 只有 T0 合并 T2/T4 代码并通过全仓无 API 测试、冻结 Source 预检和文件所有权审阅后，才能向用户申请 Batch File 生产授权。授权前禁止上传/下载文件、创建任务、调用千问、生成正式 Cue/Seed/Life Log。

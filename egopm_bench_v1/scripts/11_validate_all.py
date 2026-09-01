@@ -103,7 +103,7 @@ STAGE_DEPENDENCIES = {
 # Cue v2 的最终数据 Schema 保持 v1.0.0，但其执行过程另有冻结的请求协议。下面的
 # 字段是最终 SUCCESS 可审计地指向该协议、冻结 Source 和无正文用量账本的最小边界；
 # 不能仅凭最终 JSONL 合法就接受来自不同提示词、模型或推理 Schema 的混合结果。
-CUE_V2_MARKER_FIELDS = {
+CUE_V22_MARKER_FIELDS = {
     "source_atoms_sha256",
     "model_id",
     "prompt_version",
@@ -115,6 +115,13 @@ CUE_V2_MARKER_FIELDS = {
     "cue_inference_schema_version",
     "cue_inference_schema_sha256",
     "usage_summary",
+    "batch_transport",
+    "batch_task_count",
+    "batch_tasks_manifest_sha256",
+    "batch_input_total_request_count",
+    "batch_local_raw_response_storage",
+    "remote_cleanup_required",
+    "remote_cleanup_status",
 }
 CUE_V2_USAGE_SUMMARY_FIELDS = {
     "package_count",
@@ -128,6 +135,37 @@ CUE_V2_USAGE_SUMMARY_FIELDS = {
     "retry_count",
     "rate_limit_wait_seconds",
 }
+# v2.2 的 Batch 汇总清单是可审计的无正文元数据，不是上传的请求 JSONL。固定文件名
+# 让 QA 能在不保留 `visible_text`、请求 body 或模型 response/error 的情况下，重算任务
+# 数、输入哈希和 custom_id 到本地 package 的双向映射。
+BATCH_TASKS_MANIFEST_NAME = "batch_tasks_manifest.jsonl"
+BATCH_TASK_REQUIRED_FIELDS = {
+    "run_id",
+    "batch_task_index",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "batch_input_sha256",
+    "request_count",
+    "custom_ids_sha256",
+    "logical_shard_start",
+    "logical_shard_end",
+    "remote_file_id",
+    "status",
+    "custom_id_to_package_id",
+}
+BATCH_RAW_CONTENT_FIELDS = {
+    "body",
+    "content",
+    "error",
+    "messages",
+    "request",
+    "request_body",
+    "response",
+    "source_text",
+    "text",
+    "visible_text",
+}
+BATCH_CUSTOM_ID = re.compile(r"^v22_s\d{5}_p\d{3}_[0-9a-f]{8}$")
 TERMINAL_STATES = {"completed", "cancelled", "expired"}
 STATE_TRANSITIONS = {
     None: {None, "active_unreminded"},
@@ -293,7 +331,7 @@ def cue_v2_execution_contract(
     collector: IssueCollector,
     owner: str,
 ) -> dict[str, Any] | None:
-    """读取并哈希 T0 冻结的 Cue v2 配置、提示词和推理 Schema，不信任生产者自报。"""
+    """读取并哈希 T0 冻结的 Cue v2.2 配置、紧凑提示词和推理 Schema，不信任生产者自报。"""
 
     registry_path = config.config_dir / "model_registry.yaml"
     try:
@@ -323,7 +361,19 @@ def cue_v2_execution_contract(
         "schema_version",
     }
     service_required = {"default_endpoint", "default_region", "credential_policy", "raw_response_policy"}
-    execution_required = {"cue_execution_policy_version", "protocol_hash_payload_version"}
+    execution_required = {
+        "cue_execution_policy_version",
+        "protocol_hash_payload_version",
+        "batch_file_policy",
+        "batch_ledger_policy",
+        "compact_inference_policy",
+        "controlled_field_policy",
+        "pricing_snapshot",
+        "recovery",
+        "shard_layout",
+        "token_accounting",
+        "transport",
+    }
     package_required = {
         "maximum_atoms",
         "maximum_request_utf8_bytes",
@@ -392,6 +442,322 @@ def cue_v2_execution_contract(
     }
 
 
+def batch_tasks_manifest_path(config: RunConfig, contract: dict[str, Any]) -> Path:
+    """返回 v2.2 固定的无正文 Batch 汇总清单路径，不接受生产者提供的任意路径。"""
+
+    # 该名称是运行布局的一部分：若允许 SUCCESS 指向任意文件，攻击者可用另一轮运行的
+    # 清单替换它而不触发路径门。清单内只有哈希、ID 与 package 映射，绝不保存请求正文。
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    layout = registry["models"]["cue_extraction"]["execution"]["shard_layout"]
+    if layout.get("batch_tasks_manifest") != BATCH_TASKS_MANIFEST_NAME:
+        raise ValueError("冻结 Batch task 汇总清单文件名不符合 v2.2 合同")
+    return config.benchmark_root / str(layout["root"]) / BATCH_TASKS_MANIFEST_NAME
+
+
+def has_forbidden_batch_content(value: Any) -> bool:
+    """递归识别 Batch 元数据中不应落盘的请求/响应正文键。"""
+
+    if isinstance(value, dict):
+        return any(key in BATCH_RAW_CONTENT_FIELDS or has_forbidden_batch_content(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(has_forbidden_batch_content(item) for item in value)
+    return False
+
+
+def expand_compact_cue_for_qa(
+    compact: dict[str, Any],
+    atom: dict[str, Any],
+    contract: dict[str, Any],
+    run_id: str,
+) -> dict[str, Any]:
+    """独立展开一条 v2.2 短码 Cue，供 QA 测试证明紧凑协议仍能得到最终 Schema。"""
+
+    registry_path = Path(__file__).resolve().parents[1] / "config" / "model_registry.yaml"
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    compact_policy = registry["models"]["cue_extraction"]["execution"]["compact_inference_policy"]
+    type_codes = compact_policy["cue_type_codes"]
+    operator_codes = compact_policy["operator_codes"]
+    required = set(compact_policy["required_fields"])
+    optional = set(compact_policy["optional_defaults"])
+    if not isinstance(compact, dict) or set(compact).difference(required | optional) or required.difference(compact):
+        raise ValueError("紧凑 Cue 的字段集合不符合 v2.2 冻结短码协议")
+    if not isinstance(compact["n"], int) or isinstance(compact["n"], bool) or not 0 <= compact["n"] < 5:
+        raise ValueError("紧凑 Cue 的 n 必须是 package 内 0..4 索引")
+    cue_code = compact["t"]
+    if cue_code not in type_codes:
+        raise ValueError("紧凑 Cue 含未知 cue_type 短码")
+    predicates = compact["p"]
+    if not isinstance(predicates, list) or not predicates:
+        raise ValueError("紧凑 Cue 必须含非空谓词数组")
+    clauses: list[dict[str, str]] = []
+    for predicate in predicates:
+        if not isinstance(predicate, list) or len(predicate) != 3:
+            raise ValueError("紧凑谓词必须是三个元素的短码数组")
+        slot_code, operator_code, value = predicate
+        if slot_code not in type_codes or operator_code not in operator_codes or not isinstance(value, str) or not value:
+            raise ValueError("紧凑谓词含未知短码或空 value")
+        clauses.append({"slot": type_codes[slot_code], "operator": operator_codes[operator_code], "value": value})
+    if not any(predicate[0] == cue_code for predicate in predicates):
+        raise ValueError("至少一个谓词 slot 必须与 cue_type 短码一致")
+    supporting_span = compact["x"]
+    source_text = atom["visible_text"]
+    if not isinstance(supporting_span, str) or not supporting_span or supporting_span not in source_text:
+        # 这是幻觉防线：只保存最终 Cue 后不能再依赖原始模型响应重查，因此接收时必须
+        # 拒绝跨 Atom 或臆造的支撑文本。
+        raise ValueError("紧凑 Cue 的支撑片段不是本 Atom 原文连续子串")
+    confidence = compact["c"]
+    if not isinstance(confidence, int) or isinstance(confidence, bool) or not 0 <= confidence <= compact_policy["confidence_scale"]:
+        raise ValueError("紧凑 Cue 的置信度必须是 0..100 整数")
+    status_codes = {"A": "accepted", "R": "rejected", "N": "needs_review"}
+    if compact["v"] not in status_codes:
+        raise ValueError("紧凑 Cue 含未知 validation_status 短码")
+    defaults = compact_policy["optional_defaults"]
+    entities = compact.get("e", defaults["e"])
+    scene = compact.get("s", defaults["s"])
+    activity = compact.get("a", defaults["a"])
+    ambiguity = compact.get("r", defaults["r"])
+    if not isinstance(entities, list) or any(not isinstance(entity, str) or not entity for entity in entities):
+        raise ValueError("紧凑 Cue 的实体数组不合法")
+    return {
+        "cue_id": f"cue_{atom['atom_id'][4:]}_{compact['n']:02d}",
+        "atom_id": atom["atom_id"],
+        "split": atom["split"],
+        "entities": entities,
+        "scene_type": scene,
+        "activity_type": activity,
+        "cue_type": type_codes[cue_code],
+        "normalized_predicate": {"all_of": clauses},
+        "supporting_text_span": supporting_span,
+        "source_text": source_text,
+        "confidence": confidence / compact_policy["confidence_scale"],
+        "ambiguity_reason": ambiguity,
+        "model_id": contract["model_id"],
+        "prompt_version": contract["prompt_version"],
+        "schema_version": "v1.0.0",
+        "run_id": run_id,
+        "validation_status": status_codes[compact["v"]],
+    }
+
+
+def validate_batch_task_manifest(
+    config: RunConfig,
+    contract: dict[str, Any],
+    marker: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """校验 v2.2 Batch 无正文汇总清单、任务边界和 custom_id/package 双向血缘。"""
+
+    manifest_path = batch_tasks_manifest_path(config, contract)
+    if not manifest_path.is_file():
+        collector.add("BLOCKER", "cue_batch_manifest_missing", "cue", str(manifest_path), "汇总清单不存在", owner)
+        return False
+    if sha256_file(manifest_path) != marker.get("batch_tasks_manifest_sha256"):
+        collector.add(
+            "BLOCKER", "cue_batch_manifest_hash", "cue", "SUCCESS 声明的 batch_tasks_manifest_sha256", sha256_file(manifest_path), owner
+        )
+        return False
+    records = read_jsonl(manifest_path, collector, "cue_batch_manifest", owner)
+    if not records:
+        collector.add("BLOCKER", "cue_batch_manifest_empty", "cue", "至少一个已完成 Batch task", "空清单", owner)
+        return False
+
+    # contract 返回给 SUCCESS 比对的字段刻意不泄露整份执行配置；这里重新从 T0 冻结
+    # 的 registry 读取限额，避免生产者可通过 SUCCESS 自报的数值放宽文件/分组边界。
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    execution = registry["models"]["cue_extraction"]["execution"]
+    batch_policy = execution["batch_file_policy"]
+    max_requests = batch_policy["max_requests_per_file"]
+    shards_per_task = batch_policy["logical_shards_per_task"]
+    total_requests = 0
+    all_custom_ids: set[str] = set()
+    all_packages: set[str] = set()
+    task_indexes: set[int] = set()
+    valid = True
+    for line_number, task in enumerate(records, start=1):
+        label = f"task:{line_number}"
+        if has_forbidden_batch_content(task):
+            collector.add("BLOCKER", "cue_batch_raw_content", label, "仅无正文任务元数据", "发现请求、响应、错误或可见文本字段", owner)
+            valid = False
+        missing = sorted(BATCH_TASK_REQUIRED_FIELDS.difference(task))
+        if missing:
+            collector.add("BLOCKER", "cue_batch_task_fields", label, "完整的无正文 Batch task 元数据", f"缺少 {missing}", owner)
+            valid = False
+            continue
+        task_index = task["batch_task_index"]
+        request_count = task["request_count"]
+        shard_start = task["logical_shard_start"]
+        shard_end = task["logical_shard_end"]
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in (task_index, request_count, shard_start, shard_end)):
+            collector.add("BLOCKER", "cue_batch_task_value", label, "任务索引、请求数和 shard 边界均为整数", repr(task), owner)
+            valid = False
+            continue
+        if task_index < 0 or task_index in task_indexes:
+            collector.add("BLOCKER", "cue_batch_task_index", label, "唯一的非负 batch_task_index", repr(task_index), owner)
+            valid = False
+        task_indexes.add(task_index)
+        if request_count < 1 or request_count > max_requests:
+            collector.add("BLOCKER", "cue_batch_task_request_limit", label, f"1..{max_requests}", repr(request_count), owner)
+            valid = False
+        if shard_start < 0 or shard_end < shard_start or shard_end - shard_start + 1 > shards_per_task:
+            collector.add("BLOCKER", "cue_batch_task_shard_group", label, f"最多 {shards_per_task} 个连续逻辑 shard", f"{shard_start}..{shard_end}", owner)
+            valid = False
+        for field_name, expected in (
+            ("source_atoms_sha256", marker["source_atoms_sha256"]),
+            ("cue_execution_protocol_sha256", marker["cue_execution_protocol_sha256"]),
+        ):
+            if task[field_name] != expected:
+                collector.add("BLOCKER", "cue_batch_task_lineage", f"{label}:{field_name}", repr(expected), repr(task[field_name]), owner)
+                valid = False
+        if task["status"] != "completed":
+            collector.add("BLOCKER", "cue_batch_task_status", label, "completed", repr(task["status"]), owner)
+            valid = False
+        if not isinstance(task["remote_file_id"], str) or not task["remote_file_id"].strip():
+            # 无 API 预检可以在 T2 单测中使用 null，但最终 SUCCESS 只能在真实上传过输入
+            # 且已产生可追踪远端句柄后出现；否则无法审计服务端临时文件的清理责任。
+            collector.add("BLOCKER", "cue_batch_remote_file_id", label, "非空远端输入 file ID", repr(task["remote_file_id"]), owner)
+            valid = False
+        if not isinstance(task["batch_input_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", task["batch_input_sha256"]):
+            collector.add("BLOCKER", "cue_batch_input_hash", label, "64 位 SHA256", repr(task["batch_input_sha256"]), owner)
+            valid = False
+        mappings = task["custom_id_to_package_id"]
+        if not isinstance(mappings, dict) or len(mappings) != request_count:
+            collector.add("BLOCKER", "cue_batch_custom_id_count", label, "与 request_count 相等的 custom_id:package_id 映射", repr(mappings), owner)
+            valid = False
+            continue
+        task_custom_ids: list[str] = []
+        task_packages: list[str] = []
+        for custom_id, package_id in mappings.items():
+            if not isinstance(custom_id, str) or not BATCH_CUSTOM_ID.fullmatch(custom_id):
+                collector.add("BLOCKER", "cue_batch_custom_id_format", label, "v22 固定 custom_id 格式", repr(custom_id), owner)
+                valid = False
+            if not isinstance(package_id, str) or not package_id:
+                collector.add("BLOCKER", "cue_batch_package_id", label, "非空 package_id", repr(package_id), owner)
+                valid = False
+            task_custom_ids.append(custom_id)
+            task_packages.append(package_id)
+        if len(set(task_custom_ids)) != len(task_custom_ids) or len(set(task_packages)) != len(task_packages):
+            collector.add("BLOCKER", "cue_batch_custom_id_bijection", label, "task 内 custom_id 与 package_id 双向唯一", repr(mappings), owner)
+            valid = False
+        if set(task_custom_ids).intersection(all_custom_ids) or set(task_packages).intersection(all_packages):
+            collector.add("BLOCKER", "cue_batch_custom_id_bijection", label, "跨 task custom_id 与 package_id 不重复", repr(mappings), owner)
+            valid = False
+        all_custom_ids.update(task_custom_ids)
+        all_packages.update(task_packages)
+        # 输入 JSONL 的行序就是文件 SHA 的组成部分，故 custom_ids 哈希也保留该稳定
+        # 行序；排序会掩盖同一集合被重新排列后与上传输入不一致的问题。
+        expected_custom_ids_sha = canonical_sha256(task_custom_ids)
+        if task["custom_ids_sha256"] != expected_custom_ids_sha:
+            collector.add("BLOCKER", "cue_batch_custom_ids_hash", label, repr(expected_custom_ids_sha), repr(task["custom_ids_sha256"]), owner)
+            valid = False
+        total_requests += request_count
+    if marker["batch_task_count"] != len(records):
+        collector.add("BLOCKER", "cue_batch_task_count", "cue", str(len(records)), repr(marker["batch_task_count"]), owner)
+        valid = False
+    if marker["batch_input_total_request_count"] != total_requests:
+        collector.add("BLOCKER", "cue_batch_total_requests", "cue", str(total_requests), repr(marker["batch_input_total_request_count"]), owner)
+        valid = False
+    if marker["usage_summary"]["package_count"] != total_requests:
+        collector.add("BLOCKER", "cue_batch_usage_package_count", "cue", str(total_requests), repr(marker["usage_summary"]["package_count"]), owner)
+        valid = False
+    return valid
+
+
+def validate_batch_package_ledgers(
+    config: RunConfig,
+    contract: dict[str, Any],
+    marker: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """验证每个 package 的无正文 Batch 账本，隔离、行级失败和成功不可混写。"""
+
+    manifest_path = batch_tasks_manifest_path(config, contract)
+    tasks = read_jsonl(manifest_path, collector, "cue_batch_manifest", owner)
+    custom_to_package = {
+        custom_id: (task, package_id)
+        for task in tasks
+        if isinstance(task.get("custom_id_to_package_id"), dict)
+        for custom_id, package_id in task["custom_id_to_package_id"].items()
+    }
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    layout = registry["models"]["cue_extraction"]["execution"]["shard_layout"]
+    package_root = config.benchmark_root / str(layout["root"]) / str(layout["package_directory"])
+    suffix = str(layout["ledger_suffix"])
+    ledger_paths = sorted(package_root.rglob(f"*{suffix}")) if package_root.is_dir() else []
+    if not ledger_paths:
+        collector.add("BLOCKER", "cue_batch_ledger_missing", "cue", "每个已完成 package 的无正文 ledger", "未找到 ledger", owner)
+        return False
+    ledger_policy = registry["models"]["cue_extraction"]["execution"]["batch_ledger_policy"]
+    required = set(ledger_policy["required_fields"]) | {
+        "batch_task_index",
+        "batch_custom_id",
+        "batch_input_sha256",
+        "remote_file_id",
+        "remote_cleanup_status",
+        "outcome",
+        "package_id",
+    }
+    allowed_outcomes = set(ledger_policy["terminal_outcomes"])
+    terminal_by_custom: dict[str, str] = {}
+    terminal_by_package: dict[str, set[str]] = defaultdict(set)
+    valid = True
+    for ledger_path in ledger_paths:
+        for line_number, event in enumerate(read_jsonl(ledger_path, collector, "cue_batch_ledger", owner), start=1):
+            label = f"{ledger_path.name}:{line_number}"
+            if has_forbidden_batch_content(event):
+                collector.add("BLOCKER", "cue_batch_ledger_raw_content", label, "无请求/响应/错误正文的账本事件", repr(event), owner)
+                valid = False
+            missing = sorted(required.difference(event))
+            if missing:
+                collector.add("BLOCKER", "cue_batch_ledger_fields", label, "完整的 Batch 账本字段", f"缺少 {missing}", owner)
+                valid = False
+                continue
+            custom_id = event["batch_custom_id"]
+            entry = custom_to_package.get(custom_id)
+            if entry is None:
+                collector.add("BLOCKER", "cue_batch_ledger_custom_id", label, "task manifest 中已登记 custom_id", repr(custom_id), owner)
+                valid = False
+                continue
+            task, package_id = entry
+            if event["package_id"] != package_id or event["batch_task_index"] != task["batch_task_index"]:
+                collector.add("BLOCKER", "cue_batch_ledger_lineage", label, "匹配 task manifest 的 package/task", repr(event), owner)
+                valid = False
+            if event["batch_input_sha256"] != task["batch_input_sha256"] or event["remote_file_id"] != task["remote_file_id"]:
+                collector.add("BLOCKER", "cue_batch_ledger_lineage", label, "匹配 task manifest 的输入 SHA 与远端 file ID", repr(event), owner)
+                valid = False
+            if event["remote_cleanup_status"] != "pending_t4_cue_qa":
+                collector.add("BLOCKER", "cue_batch_ledger_cleanup", label, "pending_t4_cue_qa", repr(event["remote_cleanup_status"]), owner)
+                valid = False
+            outcome = event["outcome"]
+            if outcome not in allowed_outcomes:
+                collector.add("BLOCKER", "cue_batch_ledger_outcome", label, repr(sorted(allowed_outcomes)), repr(outcome), owner)
+                valid = False
+                continue
+            if custom_id in terminal_by_custom:
+                collector.add("BLOCKER", "cue_batch_ledger_terminal_duplicate", label, "每个 custom_id 恰有一个终态", repr(custom_id), owner)
+                valid = False
+            terminal_by_custom[custom_id] = outcome
+            terminal_by_package[package_id].add(outcome)
+    for package_id, outcomes in terminal_by_package.items():
+        if "local_validation_quarantine" in outcomes and len(outcomes) > 1:
+            # 服务端成功但本地 QA 失败已计费；再组批会把同一问题转化为重复付费，故只能
+            # 人工授权新的协议/预算后另行处理，不能与自动 requeue 或成功终态并存。
+            collector.add("BLOCKER", "cue_batch_quarantine_requeued", package_id, "quarantine package 不得再次提交", repr(sorted(outcomes)), owner)
+            valid = False
+        if "validated_success" in outcomes and "local_validation_quarantine" in outcomes:
+            collector.add("BLOCKER", "cue_batch_terminal_mixed", package_id, "成功与隔离不可混合", repr(sorted(outcomes)), owner)
+            valid = False
+    expected_custom_ids = set(custom_to_package)
+    if set(terminal_by_custom) != expected_custom_ids:
+        collector.add("BLOCKER", "cue_batch_ledger_coverage", "cue", "每个 task manifest custom_id 均有一个 ledger 终态", f"记录 {len(terminal_by_custom)} / 期望 {len(expected_custom_ids)}", owner)
+        valid = False
+    if any(outcome != "validated_success" for outcome in terminal_by_custom.values()):
+        collector.add("BLOCKER", "cue_batch_non_success_terminal", "cue", "最终 CUE SUCCESS 前全部 custom_id 已 validated_success", repr(terminal_by_custom), owner)
+        valid = False
+    return valid
+
+
 def validate_cue_v2_execution_lineage(
     config: RunConfig,
     marker: dict[str, Any],
@@ -400,7 +766,7 @@ def validate_cue_v2_execution_lineage(
 ) -> bool:
     """独立验证最终 Cue SUCCESS 的 v2 执行血缘和无正文账本汇总。"""
 
-    missing = sorted(CUE_V2_MARKER_FIELDS.difference(marker))
+    missing = sorted(CUE_V22_MARKER_FIELDS.difference(marker))
     if missing:
         collector.add("BLOCKER", "cue_execution_lineage_fields", "cue", "包含全部 v2 执行血缘字段", f"缺少 {missing}", owner)
         return False
@@ -419,6 +785,21 @@ def validate_cue_v2_execution_lineage(
     source_hash = source_marker.get("sha256") if source_marker else None
     if marker.get("source_atoms_sha256") != source_hash:
         collector.add("BLOCKER", "cue_execution_source_hash", "cue", f"冻结 Source SHA256 {source_hash}", repr(marker.get("source_atoms_sha256")), owner)
+        valid = False
+    if marker["batch_transport"] != "batch_file":
+        collector.add("BLOCKER", "cue_batch_transport", "cue", "batch_file", repr(marker["batch_transport"]), owner)
+        valid = False
+    if marker["batch_local_raw_response_storage"] != "forbidden":
+        collector.add("BLOCKER", "cue_batch_raw_response_policy", "cue", "forbidden", repr(marker["batch_local_raw_response_storage"]), owner)
+        valid = False
+    if marker["remote_cleanup_required"] is not True or marker["remote_cleanup_status"] != "pending_t4_cue_qa":
+        collector.add("BLOCKER", "cue_batch_remote_cleanup", "cue", "T4 Cue QA 前要求清理且状态 pending_t4_cue_qa", f"required={marker['remote_cleanup_required']!r}, status={marker['remote_cleanup_status']!r}", owner)
+        valid = False
+    if not isinstance(marker["batch_task_count"], int) or isinstance(marker["batch_task_count"], bool) or marker["batch_task_count"] < 1:
+        collector.add("BLOCKER", "cue_batch_task_count", "cue", "正整数", repr(marker["batch_task_count"]), owner)
+        valid = False
+    if not isinstance(marker["batch_input_total_request_count"], int) or isinstance(marker["batch_input_total_request_count"], bool) or marker["batch_input_total_request_count"] < 1:
+        collector.add("BLOCKER", "cue_batch_total_requests", "cue", "正整数", repr(marker["batch_input_total_request_count"]), owner)
         valid = False
     usage_summary = marker.get("usage_summary")
     if not isinstance(usage_summary, dict):
@@ -448,6 +829,10 @@ def validate_cue_v2_execution_lineage(
         if usage_summary["retry_count"] > usage_summary["attempt_count"]:
             collector.add("BLOCKER", "cue_usage_summary_retries", "cue", "retry_count 不超过 attempt_count", repr(usage_summary), owner)
             valid = False
+    if valid:
+        valid = validate_batch_task_manifest(config, contract, marker, collector, owner)
+    if valid:
+        valid = validate_batch_package_ledgers(config, contract, marker, collector, owner)
     return valid
 
 

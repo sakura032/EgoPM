@@ -67,19 +67,71 @@ def write_valid_marker(qa, config, stage: str, artifact_key: str, marker_key: st
 
 
 def write_cue_v2_contract_artifacts(config: object) -> None:
-    """在临时 benchmark 根建立 T0 冻结文件的最小替身，测试不依赖生产提示词。"""
+    """在临时 benchmark 根建立 v2.2 紧凑工件替身，不依赖生产提示词。"""
 
     benchmark_root = config.benchmark_root
-    prompt = benchmark_root / "prompts" / "cue_extractor_v2.md"
-    schema = benchmark_root / "schemas" / "cue_inference_batch_v1.schema.json"
+    prompt = benchmark_root / "prompts" / "cue_extractor_v3_compact.md"
+    schema = benchmark_root / "schemas" / "cue_inference_batch_compact_v1.schema.json"
     prompt.parent.mkdir(parents=True, exist_ok=True)
     schema.parent.mkdir(parents=True, exist_ok=True)
-    prompt.write_text("合成 v2 提示词。\n", encoding="utf-8")
-    schema.write_text('{"$id":"synthetic-v1.0.0","type":"object"}\n', encoding="utf-8")
+    prompt.write_text("合成 v2.2 紧凑提示词。\n", encoding="utf-8")
+    schema.write_text('{"$id":"synthetic-v2.2","type":"object"}\n', encoding="utf-8")
+
+
+def write_valid_batch_manifest(qa, config, marker: dict) -> None:
+    """写入无正文 Batch task 清单，模拟已完成任务的最小可审计血缘。"""
+
+    custom_id = "v22_s00000_p000_1234abcd"
+    row = {
+        "run_id": "run_synthetic_v22",
+        "batch_task_index": 0,
+        "source_atoms_sha256": marker["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
+        "batch_input_sha256": "a" * 64,
+        "request_count": 1,
+        "custom_ids_sha256": qa.canonical_sha256([custom_id]),
+        "logical_shard_start": 0,
+        "logical_shard_end": 0,
+        "remote_file_id": "file-synthetic-input",
+        "status": "completed",
+        "custom_id_to_package_id": {custom_id: "pkg_s00000_p000"},
+    }
+    path = qa.batch_tasks_manifest_path(config, marker)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    ledger = path.parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text(
+        json.dumps(
+            {
+                "package_id": "pkg_s00000_p000",
+                "batch_task_index": 0,
+                "batch_custom_id": custom_id,
+                "batch_input_sha256": "a" * 64,
+                "remote_file_id": "file-synthetic-input",
+                "remote_cleanup_status": "pending_t4_cue_qa",
+                "outcome": "validated_success",
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    marker.update(
+        {
+            "batch_transport": "batch_file",
+            "batch_task_count": 1,
+            "batch_tasks_manifest_sha256": qa.sha256_file(path),
+            "batch_input_total_request_count": 1,
+            "batch_local_raw_response_storage": "forbidden",
+            "remote_cleanup_required": True,
+            "remote_cleanup_status": "pending_t4_cue_qa",
+        }
+    )
 
 
 def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
-    """构造通过最终 Cue Schema 与 v2 执行血缘门的临时 SUCCESS 标记。"""
+    """构造通过最终 Cue Schema 与 v2.2 Batch 血缘门的临时 SUCCESS 标记。"""
 
     write_cue_v2_contract_artifacts(config)
     marker = write_valid_marker(
@@ -107,6 +159,7 @@ def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
         "retry_count": 0,
         "rate_limit_wait_seconds": 0.0,
     }
+    write_valid_batch_manifest(qa, config, marker)
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
     return marker
 
@@ -211,7 +264,7 @@ def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) 
     write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
     registry_path = config.config_dir / "model_registry.yaml"
     registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
-    registry["models"]["cue_extraction"]["execution"]["rate_limit_policy"]["target_requests_per_minute"] = 301
+    registry["models"]["cue_extraction"]["execution"]["batch_file_policy"]["max_requests_per_file"] = 49999
     registry_path.write_text(yaml.safe_dump(registry, allow_unicode=True, sort_keys=False), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
@@ -220,6 +273,121 @@ def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) 
         and issue["failure_id"] == "cue:cue_execution_protocol_sha256"
         for issue in collector.issues
     )
+
+
+def update_batch_manifest(qa, config, marker: dict, mutate) -> None:
+    """修改临时无正文 task 清单并同步其哈希，以测试内容门而非只测试文件哈希。"""
+
+    path = qa.batch_tasks_manifest_path(config, marker)
+    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    mutate(rows)
+    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    marker["batch_tasks_manifest_sha256"] = qa.sha256_file(path)
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
+
+
+def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(tmp_path: Path) -> None:
+    """短码仅是推理层优化；独立展开必须仍合成最终 Cue，并拒绝任何未知码。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    write_cue_v2_contract_artifacts(config)
+    contract = qa.cue_v2_execution_contract(config, qa.IssueCollector(), "T2 cue")
+    assert contract is not None
+    atom = {
+        "atom_id": "src_SYNTH_DAY1_000001",
+        "split": "train",
+        "visible_text": "A person starts preparing food in a kitchen.",
+    }
+    compact = {"n": 0, "t": "A", "p": [["A", "^", "preparing food"]], "x": "preparing food", "c": 80, "v": "A"}
+    expanded = qa.expand_compact_cue_for_qa(compact, atom, contract, "run_synthetic_v22")
+    collector = qa.IssueCollector()
+    qa.validate_schema([expanded], ROOT / "schemas" / "cue_candidate.schema.json", "cue", "T2 cue", collector)
+    assert not collector.blockers
+    unknown = dict(compact)
+    unknown["t"] = "?"
+    try:
+        qa.expand_compact_cue_for_qa(unknown, atom, contract, "run_synthetic_v22")
+    except ValueError as error:
+        assert "未知" in str(error)
+    else:
+        raise AssertionError("未知短码不得被静默展开")
+
+
+def test_cue_v22_rejects_tampered_custom_id_and_raw_content_metadata(tmp_path: Path) -> None:
+    """task 映射必须双向唯一且不含正文，防止 Batch 结果错配或原文越过保留边界。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+
+    def duplicate_custom_id(rows: list[dict]) -> None:
+        existing_package = next(iter(rows[0]["custom_id_to_package_id"].values()))
+        rows[0]["custom_id_to_package_id"]["v22_s00000_p001_1234abcd"] = existing_package
+        rows[0]["request_count"] = 2
+        rows[0]["custom_ids_sha256"] = qa.canonical_sha256(list(rows[0]["custom_id_to_package_id"]))
+        marker["batch_input_total_request_count"] = 2
+        marker["usage_summary"]["package_count"] = 2
+
+    update_batch_manifest(qa, config, marker, duplicate_custom_id)
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_batch_custom_id_bijection" for issue in collector.issues)
+
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+
+    def insert_forbidden_body(rows: list[dict]) -> None:
+        rows[0]["response"] = "不得保存的合成正文"
+
+    update_batch_manifest(qa, config, marker, insert_forbidden_body)
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_batch_raw_content" for issue in collector.issues)
+
+
+def test_cue_v22_rejects_cleanup_or_batch_price_and_output_policy_drift(tmp_path: Path) -> None:
+    """远端清理、Batch 单价和 96 token 上限同属执行合同，任何漂移都必须阻断。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    marker["remote_cleanup_status"] = "not_required"
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_batch_remote_cleanup" for issue in collector.issues)
+
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    registry_path = config.config_dir / "model_registry.yaml"
+    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    execution = registry["models"]["cue_extraction"]["execution"]
+    execution["package_policy"]["output_tokens_per_atom"] = 97
+    execution["pricing_snapshot"]["input_price_cny_per_million_tokens"] = 0.2
+    registry_path.write_text(yaml.safe_dump(registry, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_execution_lineage_mismatch" for issue in collector.issues)
+
+
+def test_cue_v22_rejects_quarantine_followed_by_requeue(tmp_path: Path) -> None:
+    """服务端成功但本地验证失败已产生费用；同 package 隔离后自动重排队必须阻断。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    ledger = qa.batch_tasks_manifest_path(config, marker).parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
+    events = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+    events[0]["outcome"] = "local_validation_quarantine"
+    retried = dict(events[0])
+    retried["outcome"] = "validated_success"
+    ledger.write_text("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in [events[0], retried]), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert {"cue_batch_quarantine_requeued", "cue_batch_ledger_terminal_duplicate"}.issubset(issue_types)
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:
