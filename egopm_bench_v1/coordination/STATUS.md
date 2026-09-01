@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`CR-2026-007` 实时 v2 无 API 基础完成；`CR-2026-008` Batch File 已完成设计/核算 | Batch File 的配置、代码和独立 QA 尚未实施；仍等待用户确认预算、远端临时文件策略、时间窗和失败 package 范围 | T0 冻结 v2.1 后 T2/T4 只做无 API 实现；通过后再请求 Batch File 生产授权 |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`CR-2026-007` 实时基础完成；`CR-2026-008` Batch 设计完成；`CR-2026-009` 紧凑协议/96 token 设计完成 | v2.2 的配置、短码 Schema、代码、独立 QA 与实际预检尚未实施；仍未获生产授权 | T0 冻结 v2.2 后 T2/T4 只做无 API 实现与核算；通过后再请求 Batch File 生产授权 |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
@@ -37,3 +37,4 @@
 - T0 于 `2026-09-01` 对冻结的 370799 条 Source Atom 实际运行默认只读 v2 预检：74160 个 package、742 个逻辑 shard、最大请求 12202 UTF-8 字节、输入上界 311023165 UTF-8 字节、输出上界 47462272 token；未读密钥、未联网、未写正式 Cue/SUCCESS。按冻结价格的单次保守上界为 `¥100.1744506`，三次尝试全耗尽为 `¥300.5233518`；以 `1000000 TPM` 的保守预留口径，时长下界为约 5.98 小时（RPM 下界为 4.12 小时）。
 - Cue 门仍为 `BLOCKED`，唯一阻断是用户尚未明确确认总预算、执行范围、运行时间窗和失败 package 重跑范围。确认前不得使用 `--execute`、调用千问、写 `cues/cue_library.jsonl` 或 `cues/CUE_LIBRARY_SUCCESS.json`，也不得启动 Seed 或 Life Log。
 - `CR-2026-008` 已登记为 v2.1 Batch File 的无 API 设计与核算：仍固定同一模型、370799 条 Source 覆盖和最多五条 package；按北京 Batch File 半价规则，单次成功请求保守上界为 `¥50.0872253`。该方案引入远端输入/结果/错误文件保留边界，因此当前只更新文档，未冻结配置、未写代码、未创建 Batch task 或上传任何文件。
+- `CR-2026-009` 已登记为 v2.2 紧凑推理协议与 96 token/Atom 的无 API 设计：短键/枚举码只存在于模型推理对象，程序仍回填既有最终 Cue Schema。按输入提示词/Schema 体积门与 96 token 输出门的保守设计代理，Batch File 上界为 `¥35.3738941`；这不是实测 token 或生产预算，当前未创建 Schema、代码、Batch 文件或远端任务。
