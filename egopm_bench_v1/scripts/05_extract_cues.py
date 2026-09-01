@@ -257,7 +257,7 @@ def settings_from_registry(path: Path) -> Settings:
     }
     expected_layout = {
         "root": "cues/batch", "package_directory": "packages", "input_manifest_suffix": ".input.jsonl",
-        "output_suffix": ".result.jsonl", "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json",
+        "batch_tasks_manifest": "batch_tasks_manifest.jsonl", "output_suffix": ".result.jsonl", "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json",
         "failed_suffix": ".failed.json", "batch_input_suffix": ".batch.jsonl", "batch_manifest_suffix": ".batch.json",
         "batch_receipt_suffix": ".batch_receipt.json", "merge_order": "numeric_shard_index_ascending",
     }
@@ -426,7 +426,8 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
 
     tasks: list[dict[str, Any]] = []
     per_task = int(settings.batch_file_policy["logical_shards_per_task"])
-    for task_index, first_shard in enumerate(range(0, (max((m["shard_index"] for m in manifests), default=-1) + 1), per_task)):
+    maximum_shard = max((m["shard_index"] for m in manifests), default=-1)
+    for task_index, first_shard in enumerate(range(0, maximum_shard + 1, per_task)):
         selected = [m for m in manifests if first_shard <= m["shard_index"] < first_shard + per_task]
         lines: list[dict[str, Any]] = []
         for manifest in selected:
@@ -450,7 +451,8 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
             "cue_execution_protocol_sha256": selected[0]["cue_execution_protocol_sha256"] if selected else "",
             "batch_input_sha256": hashlib.sha256(serialized).hexdigest(), "request_count": len(lines),
             "custom_ids_sha256": canonical_sha256(custom_ids), "logical_shard_start": first_shard,
-            "logical_shard_end": first_shard + per_task - 1, "remote_file_id": None,
+            # 末个 task 常不足十个 shard；记录实际边界避免恢复时虚构不存在的 Source 范围。
+            "logical_shard_end": max(manifest["shard_index"] for manifest in selected), "remote_file_id": None,
             "status": "planned_no_api", "request_lines": lines,
         })
     return tasks
