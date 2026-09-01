@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""第 05 阶段：以 v2 自适应 package 从冻结 Source Atom 提取 Cue。
+"""第 05 阶段：为冻结 Source Atom 构建 v2.2 Batch File 的无 API 计划。
 
-职责：默认对冻结 Source Atom 做只读分包和费用预检；仅在显式执行授权后调用固定模型，
-并由程序回填最终 Cue。输入是 Source SUCCESS、Source Atom、模型配置、提示词和 Schema；
-输出是预检报告，或逐包工件、最终 Cue 与 SUCCESS。它位于 Source QA 后、Cue QA 前。
+职责：验证冻结 Source、紧凑提示词和 Schema，并只在内存中生成五条 Atom package、Batch
+任务元数据与费用预检。输入是 Source SUCCESS、Source Atom、模型配置、提示词和 Schema；
+输出是只读预检报告及供合成测试使用的无正文解析函数。它位于 Source QA 后、Cue QA 前，
+当前合同明确禁止上传、下载、调用模型、写正式 Cue 或 SUCCESS。
 """
 
 from __future__ import annotations
@@ -13,14 +14,10 @@ import hashlib
 import json
 import os
 import sys
-import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 import jsonschema
 import yaml
@@ -43,7 +40,6 @@ class Settings:
 
     endpoint: str
     region: str
-    credential_environment_variable: str
     model_id: str
     thinking_enabled: bool
     reasoning_effort: str
@@ -56,13 +52,14 @@ class Settings:
     maximum_request_utf8_bytes: int
     output_tokens_per_atom: int
     max_retries: int
-    target_requests_per_minute: int
-    target_total_tokens_per_minute: int
     layout: dict[str, str]
     input_price_cny_per_million_tokens: float
     output_price_cny_per_million_tokens: float
     execution: dict[str, Any]
     protocol_context: dict[str, Any]
+    batch_file_policy: dict[str, Any]
+    compact_policy: dict[str, Any]
+    batch_ledger_policy: dict[str, Any]
 
 
 def utc_now() -> str:
@@ -212,7 +209,7 @@ def managed_relative_path(path: Path) -> str:
 
 
 def settings_from_registry(path: Path) -> Settings:
-    """读取 T0 冻结的 Cue v2 运行配置，并拒绝未走变更流程的参数漂移。"""
+    """读取 T0 冻结的 Cue v2.2 配置，并拒绝混入实时调用的旧合同。"""
 
     try:
         registry = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -225,59 +222,78 @@ def settings_from_registry(path: Path) -> Settings:
         raise ContractError("缺少冻结的 cue_extraction.execution")
     execution = cue["execution"]
     package = execution.get("package_policy")
-    rate = execution.get("rate_limit_policy")
     pricing = execution.get("pricing_snapshot")
     layout = execution.get("shard_layout")
-    if not all(isinstance(value, dict) for value in (package, rate, pricing, layout)):
-        raise ContractError("Cue v2 缺少 package、限流、价格或分片布局配置")
+    batch = execution.get("batch_file_policy")
+    compact = execution.get("compact_inference_policy")
+    ledger_policy = execution.get("batch_ledger_policy")
+    if not all(isinstance(value, dict) for value in (package, pricing, layout, batch, compact, ledger_policy)):
+        raise ContractError("Cue v2.2 缺少 package、Batch、紧凑码、价格或分片布局配置")
 
     expected_execution = {
-        "cue_execution_policy_version": "v2.0.0",
-        "protocol_hash_payload_version": "v1.0.0",
-        "mode": "explicit_execute_only",
+        "cue_execution_policy_version": "v2.2.0",
+        "protocol_hash_payload_version": "v2.0.0",
+        "mode": "explicit_batch_file_execute_only",
         "shard_size_atoms": 500,
         "max_retries": 2,
-        "transport": "realtime_chat_completions",
+        "transport": "batch_file",
     }
     expected_package = {
         "maximum_atoms": 5,
         "maximum_request_utf8_bytes": 24000,
         "ordering": "atom_id_lexicographic",
-        "output_tokens_per_atom": 128,
+        "output_tokens_per_atom": 96,
         "output_max_tokens_formula": "output_tokens_per_atom_times_package_atom_count",
-        "inference_schema": "cue_inference_batch_v1.schema.json",
+        "inference_schema": "cue_inference_batch_compact_v1.schema.json",
         "inference_schema_version": "v1.0.0",
         "response_top_level_field": "items",
-        "response_correlation_field": "item_index",
+        "response_correlation_field": "n",
     }
     expected_controlled = {
         "model_input_fields": ["item_index", "text"],
-        "model_output_fields": ["item_index", "entities", "scene_type", "activity_type", "cue_type", "normalized_predicate", "supporting_text_span", "confidence", "ambiguity_reason", "validation_status"],
+        "model_output_fields": ["n", "t", "p", "x", "c", "v", "e", "s", "a", "r"],
         "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"],
         "raw_model_response_storage": "forbidden",
     }
     expected_layout = {
-        "root": "cues/shards", "package_directory": "packages", "input_manifest_suffix": ".input.jsonl",
+        "root": "cues/batch", "package_directory": "packages", "input_manifest_suffix": ".input.jsonl",
         "output_suffix": ".result.jsonl", "ledger_suffix": ".ledger.jsonl", "completion_suffix": ".complete.json",
-        "failed_suffix": ".failed.json", "merge_order": "numeric_shard_index_ascending",
+        "failed_suffix": ".failed.json", "batch_input_suffix": ".batch.jsonl", "batch_manifest_suffix": ".batch.json",
+        "batch_receipt_suffix": ".batch_receipt.json", "merge_order": "numeric_shard_index_ascending",
     }
     expected_pricing = {
-        "pricing_version": "2026-09-01_cn-beijing_list", "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",
-        "input_price_cny_per_million_tokens": 0.2, "output_price_cny_per_million_tokens": 0.8,
+        "pricing_version": "2026-09-01_cn-beijing_batch_file_list", "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",
+        "input_price_cny_per_million_tokens": 0.1, "output_price_cny_per_million_tokens": 0.4,
         "price_region": "cn-beijing", "input_context_window_tokens": 32000,
-        "retry_attempts_billed_independently": True,
+        "successful_requests_only_billed": True, "context_cache_supported": False,
     }
     # 逐项冻结是为了避免“代码默认值”在价格、并发、回填字段或恢复规则变更时继续生产。
     if (
         registry.get("contract_version") != CONTRACT_VERSION or registry.get("config_version") != CONFIG_VERSION
         or cue.get("model_id") != "qwen3.7-flash-2026-07-15" or cue.get("thinking_enabled") is not False
         or cue.get("reasoning_effort") != "none" or cue.get("temperature") != 0
-        or cue.get("prompt_version") != "cue_extractor_v2" or cue.get("schema") != "cue_candidate.schema.json"
+        or cue.get("prompt_version") != "cue_extractor_v3_compact" or cue.get("schema") != "cue_candidate.schema.json"
         or cue.get("schema_version") != CUE_SCHEMA_VERSION
         or any(execution.get(key) != value for key, value in expected_execution.items())
         or package != expected_package or execution.get("controlled_field_policy") != expected_controlled
-        or layout != expected_layout or pricing != expected_pricing
-        or rate.get("target_requests_per_minute") != 300 or rate.get("target_total_tokens_per_minute") != 1_000_000
+        or any(layout.get(key) != value for key, value in expected_layout.items()) or pricing != expected_pricing
+        or compact != {
+            "cue_type_codes": {"T": "time", "P": "person", "L": "place", "O": "object", "A": "activity", "S": "state_change"},
+            "operator_codes": {"=": "eq", "!": "not_eq", "+": "present", "-": "absent", "^": "starts", "$": "ends", "~": "contains"},
+            "required_fields": ["n", "t", "p", "x", "c", "v"], "optional_defaults": {"e": [], "s": None, "a": None, "r": None}, "confidence_scale": 100,
+        }
+        or batch != {
+            "logical_shards_per_task": 10, "completion_window": "24h", "max_requests_per_file": 50000,
+            "max_input_file_bytes": 500000000, "max_request_line_bytes": 1000000,
+            "request_endpoint": "/v1/chat/completions", "custom_id_format": "v22_s{shard_index:05d}_p{package_index:03d}_{manifest_sha256_8}",
+            "local_request_body_storage": "temporary_delete_after_upload", "local_raw_result_storage": "forbidden_stream_only",
+            "remote_files_delete_after_cue_qa": "required", "successful_local_validation_failure": "quarantine_no_auto_retry",
+        }
+        or ledger_policy != {
+            "required_fields": ["batch_task_index", "batch_custom_id", "batch_input_sha256", "remote_file_id", "remote_cleanup_status", "outcome"],
+            "terminal_outcomes": ["validated_success", "service_line_failure_requeueable", "local_validation_quarantine"],
+            "require_single_terminal_outcome_per_custom_id": True, "prohibit_requeue_after_local_validation_quarantine": True,
+        }
         or registry.get("credential_policy") != "environment_only" or registry.get("raw_response_policy") != "forbidden"
     ):
         raise ContractError("Cue v2 冻结模型、执行或账本配置发生漂移")
@@ -296,18 +312,16 @@ def settings_from_registry(path: Path) -> Settings:
         },
     }
     return Settings(
-        endpoint=str(registry["default_endpoint"]).rstrip("/"), region=str(registry["default_region"]),
-        credential_environment_variable=str(registry["credential_environment_variable"]), model_id=str(cue["model_id"]),
+        endpoint=str(registry["default_endpoint"]).rstrip("/"), region=str(registry["default_region"]), model_id=str(cue["model_id"]),
         thinking_enabled=bool(cue["thinking_enabled"]), reasoning_effort=str(cue["reasoning_effort"]),
         temperature=cue["temperature"], prompt_version=str(cue["prompt_version"]),
         final_cue_schema=str(cue["schema"]), final_cue_schema_version=str(cue["schema_version"]),
         shard_size=int(execution["shard_size_atoms"]), maximum_atoms=int(package["maximum_atoms"]),
         maximum_request_utf8_bytes=int(package["maximum_request_utf8_bytes"]), output_tokens_per_atom=int(package["output_tokens_per_atom"]),
-        max_retries=int(execution["max_retries"]), target_requests_per_minute=int(rate["target_requests_per_minute"]),
-        target_total_tokens_per_minute=int(rate["target_total_tokens_per_minute"]), layout=dict(layout),
+        max_retries=int(execution["max_retries"]), layout=dict(layout),
         input_price_cny_per_million_tokens=float(pricing["input_price_cny_per_million_tokens"]),
         output_price_cny_per_million_tokens=float(pricing["output_price_cny_per_million_tokens"]),
-        execution=execution, protocol_context=protocol_context,
+        execution=execution, protocol_context=protocol_context, batch_file_policy=dict(batch), compact_policy=dict(compact), batch_ledger_policy=dict(ledger_policy),
     )
 
 
@@ -324,7 +338,7 @@ def protocol_hash(settings: Settings, prompt_path: Path, inference_schema_path: 
 
 
 def build_request(prompt: str, schema: dict[str, Any], atoms: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
-    """构造单 package 请求；模型只能看到局部索引和文本，受控字段由程序回填。"""
+    """构造 Batch 行内的 chat body；模型只能看到局部索引和文本。"""
 
     items = [{"item_index": index, "text": atom["visible_text"]} for index, atom in enumerate(atoms)]
     return {
@@ -332,7 +346,18 @@ def build_request(prompt: str, schema: dict[str, Any], atoms: list[dict[str, Any
         "enable_thinking": settings.thinking_enabled, "max_tokens": settings.output_tokens_per_atom * len(atoms),
         "stream": False,
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))}],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "cue_inference_batch_v1", "strict": True, "schema": schema}},
+        "response_format": {"type": "json_schema", "json_schema": {"name": "cue_inference_batch_compact_v1", "strict": True, "schema": schema}},
+    }
+
+
+def batch_request_line(manifest: dict[str, Any], atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings) -> dict[str, Any]:
+    """封装 Batch File 单行；此函数只构造内存对象，不上传也不落盘。"""
+
+    return {
+        "custom_id": manifest["batch_custom_id"],
+        "method": "POST",
+        "url": settings.batch_file_policy["request_endpoint"],
+        "body": build_request(prompt, schema, atoms, settings),
     }
 
 
@@ -356,14 +381,19 @@ def ordered_atoms(atoms: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def package_manifest(atoms: list[dict[str, Any]], source_sha256: str, protocol_sha256: str, run_id: str, shard_index: int, package_index: int) -> dict[str, Any]:
-    """生成绑定 run、Atom 行哈希、Source 和协议哈希的自包含输入清单。"""
+    """生成绑定 run、Atom、Source、协议及可校验 custom_id 的本地清单。"""
 
     package_id = f"shard_{shard_index:05d}_package_{package_index:03d}"
-    return {
+    manifest = {
         "run_id": run_id, "shard_index": shard_index, "package_index": package_index, "package_id": package_id,
+        "batch_task_index": shard_index // 10,
         "source_atoms_sha256": source_sha256, "cue_execution_protocol_sha256": protocol_sha256,
         "atoms": [{"atom_id": atom["atom_id"], "atom_sha256": canonical_sha256(atom)} for atom in atoms],
     }
+    # custom_id 以不含自身的清单哈希作后缀，既可与服务端结果行双向比对，又不会形成哈希循环。
+    manifest_sha256_8 = canonical_sha256(manifest)[:8]
+    manifest["batch_custom_id"] = f"v22_s{shard_index:05d}_p{package_index:03d}_{manifest_sha256_8}"
+    return manifest
 
 
 def build_packages(atoms: list[dict[str, Any]], source_sha256: str, prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str, run_id: str) -> list[dict[str, Any]]:
@@ -389,6 +419,52 @@ def build_packages(atoms: list[dict[str, Any]], source_sha256: str, prompt: str,
         if current:
             manifests.append(package_manifest(current, source_sha256, protocol_sha256, run_id, shard_index, package_index))
     return manifests
+
+
+def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings) -> list[dict[str, Any]]:
+    """按十个逻辑 shard 构建 Batch 任务计划，并在内存中检查每项/每文件大小。"""
+
+    tasks: list[dict[str, Any]] = []
+    per_task = int(settings.batch_file_policy["logical_shards_per_task"])
+    for task_index, first_shard in enumerate(range(0, (max((m["shard_index"] for m in manifests), default=-1) + 1), per_task)):
+        selected = [m for m in manifests if first_shard <= m["shard_index"] < first_shard + per_task]
+        lines: list[dict[str, Any]] = []
+        for manifest in selected:
+            atoms = [atom_by_id[item["atom_id"]] for item in manifest["atoms"]]
+            line = batch_request_line(manifest, atoms, prompt, schema, settings)
+            line_bytes = len(json.dumps(line, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+            if line_bytes > int(settings.batch_file_policy["max_request_line_bytes"]):
+                raise ContractError("单条 Batch 请求超过冻结的 1MB 行上限")
+            lines.append(line)
+        serialized = "".join(json.dumps(line, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n" for line in lines).encode("utf-8")
+        if len(lines) > int(settings.batch_file_policy["max_requests_per_file"]):
+            raise ContractError("Batch 输入文件超过冻结的请求行数上限")
+        if len(serialized) > int(settings.batch_file_policy["max_input_file_bytes"]):
+            raise ContractError("Batch 输入文件超过冻结的 500MB 上限")
+        custom_ids = [line["custom_id"] for line in lines]
+        if len(set(custom_ids)) != len(custom_ids):
+            raise ContractError("Batch custom_id 必须全局唯一")
+        tasks.append({
+            "run_id": selected[0]["run_id"] if selected else "", "batch_task_index": task_index,
+            "source_atoms_sha256": selected[0]["source_atoms_sha256"] if selected else "",
+            "cue_execution_protocol_sha256": selected[0]["cue_execution_protocol_sha256"] if selected else "",
+            "batch_input_sha256": hashlib.sha256(serialized).hexdigest(), "request_count": len(lines),
+            "custom_ids_sha256": canonical_sha256(custom_ids), "logical_shard_start": first_shard,
+            "logical_shard_end": first_shard + per_task - 1, "remote_file_id": None,
+            "status": "planned_no_api", "request_lines": lines,
+        })
+    return tasks
+
+
+def public_batch_task_manifest(task: dict[str, Any]) -> dict[str, Any]:
+    """剥离临时请求正文后生成可保存的任务元数据，防止 Git 或账本留存原文。"""
+
+    allowed = {
+        "run_id", "batch_task_index", "source_atoms_sha256", "cue_execution_protocol_sha256",
+        "batch_input_sha256", "request_count", "custom_ids_sha256", "logical_shard_start",
+        "logical_shard_end", "remote_file_id", "status",
+    }
+    return {key: task[key] for key in sorted(allowed)}
 
 
 def package_paths(run_root: Path, manifest: dict[str, Any], layout: dict[str, str]) -> dict[str, Path]:
@@ -441,79 +517,146 @@ def pending_packages(manifests: list[dict[str, Any]], run_root: Path, layout: di
 
 
 def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]], inference_validator: jsonschema.Draft202012Validator, cue_validator: jsonschema.Draft202012Validator, settings: Settings, run_id: str) -> list[dict[str, Any]]:
-    """验证模型推理数组后再回填 ID、split、原文与模型字段，只输出 accepted Cue。"""
+    """严格展开紧凑项并回填受控字段；未知短码或跨 Atom 证据一律拒绝。"""
 
-    validate_record(inference_validator, response, "Cue v2 推理响应")
+    validate_record(inference_validator, response, "Cue v2.2 紧凑推理响应")
     items = response["items"]
-    if len(items) != len(atoms) or sorted(item["item_index"] for item in items) != list(range(len(atoms))):
-        raise ContractError("推理响应必须为 package 中每条 Atom 恰好返回一次 item_index")
+    if len(items) != len(atoms) or sorted(item["n"] for item in items) != list(range(len(atoms))):
+        raise ContractError("紧凑响应必须为 package 中每条 Atom 恰好返回一次 n")
+    cue_codes = settings.compact_policy["cue_type_codes"]
+    operator_codes = settings.compact_policy["operator_codes"]
+    defaults = settings.compact_policy["optional_defaults"]
     cues: list[dict[str, Any]] = []
-    for item in sorted(items, key=lambda value: value["item_index"]):
-        atom = atoms[item["item_index"]]
-        # 这两条局部约束防止 package 中一条 Atom 的文本或谓词被错归到另一条。
-        if item["supporting_text_span"] not in atom["visible_text"]:
-            raise ContractError("supporting_text_span 不属于对应 Atom 的可见文本")
-        if not any(clause.get("slot") == item["cue_type"] for clause in item["normalized_predicate"]["all_of"]):
-            raise ContractError("normalized_predicate 未包含与 cue_type 对齐的 all_of 子句")
-        inferred = {key: value for key, value in item.items() if key != "item_index"}
+    for item in sorted(items, key=lambda value: value["n"]):
+        atom = atoms[item["n"]]
+        cue_type = cue_codes.get(item["t"])
+        if not isinstance(cue_type, str):
+            raise ContractError("出现未知 cue_type 短码")
+        clauses: list[dict[str, str]] = []
+        for compact_clause in item["p"]:
+            slot = cue_codes.get(compact_clause[0])
+            operator = operator_codes.get(compact_clause[1])
+            if not isinstance(slot, str) or not isinstance(operator, str):
+                raise ContractError("出现未知 predicate 槽位或操作短码")
+            clauses.append({"slot": slot, "operator": operator, "value": compact_clause[2]})
+        # 连续原文和主槽位门在展开前检查，避免正确 JSON 被错误 Atom 或错误语义接纳。
+        if item["x"] not in atom["visible_text"]:
+            raise ContractError("x 不属于对应 Atom 的可见文本")
+        if not any(clause["slot"] == cue_type for clause in clauses):
+            raise ContractError("p 未包含与 t 对齐的主槽位")
+        status = {"A": "accepted", "R": "rejected", "N": "needs_review"}.get(item["v"])
+        if status is None:
+            raise ContractError("出现未知 validation_status 短码")
         cue = {
-            **inferred, "cue_id": f"cue_{atom['atom_id'].removeprefix('src_')}", "atom_id": atom["atom_id"],
-            "split": atom["split"], "source_text": atom["visible_text"], "model_id": settings.model_id,
-            "prompt_version": settings.prompt_version, "schema_version": settings.final_cue_schema_version, "run_id": run_id,
+            "cue_id": f"cue_{atom['atom_id'].removeprefix('src_')}", "atom_id": atom["atom_id"],
+            "split": atom["split"], "entities": item.get("e", defaults["e"]),
+            "scene_type": item.get("s", defaults["s"]), "activity_type": item.get("a", defaults["a"]),
+            "cue_type": cue_type, "normalized_predicate": {"all_of": clauses}, "supporting_text_span": item["x"],
+            "source_text": atom["visible_text"], "confidence": item["c"] / settings.compact_policy["confidence_scale"],
+            "ambiguity_reason": item.get("r", defaults["r"]), "model_id": settings.model_id,
+            "prompt_version": settings.prompt_version, "schema_version": settings.final_cue_schema_version,
+            "run_id": run_id, "validation_status": status,
         }
-        validate_record(cue_validator, cue, "程序回填的 Cue")
+        validate_record(cue_validator, cue, "程序展开的 Cue")
         if cue["validation_status"] == "accepted":
             cues.append(cue)
     return cues
 
 
 def preflight_report(manifests: list[dict[str, Any]], atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str) -> dict[str, Any]:
-    """线性核算包大小和重试费用；不创建目录、不读密钥、不访问网络。"""
+    """核算内存中的 Batch 行与任务文件；默认不创建目录、不读密钥、不访问网络。"""
 
-    # 一次 ID 映射避免每个 package 重扫全部 370,799 条 Atom 而退化为平方复杂度。
     atom_by_id = {atom["atom_id"]: atom for atom in atoms}
-    package_bytes = [request_utf8_bytes(prompt, schema, [atom_by_id[item["atom_id"]] for item in manifest["atoms"]], settings) for manifest in manifests]
-    input_bound = sum(package_bytes)
+    tasks = build_batch_tasks(manifests, atom_by_id, prompt, schema, settings)
+    request_sizes = [len(json.dumps(line, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1 for task in tasks for line in task["request_lines"]]
+    input_bound = sum(request_sizes)
     output_bound = sum(settings.output_tokens_per_atom * len(manifest["atoms"]) for manifest in manifests)
-    def fee(multiplier: int) -> dict[str, float]:
-        input_cost = input_bound * multiplier / 1_000_000 * settings.input_price_cny_per_million_tokens
-        output_cost = output_bound * multiplier / 1_000_000 * settings.output_price_cny_per_million_tokens
-        return {"input_cny_upper_bound": input_cost, "output_cny_upper_bound": output_cost, "total_cny_upper_bound": input_cost + output_cost}
+    input_cost = input_bound / 1_000_000 * settings.input_price_cny_per_million_tokens
+    output_cost = output_bound / 1_000_000 * settings.output_price_cny_per_million_tokens
     return {
-        "mode": "preflight", "network_called": False, "credentials_read": False, "formal_outputs_written": False,
-        "atom_count": len(atoms), "package_count": len(manifests),
+        "mode": "batch_preflight_no_api", "network_called": False, "credentials_read": False, "formal_outputs_written": False,
+        "atom_count": len(atoms), "package_count": len(manifests), "batch_task_count": len(tasks),
         "logical_shard_count": (len(atoms) + settings.shard_size - 1) // settings.shard_size,
         "maximum_atoms_per_package": settings.maximum_atoms, "maximum_request_utf8_bytes": settings.maximum_request_utf8_bytes,
-        "max_observed_package_request_utf8_bytes": max(package_bytes, default=0), "input_utf8_bytes_upper_bound": input_bound,
+        "max_observed_batch_request_utf8_bytes": max(request_sizes, default=0), "batch_input_utf8_bytes_upper_bound": input_bound,
         "output_tokens_upper_bound": output_bound, "cue_execution_protocol_sha256": protocol_sha256,
-        "cny_upper_bounds": {"baseline_one_attempt_per_package": fee(1), "conservative_all_packages_exhaust_max_retries": fee(settings.max_retries + 1)},
-        "recovery": "仅当前清单、来源哈希、完整协议哈希、结果和账本 SHA256 均匹配时跳过；失败 package 必须显式重跑。",
+        "batch_task_manifests": [public_batch_task_manifest(task) for task in tasks],
+        "cny_upper_bound_successful_requests_only": {"input_cny_upper_bound": input_cost, "output_cny_upper_bound": output_cost, "total_cny_upper_bound": input_cost + output_cost},
+        "recovery": "仅重组未完成或行级失败 package；服务端成功而本地验证失败进入 quarantine，禁止自动重试。",
     }
 
 
-class RateLimiter:
-    """以冻结 RPM 与 TPM 实现跨 package 无突发节流。"""
+def batch_ledger_event(manifest: dict[str, Any], task: dict[str, Any], outcome: str, parse_status: str, usage: dict[str, int | None], failure_summary: str | None = None) -> dict[str, Any]:
+    """生成无正文行级账本；可审计 Batch 身份而不留请求、响应或错误内容。"""
 
-    def __init__(self, settings: Settings) -> None:
-        self.settings = settings
-        self.next_allowed_at: float | None = None
+    return {
+        "run_id": manifest["run_id"], "package_id": manifest["package_id"], "input_atom_ids": [item["atom_id"] for item in manifest["atoms"]],
+        "batch_task_index": task["batch_task_index"], "batch_custom_id": manifest["batch_custom_id"], "batch_input_sha256": task["batch_input_sha256"],
+        "remote_file_id": task["remote_file_id"], "remote_cleanup_status": "pending_t4_cue_qa", "request_time": utc_now(),
+        "outcome": outcome, "status": outcome, "parse_status": parse_status, "usage": usage, "failure_summary": failure_summary,
+        "raw_response_saved": False, "raw_response_path": None,
+    }
 
-    def wait(self, reserved_tokens: int) -> float:
-        """返回本次仅因限流等待的秒数；指数退避不混入该审计字段。"""
 
-        current = time.monotonic()
-        scheduled = current if self.next_allowed_at is None else self.next_allowed_at
-        waited = max(0.0, scheduled - current)
-        if waited:
-            time.sleep(waited)
-        after_wait = time.monotonic()
-        interval = max(60.0 / self.settings.target_requests_per_minute, reserved_tokens * 60.0 / self.settings.target_total_tokens_per_minute)
-        self.next_allowed_at = max(scheduled, after_wait) + interval
-        return waited
+def parse_batch_result_line(result_line: dict[str, Any], manifest_by_custom_id: dict[str, dict[str, Any]], atom_by_id: dict[str, dict[str, Any]], task: dict[str, Any], inference_validator: jsonschema.Draft202012Validator, cue_validator: jsonschema.Draft202012Validator, settings: Settings) -> tuple[str, list[dict[str, Any]], dict[str, Any]]:
+    """仅解析内存中的单行模拟结果，区分可重组失败与不可自动重试的隔离失败。"""
+
+    custom_id = result_line.get("custom_id")
+    if not isinstance(custom_id, str) or custom_id not in manifest_by_custom_id:
+        raise ContractError("Batch 结果 custom_id 不能与本地清单双向匹配")
+    manifest = manifest_by_custom_id[custom_id]
+    if result_line.get("error") is not None:
+        return "line_failed_requeue", [], batch_ledger_event(manifest, task, "service_line_failure_requeueable", "remote_line_error", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端行级失败；可重新组批")
+    try:
+        response = result_line.get("response")
+        if not isinstance(response, dict):
+            raise ContractError("Batch 成功行缺少响应对象")
+        body = response.get("body")
+        if not isinstance(body, dict):
+            raise ContractError("Batch 成功行缺少响应 body")
+        content = body.get("choices", [{}])[0].get("message", {}).get("content")
+        parsed = json.loads(content) if isinstance(content, str) else None
+        if not isinstance(parsed, dict):
+            raise ContractError("Batch 成功行推理正文不是对象")
+        atoms = [atom_by_id[item["atom_id"]] for item in manifest["atoms"]]
+        cues = parse_inference_items(parsed, atoms, inference_validator, cue_validator, settings, manifest["run_id"])
+        usage = normalise_usage(body)
+        return "validated", cues, batch_ledger_event(manifest, task, "validated_success", "validated", usage)
+    except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        # 本地语义验证失败说明服务端已成功完成，自动重传会造成重复收费，因此只能隔离并人工决策。
+        return "quarantine", [], batch_ledger_event(manifest, task, "local_validation_quarantine", "local_validation_failed", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端成功但本地合同验证失败；禁止自动重试")
+
+
+def validate_batch_ledger_events(events: list[dict[str, Any]], settings: Settings) -> None:
+    """校验终态账本：同一 custom_id 只能终结一次，隔离后绝不能进入重排队。"""
+
+    required = set(settings.batch_ledger_policy["required_fields"])
+    outcomes = set(settings.batch_ledger_policy["terminal_outcomes"])
+    seen: dict[str, str] = {}
+    for event in events:
+        if not required.issubset(event) or event.get("outcome") not in outcomes:
+            raise ContractError("Batch 账本缺少冻结字段或具有未知终态")
+        custom_id = event["batch_custom_id"]
+        if not isinstance(custom_id, str):
+            raise ContractError("Batch 账本 custom_id 无效")
+        if custom_id in seen:
+            raise ContractError("同一 Batch custom_id 不得具有多个终态")
+        seen[custom_id] = event["outcome"]
+
+
+def requeueable_batch_custom_ids(events: list[dict[str, Any]], settings: Settings) -> set[str]:
+    """只返回服务端行级失败的 package；隔离结果必须由人工处理，不能自动付费重传。"""
+
+    validate_batch_ledger_events(events, settings)
+    return {
+        str(event["batch_custom_id"])
+        for event in events
+        if event["outcome"] == "service_line_failure_requeueable"
+    }
 
 
 def normalise_usage(response: dict[str, Any]) -> dict[str, int | None]:
-    """只接受服务端三个一致的整数 usage；缺失时记录 null，绝不使用预检值伪造。"""
+    """只接受三个相加一致的 usage；缺失值必须显式保留为 null。"""
 
     empty = {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
     usage = response.get("usage")
@@ -522,102 +665,7 @@ def normalise_usage(response: dict[str, Any]) -> dict[str, int | None]:
     values = {key: usage.get(key) for key in empty}
     if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in values.values()):
         return empty
-    if values["prompt_tokens"] + values["completion_tokens"] != values["total_tokens"]:
-        return empty
-    return values
-
-
-def safe_failure_details(error: BaseException) -> tuple[str, str, list[str]]:
-    """保留可审计的类别而不把异常字符串中的模型或 HTTP 正文写入磁盘。"""
-
-    if isinstance(error, (HTTPError, URLError, TimeoutError)):
-        return "transport_error", "请求传输失败；未保存原始响应", [type(error).__name__]
-    if isinstance(error, json.JSONDecodeError):
-        return "response_decode_error", "响应无法解析为预期 JSON；未保存原始响应", [type(error).__name__]
-    return "response_contract_error", "响应未通过冻结合同；未保存原始响应", [type(error).__name__]
-
-
-def execution_cycle(ledger_path: Path) -> int:
-    """为显式失败重跑增加账本周期，保留历史尝试而不覆盖其审计证据。"""
-
-    if not ledger_path.is_file():
-        return 1
-    try:
-        cycles = [event.get("execution_cycle") for event in read_jsonl(ledger_path)]
-    except ContractError:
-        return 1
-    values = [value for value in cycles if isinstance(value, int) and value >= 1]
-    return max(values, default=0) + 1
-
-
-def make_ledger_event(manifest: dict[str, Any], settings: Settings, attempt_index: int, retry_count: int, cycle: int, waited: float, status: str, parse_status: str, usage: dict[str, int | None], failure_summary: str | None, validation_errors: list[str]) -> dict[str, Any]:
-    """生成逐请求自包含账本：包含用量、重试、血缘与本次限流等待，但不存正文。"""
-
-    return {
-        "run_id": manifest["run_id"], "package_id": manifest["package_id"], "attempt_index": attempt_index,
-        "retry_count": retry_count, "execution_cycle": cycle, "request_time": utc_now(),
-        "input_atom_ids": [item["atom_id"] for item in manifest["atoms"]], "model_id": settings.model_id,
-        "region": settings.region, "endpoint": settings.endpoint, "thinking_enabled": settings.thinking_enabled,
-        "reasoning_effort": settings.reasoning_effort, "temperature": settings.temperature,
-        "prompt_version": settings.prompt_version, "schema_version": settings.final_cue_schema_version,
-        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
-        "raw_response_path": None, "parse_status": parse_status, "validation_errors": validation_errors,
-        "usage": usage, "failure_summary": failure_summary, "rate_limit_wait_seconds": waited,
-        "raw_response_saved": False, "status": status,
-    }
-
-
-def execute_package(manifest: dict[str, Any], atom_by_id: dict[str, dict[str, Any]], run_root: Path, prompt: str, schema: dict[str, Any], inference_validator: jsonschema.Draft202012Validator, cue_validator: jsonschema.Draft202012Validator, settings: Settings, limiter: RateLimiter) -> None:
-    """执行一个可恢复 package：每个 HTTP 尝试落账，成功后才写结果和完成标记。"""
-
-    files = package_paths(run_root, manifest, settings.layout)
-    atomic_write_jsonl(files["manifest"], [manifest])
-    atoms = [atom_by_id[item["atom_id"]] for item in manifest["atoms"]]
-    payload = build_request(prompt, schema, atoms, settings)
-    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    reserved_tokens = len(body) + int(payload["max_tokens"])
-    # 默认预检不会经过此处；只有 ``--execute`` 才从环境读取一次密钥，且不会记录它。
-    api_key = os.environ.get(settings.credential_environment_variable)
-    if not api_key:
-        raise ContractError(f"未设置 {settings.credential_environment_variable}")
-    request = Request(f"{settings.endpoint}/chat/completions", data=body, headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
-    cycle = execution_cycle(files["ledger"])
-    for retry_count in range(settings.max_retries + 1):
-        attempt_index = retry_count + 1
-        waited = limiter.wait(reserved_tokens)
-        try:
-            with urlopen(request, timeout=60) as handle:
-                response = json.loads(handle.read().decode("utf-8"))
-            if not isinstance(response, dict):
-                raise ContractError("HTTP 响应根节点必须是对象")
-            inferred = json.loads(response["choices"][0]["message"]["content"])
-            if not isinstance(inferred, dict):
-                raise ContractError("模型 content 根节点必须是对象")
-            cues = parse_inference_items(inferred, atoms, inference_validator, cue_validator, settings, str(manifest["run_id"]))
-            append_ledger_event(files["ledger"], make_ledger_event(manifest, settings, attempt_index, retry_count, cycle, waited, "success", "validated", normalise_usage(response), None, []))
-            atomic_write_jsonl(files["result"], cues)
-            atomic_write_json(files["complete"], {
-                "package_id": manifest["package_id"], "source_atoms_sha256": manifest["source_atoms_sha256"],
-                "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
-                "input_manifest_sha256": sha256_file(files["manifest"]), "result_sha256": sha256_file(files["result"]),
-                "ledger_sha256": sha256_file(files["ledger"]), "completed_at": utc_now(), "accepted_row_count": len(cues),
-            })
-            # 成功后的历史失败仍在账本中；仅清除“当前未完成”失败标记。
-            if files["failed"].is_file():
-                files["failed"].unlink()
-            return
-        except (HTTPError, URLError, TimeoutError, json.JSONDecodeError, ContractError, KeyError, IndexError) as error:
-            parse_status, summary, errors = safe_failure_details(error)
-            append_ledger_event(files["ledger"], make_ledger_event(manifest, settings, attempt_index, retry_count, cycle, waited, "failed", parse_status, {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, summary, errors))
-            if retry_count == settings.max_retries:
-                atomic_write_json(files["failed"], {
-                    "package_id": manifest["package_id"], "source_atoms_sha256": manifest["source_atoms_sha256"],
-                    "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"], "ledger_sha256": sha256_file(files["ledger"]),
-                    "execution_cycle": cycle, "failure_category": type(error).__name__, "failed_at": utc_now(),
-                })
-                raise ContractError(f"package {manifest['package_id']} 已耗尽冻结重试次数") from error
-            # 短暂故障退避不计作限流等待；下一 attempt 的 rate_limit_wait_seconds 仍单独记录。
-            time.sleep(min(2 ** retry_count, 4))
+    return values if values["prompt_tokens"] + values["completion_tokens"] == values["total_tokens"] else empty
 
 
 def merge_completed_packages(manifests: list[dict[str, Any]], run_root: Path, settings: Settings, output: Path) -> int:
@@ -657,48 +705,48 @@ def usage_summary(manifests: list[dict[str, Any]], run_root: Path, settings: Set
     }
 
 
+def write_synthetic_batch_task_manifest(path: Path, tasks: list[dict[str, Any]], manifests: list[dict[str, Any]]) -> None:
+    """仅供 pytest 临时目录验证元数据格式；绝不写入正式 Batch 路径或请求正文。"""
+
+    by_task: dict[int, dict[str, str]] = {}
+    for manifest in manifests:
+        by_task.setdefault(manifest["batch_task_index"], {})[manifest["batch_custom_id"]] = manifest["package_id"]
+    rows = []
+    for task in tasks:
+        row = public_batch_task_manifest(task)
+        row["custom_id_to_package_id"] = by_task.get(task["batch_task_index"], {})
+        rows.append(row)
+    atomic_write_jsonl(path, rows)
+
+
 def run(arguments: argparse.Namespace) -> int:
-    """装配第 05 阶段；默认分支严格只读，执行分支最后才读取密钥并写工件。"""
+    """装配第 05 阶段；当前 CR 只允许预检，任何执行开关都在本地合同门阻断。"""
+
+    if arguments.execute or arguments.rerun_failed_packages:
+        raise ContractError("v2.2 当前仅允许无 API 预检；禁止创建 Batch、上传文件、下载结果或写正式 Cue")
 
     settings = settings_from_registry(arguments.model_registry)
     marker = verified_source(arguments.source_atoms, arguments.source_success)
     source_validator = load_validator(arguments.source_schema)
-    inference_validator = load_validator(arguments.inference_schema)
-    cue_validator = load_validator(arguments.cue_schema)
+    # 即使当前只预检也加载冻结 Schema，确保成本核算不会建立在不存在或替换后的协议之上。
+    load_validator(arguments.inference_schema)
+    load_validator(arguments.cue_schema)
     atoms = ordered_atoms(read_jsonl(arguments.source_atoms))
     for atom in atoms:
         validate_record(source_validator, atom, "Source Atom")
     prompt = arguments.prompt.read_text(encoding="utf-8")
     schema = read_json(arguments.inference_schema)
-    run_id = arguments.run_id or f"run_cue_{uuid.uuid4().hex[:16]}"
+    # 预检不写可恢复工件，故使用稳定名称即可；正式 run_id 只能在未来获单独授权的执行阶段引入。
+    run_id = arguments.run_id or "preflight_no_api"
     protocol_sha256 = protocol_hash(settings, arguments.prompt, arguments.inference_schema)
     manifests = build_packages(atoms, str(marker["sha256"]), prompt, schema, settings, protocol_sha256, run_id)
     report = preflight_report(manifests, atoms, prompt, schema, settings, protocol_sha256)
-    if not arguments.execute:
-        print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
-        return 0
-    run_root = arguments.run_root / run_id
-    atom_by_id = {atom["atom_id"]: atom for atom in atoms}
-    limiter = RateLimiter(settings)
-    for manifest in pending_packages(manifests, run_root, settings.layout, arguments.rerun_failed_packages):
-        execute_package(manifest, atom_by_id, run_root, prompt, schema, inference_validator, cue_validator, settings, limiter)
-    count = merge_completed_packages(manifests, run_root, settings, arguments.output)
-    # SUCCESS 必须最后写，才能让下游只读取完整合并结果和全部 package 账本。
-    atomic_write_json(arguments.success_marker, {
-        "artifact_path": managed_relative_path(arguments.output), "sha256": sha256_file(arguments.output), "row_count": count,
-        "contract_version": CONTRACT_VERSION, "config_version": CONFIG_VERSION, "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION},
-        "generated_at": utc_now(), "upstream_hashes": {"source_atoms": marker["sha256"]}, "model_id": settings.model_id,
-        "prompt_version": settings.prompt_version, "cue_execution_policy_version": settings.execution["cue_execution_policy_version"],
-        "protocol_hash_payload_version": settings.execution["protocol_hash_payload_version"], "cue_execution_protocol_sha256": protocol_sha256,
-        "cue_prompt_sha256": sha256_file(arguments.prompt), "cue_inference_schema": settings.execution["package_policy"]["inference_schema"],
-        "cue_inference_schema_version": settings.execution["package_policy"]["inference_schema_version"], "cue_inference_schema_sha256": sha256_file(arguments.inference_schema),
-        "source_atoms_sha256": marker["sha256"], "usage_summary": usage_summary(manifests, run_root, settings),
-    })
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
-    """定义只读默认值；``--execute`` 是唯一允许读取环境密钥和联网的开关。"""
+    """定义只读默认值；保留执行参数仅为明确报错，不能触及密钥或网络。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-registry", type=Path, default=ROOT / "config/model_registry.yaml")
@@ -706,13 +754,13 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--source-success", type=Path, default=ROOT / "source/SOURCE_ATOMS_SUCCESS.json")
     parser.add_argument("--source-schema", type=Path, default=ROOT / "schemas/source_video_atom.schema.json")
     parser.add_argument("--cue-schema", type=Path, default=ROOT / "schemas/cue_candidate.schema.json")
-    parser.add_argument("--inference-schema", type=Path, default=ROOT / "schemas/cue_inference_batch_v1.schema.json")
-    parser.add_argument("--prompt", type=Path, default=ROOT / "prompts/cue_extractor_v2.md")
-    parser.add_argument("--run-root", type=Path, default=ROOT / "cues/shards")
+    parser.add_argument("--inference-schema", type=Path, default=ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    parser.add_argument("--prompt", type=Path, default=ROOT / "prompts/cue_extractor_v3_compact.md")
+    parser.add_argument("--run-root", type=Path, default=ROOT / "cues/batch")
     parser.add_argument("--output", type=Path, default=ROOT / "cues/cue_library.jsonl")
     parser.add_argument("--success-marker", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
     parser.add_argument("--run-id")
-    parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--execute", action="store_true", help="当前无 API 阶段必定被合同门阻断")
     parser.add_argument("--rerun-failed-packages", action="store_true")
     return parser.parse_args(argv)
 

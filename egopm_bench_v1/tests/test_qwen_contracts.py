@@ -10,13 +10,10 @@ from __future__ import annotations
 import copy
 import importlib.util
 import json
-import os
 import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
-from urllib.error import URLError
-
 import pytest
 
 
@@ -68,51 +65,16 @@ def source_atom(index: int, text: str = "A person starts cooking.", split: str =
 
 
 def inference_response(count: int) -> dict[str, Any]:
-    """构造不含任何程序受控字段的合法推理响应。"""
+    """构造 v2.2 合法紧凑响应；仅在内存中模拟服务端推理字段。"""
 
     return {
         "items": [
             {
-                "item_index": index,
-                "entities": ["person"],
-                "scene_type": None,
-                "activity_type": "cooking",
-                "cue_type": "activity",
-                "normalized_predicate": {
-                    "all_of": [{"slot": "activity", "operator": "starts", "value": "cooking"}]
-                },
-                "supporting_text_span": "starts cooking",
-                "confidence": 0.8,
-                "ambiguity_reason": None,
-                "validation_status": "accepted",
+                "n": index, "t": "A", "p": [["A", "^", "cooking"]], "x": "starts cooking",
+                "c": 80, "v": "A",
             }
             for index in range(count)
         ]
-    }
-
-
-class FakeHTTPResponse:
-    """只返回内存字节的上下文管理器，确保执行器测试不触及网络。"""
-
-    def __init__(self, payload: dict[str, Any]) -> None:
-        self.payload = payload
-
-    def __enter__(self) -> "FakeHTTPResponse":
-        return self
-
-    def __exit__(self, *_: object) -> None:
-        return None
-
-    def read(self) -> bytes:
-        return json.dumps(self.payload).encode("utf-8")
-
-
-def fake_chat_response(count: int, usage: dict[str, int] | None = None) -> dict[str, Any]:
-    """封装兼容接口外形；content 仅在内存中存在，账本不会保存该正文。"""
-
-    return {
-        "choices": [{"message": {"content": json.dumps(inference_response(count))}}],
-        "usage": usage or {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
     }
 
 
@@ -136,17 +98,18 @@ def write_source_fixture(module: ModuleType, root: Path, atoms: list[dict[str, A
     return artifact, marker
 
 
-def test_v2_request_only_contains_item_index_and_text() -> None:
-    """受控字段不能出现在模型输入中，固定五条包应给出 640 输出上限。"""
+def test_v22_request_only_contains_item_index_and_text() -> None:
+    """紧凑协议仍不得让模型看到受控字段，固定五条包上限为 480 token。"""
 
     module = load_script()
     settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
-    schema = module.read_json(ROOT / "schemas/cue_inference_batch_v1.schema.json")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    assert len((ROOT / "prompts/cue_extractor_v3_compact.md").read_bytes()) <= 450
     request = module.build_request("测试", schema, [source_atom(index) for index in range(1, 6)], settings)
 
     assert request["model"] == "qwen3.7-flash-2026-07-15"
     assert request["enable_thinking"] is False
-    assert request["max_tokens"] == 640
+    assert request["max_tokens"] == 480
     user_payload = json.loads(request["messages"][1]["content"])
     assert user_payload == {
         "items": [{"item_index": index, "text": "A person starts cooking."} for index in range(5)]
@@ -154,12 +117,12 @@ def test_v2_request_only_contains_item_index_and_text() -> None:
     assert "atom_id" not in request["messages"][1]["content"]
 
 
-def test_adaptive_packages_are_ordered_and_limited_to_five() -> None:
+def test_adaptive_packages_are_ordered_limited_and_batch_grouped() -> None:
     """六条乱序 Atom 必须变成五加一两包，并稳定按 atom_id 排列。"""
 
     module = load_script()
     settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
-    schema = module.read_json(ROOT / "schemas/cue_inference_batch_v1.schema.json")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     atoms = module.ordered_atoms([source_atom(index) for index in (3, 1, 2, 4, 5, 6)])
     manifests = module.build_packages(atoms, "source", "p", schema, settings, "protocol", "run")
 
@@ -173,29 +136,34 @@ def test_adaptive_packages_are_ordered_and_limited_to_five() -> None:
         <= 24000
         for manifest in manifests
     )
+    tasks = module.build_batch_tasks(manifests, {atom["atom_id"]: atom for atom in atoms}, "p", schema, settings)
+    assert len(tasks) == 1 and tasks[0]["request_count"] == 2
+    assert all(line["body"]["enable_thinking"] is False for line in tasks[0]["request_lines"])
+    assert tasks[0]["batch_input_sha256"] and tasks[0]["remote_file_id"] is None
 
 
-def test_parse_backfills_controlled_fields_and_rejects_cross_atom_text() -> None:
+def test_compact_parse_backfills_defaults_and_rejects_cross_atom_text() -> None:
     """模型私传 atom_id 或引用另一个 Atom 的片段都必须在最终 Cue 前被拒绝。"""
 
     module = load_script()
     settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
-    inference_validator = module.load_validator(ROOT / "schemas/cue_inference_batch_v1.schema.json")
+    inference_validator = module.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     cue_validator = module.load_validator(ROOT / "schemas/cue_candidate.schema.json")
     atoms = [source_atom(1), source_atom(2)]
     cues = module.parse_inference_items(
         inference_response(2), atoms, inference_validator, cue_validator, settings, "run_synthetic"
     )
     assert [cue["atom_id"] for cue in cues] == [atom["atom_id"] for atom in atoms]
-    assert all(cue["prompt_version"] == "cue_extractor_v2" for cue in cues)
+    assert all(cue["prompt_version"] == "cue_extractor_v3_compact" for cue in cues)
+    assert all(cue["entities"] == [] and cue["confidence"] == 0.8 for cue in cues)
 
     private = inference_response(2)
     private["items"][0]["atom_id"] = "src_private"
     with pytest.raises(module.ContractError):
         module.parse_inference_items(private, atoms, inference_validator, cue_validator, settings, "run")
     cross_atom = inference_response(2)
-    cross_atom["items"][0]["supporting_text_span"] = "other atom"
-    with pytest.raises(module.ContractError, match="supporting_text_span"):
+    cross_atom["items"][0]["x"] = "other atom"
+    with pytest.raises(module.ContractError, match="可见文本"):
         module.parse_inference_items(cross_atom, atoms, inference_validator, cue_validator, settings, "run")
 
 
@@ -206,8 +174,8 @@ def test_protocol_hash_matches_t4_complete_canonical_payload() -> None:
     registry_path = ROOT / "config/model_registry.yaml"
     registry = module.yaml.safe_load(registry_path.read_text(encoding="utf-8"))
     settings = module.settings_from_registry(registry_path)
-    prompt = ROOT / "prompts/cue_extractor_v2.md"
-    inference_schema = ROOT / "schemas/cue_inference_batch_v1.schema.json"
+    prompt = ROOT / "prompts/cue_extractor_v3_compact.md"
+    inference_schema = ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"
     cue = registry["models"]["cue_extraction"]
     expected = {
         "payload_version": cue["execution"]["protocol_hash_payload_version"],
@@ -238,7 +206,7 @@ def test_complete_requires_exact_manifest_and_all_hashes(tmp_path: Path) -> None
 
     module = load_script()
     settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
-    schema = module.read_json(ROOT / "schemas/cue_inference_batch_v1.schema.json")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     manifest = module.build_packages([source_atom(1)], "source", "p", schema, settings, "protocol", "run_a")[0]
     files = module.package_paths(tmp_path, manifest, settings.layout)
     module.atomic_write_jsonl(files["manifest"], [manifest])
@@ -263,63 +231,36 @@ def test_complete_requires_exact_manifest_and_all_hashes(tmp_path: Path) -> None
     assert not module.is_complete(manifest, files)
 
 
-def test_execute_records_each_attempt_and_real_usage_without_network(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """一次暂态失败再成功须留下两条自包含账本行，各自有本次等待和服务端 usage。"""
+def test_batch_result_success_line_failure_and_quarantine_do_not_persist_raw_response() -> None:
+    """成功、行级失败和本地隔离均只产出无正文结果或账本，隔离项不得自动重跑。"""
 
     module = load_script()
     settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
-    schema = module.read_json(ROOT / "schemas/cue_inference_batch_v1.schema.json")
-    manifest = module.build_packages([source_atom(1)], "source", "p", schema, settings, "protocol", "run")[0]
-    atom_by_id = {"src_SYNTH_DAY1_000001": source_atom(1)}
-    calls = [URLError("synthetic"), FakeHTTPResponse(fake_chat_response(1))]
-
-    def fake_urlopen(*_: object, **__: object) -> FakeHTTPResponse:
-        next_call = calls.pop(0)
-        if isinstance(next_call, BaseException):
-            raise next_call
-        return next_call
-
-    monkeypatch.setattr(module, "urlopen", fake_urlopen)
-    monkeypatch.setattr(module.time, "sleep", lambda _: None)
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic-only")
-    limiter = module.RateLimiter(settings)
-    waits = iter((0.0, 0.25))
-    monkeypatch.setattr(limiter, "wait", lambda _: next(waits))
-    module.execute_package(
-        manifest,
-        atom_by_id,
-        tmp_path,
-        "p",
-        schema,
-        module.load_validator(ROOT / "schemas/cue_inference_batch_v1.schema.json"),
-        module.load_validator(ROOT / "schemas/cue_candidate.schema.json"),
-        settings,
-        limiter,
-    )
-
-    events = module.read_jsonl(module.package_paths(tmp_path, manifest, settings.layout)["ledger"])
-    assert len(events) == 2
-    required = {
-        "run_id", "package_id", "attempt_index", "retry_count", "request_time", "input_atom_ids",
-        "model_id", "region", "endpoint", "thinking_enabled", "reasoning_effort", "temperature",
-        "prompt_version", "schema_version", "source_atoms_sha256", "cue_execution_protocol_sha256",
-        "raw_response_path", "parse_status", "validation_errors", "usage", "failure_summary",
-        "rate_limit_wait_seconds", "raw_response_saved",
-    }
-    assert all(required.issubset(event) for event in events)
-    assert [event["rate_limit_wait_seconds"] for event in events] == [0.0, 0.25]
-    assert events[0]["usage"] == {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}
-    assert events[1]["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}
-    assert all(event["raw_response_path"] is None and event["raw_response_saved"] is False for event in events)
-    assert "starts cooking" not in json.dumps(events)
-    summary = module.usage_summary([manifest], tmp_path, settings)
-    assert summary["attempt_count"] == 2 and summary["retry_count"] == 1
-    assert summary["prompt_tokens"] == 11 and summary["total_tokens"] == 18
-    assert summary["missing_usage_count"] == 1
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    atoms = [source_atom(1)]
+    manifest = module.build_packages(atoms, "source", "p", schema, settings, "protocol", "run")[0]
+    task = module.build_batch_tasks([manifest], {atoms[0]["atom_id"]: atoms[0]}, "p", schema, settings)[0]
+    mapping = {manifest["batch_custom_id"]: manifest}
+    validators = (module.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"), module.load_validator(ROOT / "schemas/cue_candidate.schema.json"))
+    success = {"custom_id": manifest["batch_custom_id"], "response": {"body": {"choices": [{"message": {"content": json.dumps(inference_response(1))}}], "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18}}}}
+    state, cues, event = module.parse_batch_result_line(success, mapping, {atoms[0]["atom_id"]: atoms[0]}, task, *validators, settings)
+    assert state == "validated" and len(cues) == 1 and event["usage"]["total_tokens"] == 18
+    failed, _, failure_event = module.parse_batch_result_line({"custom_id": manifest["batch_custom_id"], "error": {"message": "private"}}, mapping, {atoms[0]["atom_id"]: atoms[0]}, task, *validators, settings)
+    assert failed == "line_failed_requeue" and failure_event["raw_response_saved"] is False
+    invalid = copy.deepcopy(success)
+    invalid["response"]["body"]["choices"][0]["message"]["content"] = json.dumps({"items": []})
+    quarantined, _, quarantine_event = module.parse_batch_result_line(invalid, mapping, {atoms[0]["atom_id"]: atoms[0]}, task, *validators, settings)
+    assert quarantined == "quarantine" and quarantine_event["outcome"] == "local_validation_quarantine"
+    assert "starts cooking" not in json.dumps(event, ensure_ascii=False)
+    module.validate_batch_ledger_events([event], settings)
+    assert module.requeueable_batch_custom_ids([failure_event], settings) == {manifest["batch_custom_id"]}
+    assert module.requeueable_batch_custom_ids([quarantine_event], settings) == set()
+    with pytest.raises(module.ContractError, match="多个终态"):
+        module.validate_batch_ledger_events([event, failure_event], settings)
 
 
-def test_default_preflight_is_read_only_and_final_success_has_payload_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """默认预检不得创建运行目录；合成显式执行的最终 SUCCESS 必须携带 payload 版本。"""
+def test_default_preflight_is_read_only_and_execute_is_blocked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """默认预检不得创建运行目录；显式执行必须在密钥或网络之前被合同阻断。"""
 
     module = load_script()
     monkeypatch.setattr(module, "ROOT", tmp_path)
@@ -331,8 +272,8 @@ def test_default_preflight_is_read_only_and_final_success_has_payload_version(tm
         "source_success": source_marker,
         "source_schema": ROOT / "schemas/source_video_atom.schema.json",
         "cue_schema": ROOT / "schemas/cue_candidate.schema.json",
-        "inference_schema": ROOT / "schemas/cue_inference_batch_v1.schema.json",
-        "prompt": ROOT / "prompts/cue_extractor_v2.md",
+        "inference_schema": ROOT / "schemas/cue_inference_batch_compact_v1.schema.json",
+        "prompt": ROOT / "prompts/cue_extractor_v3_compact.md",
         "run_root": tmp_path / "runs",
         "output": tmp_path / "cue_library.jsonl",
         "success_marker": tmp_path / "CUE_LIBRARY_SUCCESS.json",
@@ -344,14 +285,26 @@ def test_default_preflight_is_read_only_and_final_success_has_payload_version(tm
     with pytest.raises(module.ContractError, match="项目目录内"):
         module.managed_relative_path(tmp_path.parent / "outside" / "cue_library.jsonl")
 
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic-only")
-    monkeypatch.setattr(module, "urlopen", lambda *_args, **_kwargs: FakeHTTPResponse(fake_chat_response(1)))
-    assert module.run(module.argparse.Namespace(**common, execute=True)) == 0
-    success = module.read_json(common["success_marker"])
-    assert success["artifact_path"] == "cue_library.jsonl"
-    assert success["protocol_hash_payload_version"] == "v1.0.0"
-    assert success["model_id"] == "qwen3.7-flash-2026-07-15"
-    assert success["usage_summary"]["total_tokens"] == 18
+    with pytest.raises(module.ContractError, match="仅允许无 API 预检"):
+        module.run(module.argparse.Namespace(**common, execute=True))
+    assert not common["success_marker"].exists()
+
+
+def test_synthetic_batch_task_manifest_only_has_metadata(tmp_path: Path) -> None:
+    """任务总清单可保留 custom_id 映射，但不得夹带 source_text、请求 body 或模型响应。"""
+
+    module = load_script()
+    settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    atoms = [source_atom(1)]
+    manifests = module.build_packages(atoms, "source", "p", schema, settings, "protocol", "run")
+    tasks = module.build_batch_tasks(manifests, {atoms[0]["atom_id"]: atoms[0]}, "p", schema, settings)
+    destination = tmp_path / "batch_tasks_manifest.jsonl"
+    module.write_synthetic_batch_task_manifest(destination, tasks, manifests)
+    row = module.read_jsonl(destination)[0]
+    assert row["custom_id_to_package_id"] == {manifests[0]["batch_custom_id"]: manifests[0]["package_id"]}
+    encoded = destination.read_text(encoding="utf-8")
+    assert "source_text" not in encoded and "starts cooking" not in encoded and '"body"' not in encoded
 
 
 def cue_for(atom: dict[str, Any]) -> dict[str, Any]:
