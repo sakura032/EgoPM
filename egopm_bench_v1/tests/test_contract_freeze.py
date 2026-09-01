@@ -74,73 +74,91 @@ def test_split_policy_forbids_cross_session_relative_time_order() -> None:
     assert duplicate_policy["max_gap_seconds"] is None
 
 
-def test_cue_execution_policy_freezes_no_api_recovery_contract() -> None:
-    """Cue v2 必须冻结五条 package、回填字段和无 API 恢复边界。"""
+def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
+    """Cue v2.2 必须冻结 Batch、短码、96 token 和无 API 恢复边界。"""
 
     registry = yaml.safe_load((CONFIG_DIR / "model_registry.yaml").read_text(encoding="utf-8"))
     cue = registry["models"]["cue_extraction"]
     execution = cue["execution"]
-    assert registry["registry_version"] == "v1.2.0"
+    assert registry["registry_version"] == "v1.3.0"
     assert registry["raw_response_policy"] == "forbidden"
-    assert cue["prompt_version"] == "cue_extractor_v2"
-    assert execution["cue_execution_policy_version"] == "v2.0.0"
-    assert execution["protocol_hash_payload_version"] == "v1.0.0"
-    assert execution["mode"] == "explicit_execute_only"
+    assert cue["prompt_version"] == "cue_extractor_v3_compact"
+    assert execution["cue_execution_policy_version"] == "v2.2.0"
+    assert execution["protocol_hash_payload_version"] == "v2.0.0"
+    assert execution["mode"] == "explicit_batch_file_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2
-    assert execution["transport"] == "realtime_chat_completions"
+    assert execution["transport"] == "batch_file"
     assert execution["package_policy"] == {
         "maximum_atoms": 5,
         "maximum_request_utf8_bytes": 24000,
         "ordering": "atom_id_lexicographic",
-        "output_tokens_per_atom": 128,
+        "output_tokens_per_atom": 96,
         "output_max_tokens_formula": "output_tokens_per_atom_times_package_atom_count",
-        "inference_schema": "cue_inference_batch_v1.schema.json",
+        "inference_schema": "cue_inference_batch_compact_v1.schema.json",
         "inference_schema_version": "v1.0.0",
         "response_top_level_field": "items",
-        "response_correlation_field": "item_index",
+        "response_correlation_field": "n",
     }
     assert execution["controlled_field_policy"] == {
         "model_input_fields": ["item_index", "text"],
-        "model_output_fields": ["item_index", "entities", "scene_type", "activity_type", "cue_type", "normalized_predicate", "supporting_text_span", "confidence", "ambiguity_reason", "validation_status"],
+        "model_output_fields": ["n", "t", "p", "x", "c", "v", "e", "s", "a", "r"],
         "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"],
         "raw_model_response_storage": "forbidden",
     }
+    assert execution["compact_inference_policy"] == {
+        "cue_type_codes": {"T": "time", "P": "person", "L": "place", "O": "object", "A": "activity", "S": "state_change"},
+        "operator_codes": {"=": "eq", "!": "not_eq", "+": "present", "-": "absent", "^": "starts", "$": "ends", "~": "contains"},
+        "required_fields": ["n", "t", "p", "x", "c", "v"],
+        "optional_defaults": {"e": [], "s": None, "a": None, "r": None},
+        "confidence_scale": 100,
+    }
+    assert execution["batch_file_policy"] == {
+        "logical_shards_per_task": 10,
+        "completion_window": "24h",
+        "max_requests_per_file": 50000,
+        "max_input_file_bytes": 500000000,
+        "max_request_line_bytes": 1000000,
+        "request_endpoint": "/v1/chat/completions",
+        "custom_id_format": "v22_s{shard_index:05d}_p{package_index:03d}_{manifest_sha256_8}",
+        "local_request_body_storage": "temporary_delete_after_upload",
+        "local_raw_result_storage": "forbidden_stream_only",
+        "remote_files_delete_after_cue_qa": "required",
+        "successful_local_validation_failure": "quarantine_no_auto_retry",
+    }
     assert execution["pricing_snapshot"] == {
-        "pricing_version": "2026-09-01_cn-beijing_list",
+        "pricing_version": "2026-09-01_cn-beijing_batch_file_list",
         "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",
-        "input_price_cny_per_million_tokens": 0.2,
-        "output_price_cny_per_million_tokens": 0.8,
+        "input_price_cny_per_million_tokens": 0.1,
+        "output_price_cny_per_million_tokens": 0.4,
         "price_region": "cn-beijing",
         "input_context_window_tokens": 32000,
-        "retry_attempts_billed_independently": True,
-    }
-    assert execution["rate_limit_policy"] == {
-        "target_requests_per_minute": 300,
-        "target_total_tokens_per_minute": 1000000,
-        "official_requests_per_minute": 30000,
-        "official_total_tokens_per_minute": 5000000,
-        "official_region": "cn-beijing",
+        "successful_requests_only_billed": True,
+        "context_cache_supported": False,
     }
     assert execution["token_accounting"]["authoritative_source"] == "response_usage"
+    assert execution["token_accounting"]["preflight_upper_bound"] == "serialized_utf8_batch_request_bytes"
     assert execution["token_accounting"]["raw_response_storage"] == "forbidden"
     assert execution["recovery"] == {
         "require_matching_source_hash": True,
         "require_matching_protocol_hash": True,
         "rerun_only_incomplete_or_failed_packages": True,
         "completion_marker_requires_sha256": True,
+        "require_batch_custom_id_bijection": True,
+        "prohibit_automatic_local_validation_retry": True,
     }
-    assert {"cue_execution_policy_version", "cue_execution_protocol_sha256", "cue_prompt_sha256", "cue_inference_schema_sha256", "source_atoms_sha256", "package_maximum_atoms", "package_maximum_request_utf8_bytes", "output_tokens_per_atom", "package_count", "usage_summary"}.issubset(registry["run_manifest_required_fields"])
+    assert {"cue_execution_policy_version", "cue_execution_protocol_sha256", "cue_prompt_sha256", "cue_inference_schema_sha256", "source_atoms_sha256", "package_maximum_atoms", "package_maximum_request_utf8_bytes", "output_tokens_per_atom", "batch_task_id", "batch_custom_id", "batch_input_sha256", "remote_file_id", "remote_cleanup_status", "package_count", "usage_summary"}.issubset(registry["run_manifest_required_fields"])
 
 
-def test_cue_inference_schema_excludes_program_controlled_fields() -> None:
-    """v2 推理 Schema 只能容纳模型推理字段，最终血缘字段必须留给程序回填。"""
+def test_compact_cue_inference_schema_excludes_controlled_fields_and_stays_small() -> None:
+    """v2.2 短码 Schema 必须严格、可展开且不超过 1000 字节序列化预算。"""
 
-    schema = json.loads((SCHEMA_DIR / "cue_inference_batch_v1.schema.json").read_text(encoding="utf-8"))
-    item = schema["$defs"]["item"]
+    schema = json.loads((SCHEMA_DIR / "cue_inference_batch_compact_v1.schema.json").read_text(encoding="utf-8"))
+    item = schema["$defs"]["i"]
     controlled = {"cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"}
     assert item["additionalProperties"] is False
     assert controlled.isdisjoint(item["properties"])
+    assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1000
     jsonschema.Draft202012Validator(schema).validate({
-        "items": [{"item_index": 0, "entities": ["手机"], "scene_type": None, "activity_type": "拿取", "cue_type": "object", "normalized_predicate": {"all_of": [{"slot": "object", "operator": "present", "value": "手机"}]}, "supporting_text_span": "拿着手机", "confidence": 0.9, "ambiguity_reason": None, "validation_status": "accepted"}]
+        "items": [{"n": 0, "t": "O", "p": [["O", "+", "手机"]], "x": "拿着手机", "c": 90, "v": "A"}]
     })
