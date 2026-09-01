@@ -126,6 +126,8 @@ def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
         "remote_files_delete_after_cue_qa": "required",
         "successful_local_validation_failure": "quarantine_no_auto_retry",
     }
+    assert execution["shard_layout"]["root"] == "cues/batch"
+    assert execution["shard_layout"]["batch_tasks_manifest"] == "batch_tasks_manifest.jsonl"
     assert execution["pricing_snapshot"] == {
         "pricing_version": "2026-09-01_cn-beijing_batch_file_list",
         "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",

@@ -75,6 +75,7 @@ models:
         context_cache_supported: false
       shard_layout:
         root: cues/batch
+        batch_tasks_manifest: batch_tasks_manifest.jsonl
         package_directory: packages
         input_manifest_suffix: .input.jsonl
         output_suffix: .result.jsonl
