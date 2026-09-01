@@ -300,14 +300,14 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
         "visible_text": "A person starts preparing food in a kitchen.",
     }
     compact = {"n": 0, "t": "A", "p": [["A", "^", "preparing food"]], "x": "preparing food", "c": 80, "v": "A"}
-    expanded = qa.expand_compact_cue_for_qa(compact, atom, contract, "run_synthetic_v22")
+    expanded = qa.expand_compact_cue_for_qa(compact, atom, contract, "run_synthetic_v22", config)
     collector = qa.IssueCollector()
     qa.validate_schema([expanded], ROOT / "schemas" / "cue_candidate.schema.json", "cue", "T2 cue", collector)
     assert not collector.blockers
     unknown = dict(compact)
     unknown["t"] = "?"
     try:
-        qa.expand_compact_cue_for_qa(unknown, atom, contract, "run_synthetic_v22")
+        qa.expand_compact_cue_for_qa(unknown, atom, contract, "run_synthetic_v22", config)
     except ValueError as error:
         assert "未知" in str(error)
     else:

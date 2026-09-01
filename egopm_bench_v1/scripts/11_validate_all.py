@@ -469,11 +469,13 @@ def expand_compact_cue_for_qa(
     atom: dict[str, Any],
     contract: dict[str, Any],
     run_id: str,
+    config: RunConfig,
 ) -> dict[str, Any]:
     """独立展开一条 v2.2 短码 Cue，供 QA 测试证明紧凑协议仍能得到最终 Schema。"""
 
-    registry_path = Path(__file__).resolve().parents[1] / "config" / "model_registry.yaml"
-    registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
+    # 必须读取与当前 SUCCESS 同一份临时/正式配置：直接引用工作树全局 registry 会让
+    # 测试在复制配置被篡改时仍错误通过，并破坏 T4 独立复算冻结短码表的意义。
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
     compact_policy = registry["models"]["cue_extraction"]["execution"]["compact_inference_policy"]
     type_codes = compact_policy["cue_type_codes"]
     operator_codes = compact_policy["operator_codes"]

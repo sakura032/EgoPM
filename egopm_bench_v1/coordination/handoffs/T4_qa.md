@@ -3,7 +3,7 @@
 ## 交接元数据
 
 - 分支：`main`。
-- 本次 T4 提交：待 T0 合并后填写；基线配置提交为 `21e01f6`、`738b7d9`、`b851583`。
+- 本次 T4 提交：`28461b7`；基线配置提交为 `21e01f6`、`738b7d9`、`b851583`。
 - 治理合同版本：`v1.1.0`。
 - 数据合同版本：Source Atom Schema 为 `v1.1.0`；最终 `cue_candidate` Schema 仍为 `v1.0.0`；Cue 执行协议为 `v2.2.0`，协议哈希 payload 为 `v2.0.0`。
 - 修改文件：`scripts/11_validate_all.py`、`tests/test_validators.py`、本交接文件。
