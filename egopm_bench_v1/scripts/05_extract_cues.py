@@ -97,25 +97,39 @@ def read_json(path: Path) -> dict[str, Any]:
     return value
 
 
-def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    """读取且严格限制 JSONL 为无空行的对象序列，以稳定行数和哈希门。"""
+def iter_jsonl(path: Path) -> Iterable[dict[str, Any]]:
+    """逐行读取严格 JSONL，供正式预检避免将冻结 Source 全量留在内存。"""
 
+    # Source 已冻结为数十万条记录；全量 list 会把 Atom、包和请求正文同时留在内存，
+    # 既不利于低成本预检，也会让仅核算阶段因内存耗尽中断。因此把顺序、类型与空行门
+    # 保留在流式迭代器中，调用方仍须逐条做 Schema 校验。
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        handle = path.open("r", encoding="utf-8", newline=None)
     except (OSError, UnicodeDecodeError) as error:
         raise ContractError(f"无法读取 JSONL：{path}") from error
-    result: list[dict[str, Any]] = []
-    for line_number, line in enumerate(lines, start=1):
-        if not line.strip():
-            raise ContractError(f"JSONL 不允许空行：{path}:{line_number}")
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as error:
-            raise ContractError(f"JSONL 格式无效：{path}:{line_number}") from error
-        if not isinstance(value, dict):
-            raise ContractError(f"JSONL 行必须是 object：{path}:{line_number}")
-        result.append(value)
-    return result
+    with handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                raise ContractError(f"JSONL 不允许空行：{path}:{line_number}")
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise ContractError(f"JSONL 格式无效：{path}:{line_number}") from error
+            if not isinstance(value, dict):
+                raise ContractError(f"JSONL 行必须是 object：{path}:{line_number}")
+            yield value
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    """在测试或小型 package 场景收集 JSONL；正式 Source 预检必须使用迭代器。"""
+
+    return list(iter_jsonl(path))
+
+
+def jsonl_row_count(path: Path) -> int:
+    """只计数冻结 JSONL 行，避免 SUCCESS 校验复制整份 Source 到内存。"""
+
+    return sum(1 for _ in iter_jsonl(path))
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
@@ -192,7 +206,7 @@ def verified_source(artifact: Path, marker_path: Path) -> dict[str, Any]:
         or marker.get("config_version") != CONFIG_VERSION
         or schema_versions.get("source_video_atom") != SOURCE_SCHEMA_VERSION
         or marker.get("sha256") != sha256_file(artifact)
-        or marker.get("row_count") != len(read_jsonl(artifact))
+        or marker.get("row_count") != jsonl_row_count(artifact)
     ):
         raise ContractError("Source SUCCESS 的版本、哈希或行数不匹配")
     return marker
@@ -429,6 +443,10 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
     maximum_shard = max((m["shard_index"] for m in manifests), default=-1)
     for task_index, first_shard in enumerate(range(0, maximum_shard + 1, per_task)):
         selected = [m for m in manifests if first_shard <= m["shard_index"] < first_shard + per_task]
+        if not selected:
+            # 流式预检会按单个 task 调用本函数；跳过此前不存在的 shard，不能构造空的
+            # Batch 文件，也不能把它们计入远端任务数量或费用。
+            continue
         lines: list[dict[str, Any]] = []
         for manifest in selected:
             atoms = [atom_by_id[item["atom_id"]] for item in manifest["atoms"]]
@@ -456,6 +474,115 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
             "status": "planned_no_api", "request_lines": lines,
         })
     return tasks
+
+
+def streaming_preflight_report(
+    source_path: Path,
+    source_validator: jsonschema.Draft202012Validator,
+    source_sha256: str,
+    prompt: str,
+    schema: dict[str, Any],
+    settings: Settings,
+    protocol_sha256: str,
+    run_id: str,
+) -> dict[str, Any]:
+    """流式构建正式 Source 的无 API 预检，最多暂存一个十-shard Batch 任务。"""
+
+    # 每个 Batch task 最多十个 shard。仅将这一个 task 的请求行临时放在内存中以重算
+    # `batch_input_sha256`，任务结束立即释放；因此不会把数万条请求正文或 37 万 Atom
+    # 作为“预检产物”保留，也不会向磁盘写入任何请求文件。
+    task_packages: list[dict[str, Any]] = []
+    task_atom_by_id: dict[str, dict[str, Any]] = {}
+    public_tasks: list[dict[str, Any]] = []
+    source_count = 0
+    package_count = 0
+    output_bound = 0
+    input_bound = 0
+    max_observed = 0
+    previous_atom_id: str | None = None
+    current_shard: int | None = None
+    current_package_index = 0
+    current_atoms: list[dict[str, Any]] = []
+
+    def finish_task() -> None:
+        """完成当前十-shard计划的瞬时哈希与核算，然后只保留无正文元数据。"""
+
+        nonlocal task_packages, task_atom_by_id, input_bound, max_observed
+        if not task_packages:
+            return
+        task = build_batch_tasks(task_packages, task_atom_by_id, prompt, schema, settings)[0]
+        request_sizes = [
+            len(json.dumps(line, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
+            for line in task["request_lines"]
+        ]
+        input_bound += sum(request_sizes)
+        max_observed = max(max_observed, max(request_sizes, default=0))
+        public_tasks.append(public_batch_task_manifest(task))
+        task_packages = []
+        task_atom_by_id = {}
+
+    def finish_package() -> None:
+        """把当前至多五条 Atom 变为包清单，并保留到其所属 task 的 SHA 核算完成。"""
+
+        nonlocal current_atoms, current_package_index, package_count, output_bound
+        if not current_atoms or current_shard is None:
+            return
+        task_packages.append(
+            package_manifest(
+                current_atoms, source_sha256, protocol_sha256, run_id, current_shard, current_package_index
+            )
+        )
+        task_atom_by_id.update({atom["atom_id"]: atom for atom in current_atoms})
+        package_count += 1
+        output_bound += settings.output_tokens_per_atom * len(current_atoms)
+        current_package_index += 1
+        current_atoms = []
+
+    for atom in iter_jsonl(source_path):
+        validate_record(source_validator, atom, "Source Atom")
+        atom_id = atom.get("atom_id")
+        if not isinstance(atom_id, str) or not atom_id:
+            raise ContractError("每条 Source Atom 必须有非空 atom_id")
+        if previous_atom_id is not None and atom_id <= previous_atom_id:
+            # 固定 atom_id 顺序是 package/custom_id/最终合并一致的共同前提；预检不能为
+            # 省内存而悄悄接受乱序输入，否则正式执行会改变冻结覆盖范围。
+            raise ContractError("Source Atom 必须已按 atom_id 严格升序冻结，流式预检拒绝乱序输入")
+        previous_atom_id = atom_id
+        shard_index = source_count // settings.shard_size
+        if current_shard is not None and shard_index != current_shard:
+            finish_package()
+            if shard_index // int(settings.batch_file_policy["logical_shards_per_task"]) != current_shard // int(settings.batch_file_policy["logical_shards_per_task"]):
+                finish_task()
+            current_package_index = 0
+        current_shard = shard_index
+        candidate = current_atoms + [atom]
+        if len(candidate) <= settings.maximum_atoms and request_utf8_bytes(prompt, schema, candidate, settings) <= settings.maximum_request_utf8_bytes:
+            current_atoms = candidate
+        else:
+            if not current_atoms:
+                raise ContractError("单条 Atom 超过 24000 UTF-8 字节请求保护线")
+            finish_package()
+            if request_utf8_bytes(prompt, schema, [atom], settings) > settings.maximum_request_utf8_bytes:
+                raise ContractError("单条 Atom 超过 24000 UTF-8 字节请求保护线")
+            current_atoms = [atom]
+        source_count += 1
+    finish_package()
+    finish_task()
+    if source_count == 0:
+        raise ContractError("Source Atom 不能为空")
+    input_cost = input_bound / 1_000_000 * settings.input_price_cny_per_million_tokens
+    output_cost = output_bound / 1_000_000 * settings.output_price_cny_per_million_tokens
+    return {
+        "mode": "batch_preflight_no_api", "network_called": False, "credentials_read": False, "formal_outputs_written": False,
+        "atom_count": source_count, "package_count": package_count, "batch_task_count": len(public_tasks),
+        "logical_shard_count": (source_count + settings.shard_size - 1) // settings.shard_size,
+        "maximum_atoms_per_package": settings.maximum_atoms, "maximum_request_utf8_bytes": settings.maximum_request_utf8_bytes,
+        "max_observed_batch_request_utf8_bytes": max_observed, "batch_input_utf8_bytes_upper_bound": input_bound,
+        "output_tokens_upper_bound": output_bound, "cue_execution_protocol_sha256": protocol_sha256,
+        "batch_task_manifests": public_tasks,
+        "cny_upper_bound_successful_requests_only": {"input_cny_upper_bound": input_cost, "output_cny_upper_bound": output_cost, "total_cny_upper_bound": input_cost + output_cost},
+        "recovery": "仅重组未完成或行级失败 package；服务端成功而本地验证失败进入 quarantine，禁止自动重试。",
+    }
 
 
 def public_batch_task_manifest(task: dict[str, Any]) -> dict[str, Any]:
@@ -733,16 +860,21 @@ def run(arguments: argparse.Namespace) -> int:
     # 即使当前只预检也加载冻结 Schema，确保成本核算不会建立在不存在或替换后的协议之上。
     load_validator(arguments.inference_schema)
     load_validator(arguments.cue_schema)
-    atoms = ordered_atoms(read_jsonl(arguments.source_atoms))
-    for atom in atoms:
-        validate_record(source_validator, atom, "Source Atom")
     prompt = arguments.prompt.read_text(encoding="utf-8")
     schema = read_json(arguments.inference_schema)
     # 预检不写可恢复工件，故使用稳定名称即可；正式 run_id 只能在未来获单独授权的执行阶段引入。
     run_id = arguments.run_id or "preflight_no_api"
     protocol_sha256 = protocol_hash(settings, arguments.prompt, arguments.inference_schema)
-    manifests = build_packages(atoms, str(marker["sha256"]), prompt, schema, settings, protocol_sha256, run_id)
-    report = preflight_report(manifests, atoms, prompt, schema, settings, protocol_sha256)
+    report = streaming_preflight_report(
+        arguments.source_atoms,
+        source_validator,
+        str(marker["sha256"]),
+        prompt,
+        schema,
+        settings,
+        protocol_sha256,
+        run_id,
+    )
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 

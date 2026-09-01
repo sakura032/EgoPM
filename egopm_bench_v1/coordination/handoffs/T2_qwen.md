@@ -19,6 +19,8 @@
 | 最终 Cue Schema | `v1.0.0` |
 | 紧凑推理 Schema | `cue_inference_batch_compact_v1.schema.json` / `v1.0.0` |
 | 生产调用状态 | 未授权、未执行 |
+| 冻结只读输入 | `source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 |
+| 本次正式输出 | 无；未写 `cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json`、Batch 请求文件或远端工件 |
 
 ## 修改内容
 
@@ -42,6 +44,8 @@
     `local_validation_quarantine`，绝不自动重传；通过为 `validated_success`。账本不保存请求、
     响应、错误正文或原文，包含冻结的 Batch 六字段和 `outcome`。
   - 同一 `batch_custom_id` 只能有一个终态；隔离项永远不在可重排队集合中。
+  - 面向冻结 Source 的默认预检采用逐行读取和逐 task 哈希：内存中只暂存当前十个 shard 的
+    请求行，完成哈希后立即释放；不会把全量 Atom、package 与请求正文同时常驻内存。
 - `tests/test_qwen_contracts.py`
   - 保留第 06/07 的回归测试；新增紧凑提示词字节数、五条 package、Batch 分组/`custom_id`、
     三个解析终态、隔离不重排队、无正文任务清单和默认只读/执行阻断测试。
@@ -80,6 +84,10 @@ python -m pytest -q --basetemp .pytest_cache/t2-v22-full
 git diff --check
 # 通过
 ```
+
+T0 复跑的冻结 Source 只读预检结果为：`74160` 个 package、`742` 个逻辑 shard、`75` 个
+Batch task；最大 Batch 请求行 `10943` UTF-8 字节，输入字节代理上界 `217655725`，输出上界
+`35596704` token。该预检未读密钥、未联网、未写正式工件。
 
 ## 未解决问题与下一门
 
