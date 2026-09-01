@@ -57,6 +57,11 @@ models:
         local_raw_result_storage: forbidden_stream_only
         remote_files_delete_after_cue_qa: required
         successful_local_validation_failure: quarantine_no_auto_retry
+      batch_ledger_policy:
+        required_fields: [batch_task_index, batch_custom_id, batch_input_sha256, remote_file_id, remote_cleanup_status, outcome]
+        terminal_outcomes: [validated_success, service_line_failure_requeueable, local_validation_quarantine]
+        require_single_terminal_outcome_per_custom_id: true
+        prohibit_requeue_after_local_validation_quarantine: true
       token_accounting:
         authoritative_source: response_usage
         input_field: prompt_tokens

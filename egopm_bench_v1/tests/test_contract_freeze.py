@@ -126,6 +126,12 @@ def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
         "remote_files_delete_after_cue_qa": "required",
         "successful_local_validation_failure": "quarantine_no_auto_retry",
     }
+    assert execution["batch_ledger_policy"] == {
+        "required_fields": ["batch_task_index", "batch_custom_id", "batch_input_sha256", "remote_file_id", "remote_cleanup_status", "outcome"],
+        "terminal_outcomes": ["validated_success", "service_line_failure_requeueable", "local_validation_quarantine"],
+        "require_single_terminal_outcome_per_custom_id": True,
+        "prohibit_requeue_after_local_validation_quarantine": True,
+    }
     assert execution["shard_layout"]["root"] == "cues/batch"
     assert execution["shard_layout"]["batch_tasks_manifest"] == "batch_tasks_manifest.jsonl"
     assert execution["pricing_snapshot"] == {
