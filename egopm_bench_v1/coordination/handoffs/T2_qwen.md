@@ -206,3 +206,43 @@ Batch task；最大 Batch 请求行 `10943` UTF-8 字节，输入字节代理上
 哈希和协议哈希，且 `status=completed`、完成数等于总数、在飞数为零、成功数等于总数、
 隔离/服务失败/预算停止均为零；任何缺失、身份不一致或失败都会阻断下一波。进度快照已
 绑定上述身份字段；测试覆盖 Wave 2 的通过与失败阻断场景。
+
+## 实时 v5 无正文隔离诊断交接（2026-09-05）
+
+### 只读事实与边界
+
+- 仅读取 `realtime_v5_01` 的 package 状态、波次状态和进度，未读取结果 JSONL、模型原始响应、
+  Source 文本或 API Key，也未联网。
+- 现有无正文状态只能确认：首批 10 个 package 中 5 个 `validated_success`、5 个
+  `local_validation_quarantine`，累计账面费用 `¥0.0033416`。旧版本没有记录失败类别；在
+  不保存原始响应的合同下，不能从旧账本可靠倒推字段级原因，故不得猜测或自动重发。
+
+### 本次修改
+
+- `scripts/05_extract_cues.py` 新增 `LocalValidationError` 与只含固定大写错误码、JSON 字段/下标
+  路径的诊断。错误码覆盖 JSON 解析、响应结构/根、推理 Schema 关键字、项目索引或数量、实体重复、
+  短码、支撑文本子串、predicate 主槽位和最终 Cue Schema。
+- 实时隔离事件、`*.failed.json` 与 `realtime_state.json` 新增
+  `local_validation_failure={code,path}`；其中不含字段值、Atom 文本、请求体或模型响应。未知内部
+  合同异常只记为 `LOCAL_VALIDATION_UNCLASSIFIED`，不会回显异常消息。
+- `tests/test_qwen_contracts.py` 增加 JSON 解析、原文子串和 predicate 对齐三种模拟失败的无正文
+  落盘测试，并验证账本字段合法。
+
+### 验证结果
+
+```powershell
+python -m pytest -q egopm_bench_v1/tests/test_qwen_contracts.py
+# 15 passed
+
+python -m pytest -q
+# 53 passed
+
+git diff --check
+# 通过
+```
+
+### 下一门
+
+- 该改动改变执行协议哈希；T0 必须更新冻结协议/授权绑定，T4 应复核诊断字段和无正文保证。
+- 旧 `realtime_v5_01` 仅保留审计，不自动重跑。以新协议和新 run id 发起的、小范围诊断运行才会
+  产生可归类的失败记录；是否调用 API 仍须由用户单独确认。

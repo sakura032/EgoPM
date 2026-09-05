@@ -109,6 +109,35 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     with pytest.raises(value.ContractError, match="Batch"): value.validate_realtime_ledger_event({**result[2], "batch_custom_id": "x"})
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_code", "expected_path"),
+    [
+        ("{", "JSON_PARSE", "/"),
+        (json.dumps({"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "不存在", "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_NOT_SUBSTRING", "/items/0/x"),
+        (json.dumps({"items": [{"n": 0, "t": "A", "p": [["P", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A"}]}, ensure_ascii=False), "PREDICATE_CUE_TYPE_MISMATCH", "/items/0/p"),
+    ],
+)
+def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
+    """已计费的本地失败必须落盘固定类别/路径，且诊断不含模型输出正文。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+
+    class Invalid:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            return {"choices": [{"message": {"content": payload}}], "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+
+    root = tmp_path / "realtime"
+    result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Invalid(), root, 1.0, *buckets(value, policy))
+    state = json.loads((root / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8"))
+    assert result[0] == "local_validation_quarantine"
+    assert result[2]["local_validation_failure"] == {"code": expected_code, "path": expected_path}
+    assert state["local_validation_failure"] == {"code": expected_code, "path": expected_path}
+    persisted = json.dumps(state, ensure_ascii=False)
+    assert "choices" not in persisted and "message" not in persisted
+    if payload != "{":
+        assert payload not in persisted
+    value.validate_realtime_ledger_event(result[2])
+
+
 def test_http_400_has_safe_diagnostic_without_raw_body() -> None:
     """HTTP 400 必须终结为无正文诊断，且不把原始错误体暴露给运行状态。"""
     value = module(); settings, policy, *_ = setup(value)
@@ -143,7 +172,7 @@ def test_server_compatible_inference_schema_keeps_entity_deduplication_locally()
     inference_validator = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     cue_validator = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
     duplicate = {"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A", "e": ["物品", "物品"]}]}
-    with pytest.raises(value.ContractError, match="实体不得重复"):
+    with pytest.raises(value.LocalValidationError, match="ENTITY_DUPLICATE"):
         value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
 
 

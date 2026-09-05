@@ -41,6 +41,45 @@ class ContractError(RuntimeError):
     """冻结合同、输入血缘、响应结构或恢复边界不一致。"""
 
 
+class LocalValidationError(ContractError):
+    """记录不含模型正文的本地验证分类，供已计费响应的隔离审计使用。
+
+    输入是固定错误码及 JSON 路径（只允许字段名和数组下标）；输出是普通合同异常。
+    它位于第 05 阶段实时接收路径，刻意不携带字段值、Atom 文本或服务端原始响应，
+    使失败类别能用于修复提示词而不会把受保护正文写入账本。
+    """
+
+    def __init__(self, code: str, path: str = "/") -> None:
+        super().__init__(code)
+        self.code = code
+        self.path = path
+
+
+def safe_json_path(parts: Iterable[Any]) -> str:
+    """把 Schema 错误路径压缩成无值路径，拒绝把模型字段内容带入诊断。"""
+
+    rendered = [str(part) for part in parts if isinstance(part, (str, int))]
+    return "/" + "/".join(rendered) if rendered else "/"
+
+
+def validate_inference_response(validator: jsonschema.Draft202012Validator, response: dict[str, Any]) -> None:
+    """验证紧凑响应并输出 Schema 关键字与路径，不回显任何输入值或模型文字。"""
+
+    error = next(iter(validator.iter_errors(response)), None)
+    if error is not None:
+        keyword = str(error.validator) if isinstance(error.validator, str) else "unknown"
+        raise LocalValidationError(f"INFERENCE_SCHEMA_{keyword.upper()}", safe_json_path(error.absolute_path))
+
+
+def validate_final_cue(validator: jsonschema.Draft202012Validator, cue: dict[str, Any]) -> None:
+    """验证程序展开的最终 Cue，并只暴露 Schema 关键字和字段路径。"""
+
+    error = next(iter(validator.iter_errors(cue)), None)
+    if error is not None:
+        keyword = str(error.validator) if isinstance(error.validator, str) else "unknown"
+        raise LocalValidationError(f"FINAL_CUE_SCHEMA_{keyword.upper()}", safe_json_path(error.absolute_path))
+
+
 @dataclass(frozen=True)
 class RealtimePolicy:
     """实时传输的冻结参数；它与已取消的 Batch 协议绝不共享状态目录。"""
@@ -796,10 +835,10 @@ def pending_packages(manifests: list[dict[str, Any]], run_root: Path, layout: di
 def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]], inference_validator: jsonschema.Draft202012Validator, cue_validator: jsonschema.Draft202012Validator, settings: Settings, run_id: str) -> list[dict[str, Any]]:
     """严格展开紧凑项并回填受控字段；未知短码或跨 Atom 证据一律拒绝。"""
 
-    validate_record(inference_validator, response, "Cue v2.2 紧凑推理响应")
+    validate_inference_response(inference_validator, response)
     items = response["items"]
     if len(items) != len(atoms) or sorted(item["n"] for item in items) != list(range(len(atoms))):
-        raise ContractError("紧凑响应必须为 package 中每条 Atom 恰好返回一次 n")
+        raise LocalValidationError("RESPONSE_ITEM_INDEX_OR_COUNT", "/items")
     cue_codes = settings.compact_policy["cue_type_codes"]
     operator_codes = settings.compact_policy["operator_codes"]
     defaults = settings.compact_policy["optional_defaults"]
@@ -810,25 +849,25 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
         # 服务端 JSON Schema 子集拒绝 `uniqueItems`；本地在解析后立即恢复同一约束，
         # 使兼容性修复不放宽最终 Cue 的实体去重质量门。
         if len(entities) != len(set(entities)):
-            raise ContractError("e 中的实体不得重复")
+            raise LocalValidationError("ENTITY_DUPLICATE", f"/items/{item['n']}/e")
         cue_type = cue_codes.get(item["t"])
         if not isinstance(cue_type, str):
-            raise ContractError("出现未知 cue_type 短码")
+            raise LocalValidationError("UNKNOWN_CUE_TYPE_CODE", f"/items/{item['n']}/t")
         clauses: list[dict[str, str]] = []
         for compact_clause in item["p"]:
             slot = cue_codes.get(compact_clause[0])
             operator = operator_codes.get(compact_clause[1])
             if not isinstance(slot, str) or not isinstance(operator, str):
-                raise ContractError("出现未知 predicate 槽位或操作短码")
+                raise LocalValidationError("UNKNOWN_PREDICATE_CODE", f"/items/{item['n']}/p")
             clauses.append({"slot": slot, "operator": operator, "value": compact_clause[2]})
         # 连续原文和主槽位门在展开前检查，避免正确 JSON 被错误 Atom 或错误语义接纳。
         if item["x"] not in atom["visible_text"]:
-            raise ContractError("x 不属于对应 Atom 的可见文本")
+            raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/x")
         if not any(clause["slot"] == cue_type for clause in clauses):
-            raise ContractError("p 未包含与 t 对齐的主槽位")
+            raise LocalValidationError("PREDICATE_CUE_TYPE_MISMATCH", f"/items/{item['n']}/p")
         status = {"A": "accepted", "R": "rejected", "N": "needs_review"}.get(item["v"])
         if status is None:
-            raise ContractError("出现未知 validation_status 短码")
+            raise LocalValidationError("UNKNOWN_VALIDATION_STATUS_CODE", f"/items/{item['n']}/v")
         cue = {
             "cue_id": f"cue_{atom['atom_id'].removeprefix('src_')}", "atom_id": atom["atom_id"],
             "split": atom["split"], "entities": entities,
@@ -839,7 +878,7 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
             "prompt_version": settings.prompt_version, "schema_version": settings.final_cue_schema_version,
             "run_id": run_id, "validation_status": status,
         }
-        validate_record(cue_validator, cue, "程序展开的 Cue")
+        validate_final_cue(cue_validator, cue)
         if cue["validation_status"] == "accepted":
             cues.append(cue)
     return cues
@@ -1145,7 +1184,7 @@ def realtime_usage_cost(usage: dict[str, int | None], policy: RealtimePolicy) ->
     return prompt_tokens / 1_000_000 * policy.input_price_cny_per_million_tokens + completion_tokens / 1_000_000 * policy.output_price_cny_per_million_tokens
 
 
-def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: int, usage: dict[str, int | None], failure_class: str | None = None, service_error: dict[str, Any] | None = None) -> dict[str, Any]:
+def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: int, usage: dict[str, int | None], failure_class: str | None = None, service_error: dict[str, Any] | None = None, local_validation_failure: dict[str, str] | None = None) -> dict[str, Any]:
     """生成实时无正文账本；逐请求记录 usage、重试和终态。"""
 
     return {
@@ -1154,14 +1193,15 @@ def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: i
         "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
         "request_time": utc_now(), "request_sha256": manifest["request_sha256"], "outcome": outcome, "attempt": retry_count + 1, "retry_count": retry_count, "usage": usage,
         "retry_eligible": outcome == "service_transport_exhausted" and failure_class == "transient_service", "failure_origin": failure_class,
-        "service_error": service_error, "raw_response_saved": False, "raw_response_path": None,
+        "service_error": service_error, "local_validation_failure": local_validation_failure,
+        "raw_response_saved": False, "raw_response_path": None,
     }
 
 
 def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
     """拒绝缺失身份、使用量或混入 Batch 字段的实时账本行。"""
 
-    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "realtime_request_id", "transport", "raw_response_saved", "service_error"}
+    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "realtime_request_id", "transport", "raw_response_saved", "service_error", "local_validation_failure"}
     if not required.issubset(event) or event.get("transport") != "realtime_chat_completions":
         raise ContractError("实时账本缺少冻结字段或传输标识不符")
     if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
@@ -1171,6 +1211,14 @@ def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
     diagnostic = event.get("service_error")
     if diagnostic is not None and (not isinstance(diagnostic, dict) or set(diagnostic) != {"http_status", "service_code", "service_message"}):
         raise ContractError("实时账本的服务诊断字段无效")
+    local_failure = event.get("local_validation_failure")
+    if local_failure is not None:
+        if event.get("outcome") != "local_validation_quarantine" or not isinstance(local_failure, dict) or set(local_failure) != {"code", "path"}:
+            raise ContractError("实时账本的本地验证诊断字段无效")
+        if not isinstance(local_failure["code"], str) or not re.fullmatch(r"[A-Z0-9_]{1,96}", local_failure["code"]):
+            raise ContractError("实时账本的本地验证错误码无效")
+        if not isinstance(local_failure["path"], str) or not re.fullmatch(r"/(?:[A-Za-z0-9_./-]+)?", local_failure["path"]):
+            raise ContractError("实时账本的本地验证路径无效")
 
 
 def execute_realtime_package(
@@ -1220,9 +1268,14 @@ def execute_realtime_package(
             return "service_transport_exhausted", 0.0, event
         try:
             content = response.get("choices", [{}])[0].get("message", {}).get("content")
-            parsed = json.loads(content) if isinstance(content, str) else None
+            if not isinstance(content, str):
+                raise LocalValidationError("RESPONSE_STRUCTURE", "/choices/0/message/content")
+            try:
+                parsed = json.loads(content)
+            except json.JSONDecodeError as error:
+                raise LocalValidationError("JSON_PARSE", "/") from error
             if not isinstance(parsed, dict):
-                raise ContractError("实时响应正文不是对象")
+                raise LocalValidationError("RESPONSE_ROOT_NOT_OBJECT", "/")
             cues = parse_inference_items(parsed, atoms, load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"), load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"])
             usage = normalise_usage(response)
             charged = realtime_usage_cost(usage, policy)
@@ -1247,16 +1300,28 @@ def execute_realtime_package(
                 "ledger_sha256": sha256_file(files["ledger"]), "state_sha256": sha256_file(state_path), "completed_at": utc_now(),
             })
             return "validated_success", charged, event
-        except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+        except LocalValidationError as error:
             # 本地验证失败不等于服务端未计费：若 usage 完整，仍须写入共同预算账本，然后
             # 立即隔离并停止，不能把一次已发生调用误报为零成本。
             usage = normalise_usage(response)
             charged = realtime_usage_cost(usage, policy) if all(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens")) else 0.0
             if budget_tracker is not None:
                 budget_tracker.record_charge(charged)
-            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, usage, "local_validation")
-            atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "raw_response_saved": False})
-            atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts})
+            diagnostic = {"code": error.code, "path": error.path}
+            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, usage, "local_validation", local_validation_failure=diagnostic)
+            atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "local_validation_failure": diagnostic, "raw_response_saved": False})
+            atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts, "local_validation_failure": diagnostic})
+            return "local_validation_quarantine", charged, event
+        except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+            # 这条防线覆盖代码/合同内部异常：仍不回显异常文字，避免将未预期对象内容带入账本。
+            usage = normalise_usage(response)
+            charged = realtime_usage_cost(usage, policy) if all(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens")) else 0.0
+            if budget_tracker is not None:
+                budget_tracker.record_charge(charged)
+            diagnostic = {"code": "LOCAL_VALIDATION_UNCLASSIFIED", "path": "/"}
+            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, usage, "local_validation", local_validation_failure=diagnostic)
+            atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "local_validation_failure": diagnostic, "raw_response_saved": False})
+            atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts, "local_validation_failure": diagnostic})
             return "local_validation_quarantine", charged, event
     raise AssertionError("实时重试循环未终结")
 
