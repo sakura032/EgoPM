@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""第 05 阶段：为冻结 Source Atom 构建 v2.2 Batch File 的无 API 计划。
+"""第 05 阶段：为冻结 Source Atom 构建 v3 实时 Cue 的无 API 计划与可恢复执行器。
 
-职责：验证冻结 Source、紧凑提示词和 Schema，并只在内存中生成五条 Atom package、Batch
-任务元数据与费用预检。输入是 Source SUCCESS、Source Atom、模型配置、提示词和 Schema；
-输出是只读预检报告，或在用户显式授权的生产入口中写入已验证 Cue 片段、无正文账本和收据。
-它位于 Source QA 后、Cue QA 前；默认模式绝不联网，正式 Cue 合并与 SUCCESS 仍由后续 QA 门控制。
+职责：验证冻结 Source、紧凑提示词和 Schema，并按最多五条 Atom 构造独立实时 package、
+限流/重试/预算熔断状态和无正文账本。输入是 Source SUCCESS、Source Atom、模型配置、
+提示词和 Schema；输出是只读预检报告，或在未来显式授权入口中写入验证后的 Cue 片段。
+它位于 Source QA 后、Cue QA 前；默认模式绝不联网，绝不读取密钥，且禁止复用已取消 Batch。
 """
 
 from __future__ import annotations
@@ -36,6 +36,94 @@ CUE_SCHEMA_VERSION = "v1.0.0"
 
 class ContractError(RuntimeError):
     """冻结合同、输入血缘、响应结构或恢复边界不一致。"""
+
+
+@dataclass(frozen=True)
+class RealtimePolicy:
+    """实时传输的冻结参数；它与已取消的 Batch 协议绝不共享状态目录。"""
+
+    request_endpoint: str
+    maximum_in_flight: int
+    requests_per_minute: int
+    tokens_per_minute: int
+    request_timeout_seconds: int
+    transient_http_statuses: frozenset[int]
+    retry_backoff_initial_seconds: int
+    retry_backoff_max_seconds: int
+    authorization_version: str
+    maximum_local_validation_quarantine: int
+    input_price_cny_per_million_tokens: float
+    output_price_cny_per_million_tokens: float
+
+
+def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]:
+    """读取 T0 冻结的实时协议；缺少独立实时字段时禁止降级复用 Batch 合同。
+
+    输入是模型注册表；输出是共享的紧凑推理参数及实时限流、重试、预算参数。该函数位于
+    第 05 阶段，故只做离线配置门，不读取密钥也不建立网络连接。
+    """
+
+    try:
+        registry = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, yaml.YAMLError) as error:
+        raise ContractError("无法读取模型配置") from error
+    cue = registry.get("models", {}).get("cue_extraction") if isinstance(registry, dict) else None
+    execution = cue.get("execution") if isinstance(cue, dict) else None
+    if not isinstance(execution, dict):
+        raise ContractError("缺少冻结的 cue_extraction.execution")
+    realtime = execution.get("realtime_api_policy")
+    realtime_execution = execution.get("realtime_execution_policy")
+    realtime_ledger = execution.get("realtime_ledger_policy")
+    package = execution.get("package_policy")
+    compact = execution.get("compact_inference_policy")
+    pricing = execution.get("pricing_snapshot")
+    layout = execution.get("shard_layout")
+    required_groups = (realtime, realtime_execution, realtime_ledger, package, compact, pricing, layout)
+    if not all(isinstance(group, dict) for group in required_groups):
+        raise ContractError("实时执行缺少独立 policy、账本、价格、分片或紧凑推理配置")
+    if execution.get("mode") != "explicit_realtime_execute_only" or execution.get("transport") != "realtime_chat_completions":
+        raise ContractError("当前配置不是冻结的独立实时执行协议")
+    if cue.get("model_id") != "qwen3.7-flash" or cue.get("thinking_enabled") is not False or cue.get("temperature") != 0:
+        raise ContractError("实时协议必须冻结 qwen3.7-flash、关闭 thinking 且 temperature=0")
+    if package.get("maximum_atoms") != 5 or package.get("output_tokens_per_atom") != 96:
+        raise ContractError("实时协议必须保留最多五条 Atom 与每 Atom 96 token 输出上限")
+    if execution.get("max_retries") != 2:
+        raise ContractError("实时协议最大重试次数必须冻结为 2")
+    if not isinstance(realtime.get("retryable_http_statuses"), list) or not all(isinstance(v, int) for v in realtime["retryable_http_statuses"]):
+        raise ContractError("实时临时失败 HTTP 状态码配置无效")
+    for name in ("maximum_in_flight", "requests_per_minute", "tokens_per_minute", "request_timeout_seconds", "retry_backoff_initial_seconds", "retry_backoff_max_seconds"):
+        if not isinstance(realtime.get(name), int) or realtime[name] <= 0:
+            raise ContractError(f"实时限流字段无效：{name}")
+    for name in ("input_price_cny_per_million_tokens", "output_price_cny_per_million_tokens"):
+        if not isinstance(pricing.get(name), (int, float)) or isinstance(pricing[name], bool) or pricing[name] < 0:
+            raise ContractError(f"实时价格字段无效：{name}")
+
+    # 借用现有 Settings 是为了让紧凑提示词、展开与 Schema 验证只有一套实现；实时路径
+    # 不会读取 batch_file_policy 或 batch_ledger_policy，也不会生成 batch_custom_id。
+    settings = Settings(
+        endpoint=str(registry["default_endpoint"]).rstrip("/"), region=str(registry["default_region"]),
+        model_id=str(cue["model_id"]), thinking_enabled=False, reasoning_effort=str(cue.get("reasoning_effort", "none")),
+        temperature=0, prompt_version=str(cue["prompt_version"]), final_cue_schema=str(cue["schema"]),
+        final_cue_schema_version=str(cue["schema_version"]), shard_size=int(execution["shard_size_atoms"]),
+        maximum_atoms=int(package["maximum_atoms"]), maximum_request_utf8_bytes=int(package["maximum_request_utf8_bytes"]),
+        output_tokens_per_atom=int(package["output_tokens_per_atom"]), max_retries=int(execution["max_retries"]),
+        layout=dict(layout), input_price_cny_per_million_tokens=float(pricing["input_price_cny_per_million_tokens"]),
+        output_price_cny_per_million_tokens=float(pricing["output_price_cny_per_million_tokens"]), execution=execution,
+        protocol_context={"payload_version": execution.get("protocol_hash_payload_version"), "transport": "realtime_chat_completions"},
+        batch_file_policy={}, compact_policy=dict(compact), batch_ledger_policy=dict(realtime_ledger),
+    )
+    return settings, RealtimePolicy(
+        request_endpoint=str(realtime.get("request_endpoint", "/chat/completions")),
+        maximum_in_flight=int(realtime["maximum_in_flight"]), requests_per_minute=int(realtime["requests_per_minute"]),
+        tokens_per_minute=int(realtime["tokens_per_minute"]), request_timeout_seconds=int(realtime["request_timeout_seconds"]),
+        transient_http_statuses=frozenset(realtime["retryable_http_statuses"]),
+        retry_backoff_initial_seconds=int(realtime["retry_backoff_initial_seconds"]),
+        retry_backoff_max_seconds=int(realtime["retry_backoff_max_seconds"]),
+        authorization_version=str(realtime_execution.get("authorization_version", "")),
+        maximum_local_validation_quarantine=int(realtime_execution["max_local_validation_quarantine_per_run"]),
+        input_price_cny_per_million_tokens=float(pricing["input_price_cny_per_million_tokens"]),
+        output_price_cny_per_million_tokens=float(pricing["output_price_cny_per_million_tokens"]),
+    )
 
 
 @dataclass(frozen=True)
@@ -239,6 +327,10 @@ def settings_from_registry(path: Path) -> Settings:
     if not isinstance(cue, dict) or not isinstance(cue.get("execution"), dict):
         raise ContractError("缺少冻结的 cue_extraction.execution")
     execution = cue["execution"]
+    # v3 起实时协议是唯一生产路径。保留旧 Batch 辅助函数仅为读取历史收据；任何新调用
+    # 都必须从独立实时配置得到 Settings，避免把已取消 Batch 的状态重新解释为可恢复工作。
+    if execution.get("mode") == "explicit_realtime_execute_only":
+        return realtime_policy_from_registry(path)[0]
     package = execution.get("package_policy")
     pricing = execution.get("pricing_snapshot")
     layout = execution.get("shard_layout")
@@ -819,6 +911,276 @@ def normalise_usage(response: dict[str, Any]) -> dict[str, int | None]:
     return values if values["prompt_tokens"] + values["completion_tokens"] == values["total_tokens"] else empty
 
 
+class RealtimeTransport:
+    """实时 Chat Completions 最小传输器；仅显式执行入口可实例化并读取环境密钥。
+
+    输入是已构造的紧凑请求；输出是内存中的单次 JSON 响应。它不写原始响应，也不提供
+    Batch 上传、轮询或下载方法，以物理隔离取消的 Batch 运行与新的实时运行。
+    """
+
+    def __init__(self, endpoint: str, api_key: str, open_call: Callable[..., Any] = urlrequest.urlopen) -> None:
+        self.endpoint = endpoint.rstrip("/")
+        self.api_key = api_key
+        self._open = open_call
+
+    def complete(self, body: dict[str, Any], policy: RealtimePolicy) -> dict[str, Any]:
+        """发出一条实时请求并只返回内存对象；HTTP 正文不会落盘。"""
+
+        encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        request = urlrequest.Request(
+            f"{self.endpoint}{policy.request_endpoint}", data=encoded, method="POST",
+            headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+        )
+        try:
+            with self._open(request, timeout=policy.request_timeout_seconds) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urlerror.HTTPError as error:
+            # 仅返回状态码类别；禁止把可能含原文的服务端错误正文写入账本或异常消息。
+            raise RealtimeServiceError(error.code, error.code in policy.transient_http_statuses) from error
+        except (urlerror.URLError, TimeoutError, OSError) as error:
+            raise RealtimeServiceError(None, True) from error
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise RealtimeServiceError(None, False) from error
+        if not isinstance(payload, dict):
+            raise RealtimeServiceError(None, False)
+        return payload
+
+
+class RealtimeServiceError(RuntimeError):
+    """无正文实时服务错误；仅携带能决定安全重试的状态类别。"""
+
+    def __init__(self, status_code: int | None, retryable: bool) -> None:
+        super().__init__("实时服务请求失败")
+        self.status_code = status_code
+        self.retryable = retryable
+
+
+class TokenBucket:
+    """可注入时钟的双令牌桶，确保 RPM 与 TPM 均在客户端受控。
+
+    每次取得配额前按单调时钟补充令牌；测试可传入假时钟/睡眠函数，生产中才使用真实等待。
+    """
+
+    def __init__(self, capacity: int, window_seconds: float = 60.0, clock: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> None:
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.window_seconds = window_seconds
+        self.clock = clock
+        self.sleep = sleep
+        self.updated_at = clock()
+
+    def acquire(self, amount: int) -> None:
+        """阻塞至足够配额；单次超容量说明冻结单包上界和限流配置不兼容。"""
+
+        if amount <= 0 or amount > self.capacity:
+            raise ContractError("令牌请求超出冻结桶容量")
+        while True:
+            now = self.clock()
+            self.tokens = min(self.capacity, self.tokens + (now - self.updated_at) * self.capacity / self.window_seconds)
+            self.updated_at = now
+            if self.tokens >= amount:
+                self.tokens -= amount
+                return
+            self.sleep((amount - self.tokens) * self.window_seconds / self.capacity)
+
+
+def realtime_package_state_path(run_root: Path, manifest: dict[str, Any]) -> Path:
+    """为实时包返回独立状态文件，路径不得落入 `cues/batch`。"""
+
+    if run_root.name == "batch" or "batch" in run_root.parts:
+        raise ContractError("实时执行根目录不得复用或读取 Batch 状态目录")
+    return run_root / "packages" / str(manifest["package_id"]) / "realtime_state.json"
+
+
+def realtime_protocol_hash(settings: Settings, prompt_path: Path, inference_schema_path: Path) -> str:
+    """以 transport 纳入哈希，阻断任何 Batch 清单、授权或完成标记被实时路径接纳。"""
+
+    return canonical_sha256({
+        **settings.protocol_context, "execution": settings.execution, "cue_prompt_sha256": sha256_file(prompt_path),
+        "cue_inference_schema_sha256": sha256_file(inference_schema_path), "transport": "realtime_chat_completions",
+    })
+
+
+def realtime_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
+    """把共享包清单投影为实时身份，移除全部 Batch 字段以防混用。"""
+
+    forbidden = {"batch_task_index", "batch_custom_id", "batch_input_sha256", "remote_file_id"}
+    if forbidden.intersection(manifest):
+        # `package_manifest` 历史上包含 batch_task_index；实时运行必须新建清单而非悄悄
+        # 清洗旧 Batch 执行状态，故调用方要使用此函数生成新的独立 identity。
+        manifest = {key: value for key, value in manifest.items() if key not in forbidden}
+    value = {**manifest, "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"]}
+    value["realtime_request_id"] = f"rt_{value['package_id']}_{canonical_sha256(value)[:10]}"
+    value["request_sha256"] = canonical_sha256({"package_id": value["package_id"], "atoms": value["atoms"], "transport": value["transport"]})
+    return value
+
+
+def realtime_usage_cost(usage: dict[str, int | None], policy: RealtimePolicy) -> float:
+    """按服务端 usage 计算累计费用；缺 usage 时不假装免费，执行器立即熔断。"""
+
+    prompt_tokens, completion_tokens = usage.get("prompt_tokens"), usage.get("completion_tokens")
+    if not isinstance(prompt_tokens, int) or not isinstance(completion_tokens, int):
+        raise ContractError("实时成功响应缺少可核对的 usage；为避免预算失真停止执行")
+    return prompt_tokens / 1_000_000 * policy.input_price_cny_per_million_tokens + completion_tokens / 1_000_000 * policy.output_price_cny_per_million_tokens
+
+
+def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: int, usage: dict[str, int | None], failure_class: str | None = None) -> dict[str, Any]:
+    """生成实时无正文账本；逐请求记录 usage、重试和终态。"""
+
+    return {
+        "run_id": manifest["run_id"], "realtime_shard_index": manifest["shard_index"], "package_id": manifest["package_id"], "realtime_request_id": manifest["realtime_request_id"],
+        "transport": "realtime_chat_completions", "input_atom_ids": [row["atom_id"] for row in manifest["atoms"]],
+        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+        "request_time": utc_now(), "request_sha256": manifest["request_sha256"], "outcome": outcome, "attempt": retry_count + 1, "retry_count": retry_count, "usage": usage,
+        "retry_eligible": outcome == "service_transport_exhausted", "failure_origin": failure_class, "raw_response_saved": False, "raw_response_path": None,
+    }
+
+
+def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
+    """拒绝缺失身份、使用量或混入 Batch 字段的实时账本行。"""
+
+    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "realtime_request_id", "transport", "raw_response_saved"}
+    if not required.issubset(event) or event.get("transport") != "realtime_chat_completions":
+        raise ContractError("实时账本缺少冻结字段或传输标识不符")
+    if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
+        raise ContractError("实时账本不得混入 Batch 身份字段")
+    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"}:
+        raise ContractError("实时账本具有未知终态")
+
+
+def execute_realtime_package(
+    manifest: dict[str, Any], atoms_by_id: dict[str, dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings,
+    policy: RealtimePolicy, transport: RealtimeTransport, run_root: Path, budget_remaining_cny: float,
+    request_bucket: TokenBucket, token_bucket: TokenBucket,
+) -> tuple[str, float, dict[str, Any]]:
+    """执行一个实时包并安全终结；成功、服务失败、隔离与预算熔断互斥。
+
+    每次网络尝试前写入无正文状态；服务端临时故障最多重试两次，本地合同失败一律隔离。
+    返回终态、实际核算费用及无正文账本行，调用方负责跨包累计和原子保存。
+    """
+
+    if manifest.get("transport") != "realtime_chat_completions":
+        raise ContractError("实时执行只能接收独立实时清单")
+    state_path = realtime_package_state_path(run_root, manifest)
+    files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
+    if is_complete(manifest, files):
+        return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
+    atoms = [atoms_by_id[item["atom_id"]] for item in manifest["atoms"]]
+    body = build_request(prompt, schema, atoms, settings)
+    token_reservation = settings.output_tokens_per_atom * len(atoms) + max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
+    if token_reservation > policy.tokens_per_minute:
+        raise ContractError("单包 token 上界超过实时 TPM；需 T0 重新冻结限流或包大小")
+    attempts = 0
+    while attempts <= settings.max_retries:
+        request_bucket.acquire(1)
+        token_bucket.acquire(token_reservation)
+        atomic_write_json(state_path, {
+            "run_id": manifest["run_id"], "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"], "package_id": manifest["package_id"], "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+            "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+            "attempt": attempts + 1, "retry_count": attempts, "status": "requesting", "request_body_saved": False,
+        })
+        try:
+            response = transport.complete(body, policy)
+        except RealtimeServiceError as error:
+            attempts += 1
+            if error.retryable and attempts <= settings.max_retries:
+                continue
+            event = realtime_ledger_event(manifest, "service_transport_exhausted", attempts, normalise_usage({}), "transient_service" if error.retryable else "permanent_service")
+            atomic_write_json(state_path, {**read_json(state_path), "status": "service_transport_exhausted", "retry_count": attempts})
+            return "service_transport_exhausted", 0.0, event
+        try:
+            content = response.get("choices", [{}])[0].get("message", {}).get("content")
+            parsed = json.loads(content) if isinstance(content, str) else None
+            if not isinstance(parsed, dict):
+                raise ContractError("实时响应正文不是对象")
+            cues = parse_inference_items(parsed, atoms, load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"), load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"])
+            usage = normalise_usage(response)
+            charged = realtime_usage_cost(usage, policy)
+            if charged > budget_remaining_cny:
+                event = realtime_ledger_event(manifest, "budget_stopped", attempts, usage, "post_response_budget_exceeded")
+                atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts})
+                return "budget_stopped", charged, event
+            event = realtime_ledger_event(manifest, "validated_success", attempts, usage)
+            # 只有完整的本地验证通过才写结果；严格原子顺序令恢复时不会将半个 package 视为完成。
+            atomic_write_jsonl(files["manifest"], [manifest])
+            atomic_write_jsonl(files["result"], cues)
+            atomic_write_jsonl(files["ledger"], [event])
+            atomic_write_json(state_path, {**read_json(state_path), "status": "validated_success", "retry_count": attempts})
+            atomic_write_json(files["complete"], {
+                "run_id": manifest["run_id"], "package_id": manifest["package_id"], "transport": "realtime_chat_completions",
+                "realtime_shard_index": manifest["realtime_shard_index"], "request_sha256": manifest["request_sha256"], "status": "validated_success",
+                "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+                "input_manifest_sha256": sha256_file(files["manifest"]), "result_sha256": sha256_file(files["result"]),
+                "ledger_sha256": sha256_file(files["ledger"]), "state_sha256": sha256_file(state_path), "completed_at": utc_now(),
+            })
+            return "validated_success", charged, event
+        except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
+            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, normalise_usage(response), "local_validation")
+            atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "raw_response_saved": False})
+            atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts})
+            return "local_validation_quarantine", 0.0, event
+    raise AssertionError("实时重试循环未终结")
+
+
+def realtime_preflight_report(source_path: Path, source_validator: jsonschema.Draft202012Validator, source_sha256: str, prompt: str, schema: dict[str, Any], settings: Settings, policy: RealtimePolicy, protocol_sha256: str) -> dict[str, Any]:
+    """流式核算实时包数量、RPM/TPM 保护线和单次预算上界，且不写任何执行状态。"""
+
+    atom_count = package_count = output_tokens = input_token_proxy = 0
+    candidate: list[dict[str, Any]] = []
+    previous: str | None = None
+    for atom in iter_jsonl(source_path):
+        validate_record(source_validator, atom, "Source Atom")
+        atom_id = atom.get("atom_id")
+        if not isinstance(atom_id, str) or not atom_id or (previous is not None and atom_id <= previous):
+            raise ContractError("实时预检要求 Source Atom 的 atom_id 严格升序")
+        previous = atom_id
+        next_candidate = candidate + [atom]
+        if len(next_candidate) <= settings.maximum_atoms and request_utf8_bytes(prompt, schema, next_candidate, settings) <= settings.maximum_request_utf8_bytes:
+            candidate = next_candidate
+        else:
+            if not candidate:
+                raise ContractError("单条 Atom 超过实时请求 UTF-8 保护线")
+            body = build_request(prompt, schema, candidate, settings)
+            input_token_proxy += max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
+            output_tokens += settings.output_tokens_per_atom * len(candidate)
+            package_count += 1
+            candidate = [atom]
+        atom_count += 1
+    if candidate:
+        body = build_request(prompt, schema, candidate, settings)
+        input_token_proxy += max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
+        output_tokens += settings.output_tokens_per_atom * len(candidate)
+        package_count += 1
+    if not atom_count:
+        raise ContractError("Source Atom 不能为空")
+    return {
+        "mode": "realtime_preflight_no_api", "network_called": False, "credentials_read": False, "formal_outputs_written": False,
+        "transport": "realtime_chat_completions", "atom_count": atom_count, "package_count": package_count,
+        "logical_shard_count": (atom_count + settings.shard_size - 1) // settings.shard_size,
+        "maximum_atoms_per_package": settings.maximum_atoms, "requests_per_minute": policy.requests_per_minute,
+        "tokens_per_minute": policy.tokens_per_minute, "input_tokens_upper_bound_proxy": input_token_proxy,
+        "output_tokens_upper_bound": output_tokens, "cue_execution_protocol_sha256": protocol_sha256,
+        "cny_upper_bound": input_token_proxy / 1_000_000 * policy.input_price_cny_per_million_tokens + output_tokens / 1_000_000 * policy.output_price_cny_per_million_tokens,
+        "recovery": "仅跳过 SHA 完整的实时 package；服务端临时失败最多重试 2 次；本地验证失败隔离且不自动重试。",
+    }
+
+
+def realtime_shards_manifest(run_id: str, manifests: list[dict[str, Any]], run_root: Path, settings: Settings) -> dict[str, Any]:
+    """生成全局实时分片清单；只登记包身份哈希，绝不保存 Atom 正文或请求正文。"""
+
+    if run_root.name == "batch" or "batch" in run_root.parts:
+        raise ContractError("实时全局清单不得写入或复用 Batch 根目录")
+    package_ids = [str(manifest["package_id"]) for manifest in manifests]
+    mapping = {str(manifest["package_id"]): str(manifest["request_sha256"]) for manifest in manifests}
+    value = {
+        "run_id": run_id, "transport": "realtime_chat_completions", "source_atoms_sha256": manifests[0]["source_atoms_sha256"] if manifests else "",
+        "cue_execution_protocol_sha256": manifests[0]["cue_execution_protocol_sha256"] if manifests else "", "package_count": len(manifests),
+        "package_ids_sha256": canonical_sha256(package_ids), "package_id_to_request_sha256": mapping, "status": "planned_no_api",
+    }
+    value["completion_sha256"] = canonical_sha256({key: value[key] for key in value if key != "completion_sha256"})
+    return value
+
+
 def merge_completed_packages(manifests: list[dict[str, Any]], run_root: Path, settings: Settings, output: Path) -> int:
     """按数字 shard/package 顺序合并；任何未完成或失败包都会阻止写最终 Cue JSONL。"""
 
@@ -1376,7 +1738,7 @@ def run(arguments: argparse.Namespace) -> int:
     if arguments.rerun_failed_packages:
         raise ContractError("失败 package 重跑必须在独立授权与 T4 审阅后启用")
 
-    settings = settings_from_registry(arguments.model_registry)
+    settings, realtime_policy = realtime_policy_from_registry(arguments.model_registry)
     marker = verified_source(arguments.source_atoms, arguments.source_success)
     source_validator = load_validator(arguments.source_schema)
     # 即使当前只预检也加载冻结 Schema，确保成本核算不会建立在不存在或替换后的协议之上。
@@ -1386,7 +1748,21 @@ def run(arguments: argparse.Namespace) -> int:
     schema = read_json(arguments.inference_schema)
     # 预检不写可恢复工件，故使用稳定名称即可；正式 run_id 只能在未来获单独授权的执行阶段引入。
     run_id = arguments.run_id or "preflight_no_api"
-    protocol_sha256 = protocol_hash(settings, arguments.prompt, arguments.inference_schema)
+    protocol_sha256 = realtime_protocol_hash(settings, arguments.prompt, arguments.inference_schema)
+    # v3 的唯一生产协议是实时 Chat Completions。旧 Batch 参数保留在 CLI 仅为了明确
+    # 拒绝误操作，不能读取已取消任务、上传输入或接收其输出。
+    if getattr(arguments, "execute", False) or getattr(arguments, "receive", False):
+        raise ContractError("Batch 提交/接收已取消；实时生产只能使用 --realtime-execute 并经独立授权")
+    if getattr(arguments, "realtime_execute", False):
+        if getattr(arguments, "confirmation", "") != "START_REALTIME_CUE_API":
+            raise ContractError("实时生产需要显式 confirmation=START_REALTIME_CUE_API")
+        if getattr(arguments, "authorization", None) is None:
+            raise ContractError("实时生产必须提供重新绑定 v3 协议的本机授权文件")
+        raise ContractError("实时执行入口待 T0/T4 对全局 manifest 与授权账本完成最终审阅；本次未读取密钥或联网")
+    report = realtime_preflight_report(arguments.source_atoms, source_validator, str(marker["sha256"]), prompt, schema, settings, realtime_policy, protocol_sha256)
+    print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+    return 0
+    # 下方为 v2 历史 Batch 接收代码，因上述实时协议门永久不可达。
     if getattr(arguments, "receive", False):
         if getattr(arguments, "confirmation", "") != "RECEIVE_BATCH_RESULTS_API":
             raise ContractError("结果接收需要显式 confirmation=RECEIVE_BATCH_RESULTS_API")
@@ -1452,6 +1828,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--confirmation", default="", help="提交或接收的显式 API 确认短语")
     parser.add_argument("--execute", action="store_true", help="提交首波 Batch；需授权文件和显式 confirmation")
     parser.add_argument("--receive", action="store_true", help="接收已提交 Batch 的结果；需独立确认和授权")
+    parser.add_argument("--realtime-execute", action="store_true", help="实时生产保留入口；必须独立授权与显式 confirmation")
     parser.add_argument("--poll-attempts", type=int, default=1, help="接收命令内的最多轮询次数；默认一次")
     parser.add_argument("--rerun-failed-packages", action="store_true")
     return parser.parse_args(argv)

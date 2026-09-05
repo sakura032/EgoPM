@@ -1,4 +1,31 @@
-# T2 交接：CR-2026-009 的 Cue v2.2 Batch File 无 API 生产者
+# T2 交接：CR-2026-011 的 Cue v3 实时 API 无 API 生产者
+
+## 2026-09-05：实时 API 切换的离线执行准备
+
+本次仅实现和测试实时执行的离线部件；未读取 `DASHSCOPE_API_KEY`、未联网、未调用 API，
+未读取已取消 Batch 的结果，也未写 `cue_library.jsonl`、`CUE_LIBRARY_SUCCESS.json` 或 Seed。
+
+- 读取 T0 冻结的 v3 实时协议：`qwen3.7-flash`、`enable_thinking:false`、`temperature:0`、
+  最多五条 Atom/package、每 Atom `96` 输出 token、最多两次临时服务重试、实时价格
+  `¥0.2/M` 输入和 `¥0.8/M` 输出。
+- `RealtimeTransport` 只在未来显式生产入口中可使用；它不含 Batch 上传、轮询、下载接口，
+  也不保存原始响应。默认命令执行实时预检，`--execute`/`--receive` 对已取消 Batch 一律拒绝。
+- `TokenBucket` 对 RPM 与 TPM 分别节流；每次调用前状态仅记录 package 身份、协议/Source
+  哈希、尝试次数和无正文标识。服务端临时失败最多重试两次；本地验证失败写
+  `local_validation_quarantine`，永不自动重试；实际 usage 缺失或费用越过剩余授权预算则熔断。
+- 实时根只能是 `cues/realtime`。全局 `realtime_shards_manifest.jsonl` 所需对象由
+  `realtime_shards_manifest()` 生成，含 `run_id`、`transport`、Source/协议哈希、package 数、
+  package ID 哈希、`package_id_to_request_sha256` 和 `completion_sha256`；不含请求/响应正文。
+- 每包状态为 `packages/<package_id>/realtime_state.json`，字段含 `run_id`、`transport`、
+  `realtime_shard_index`、`package_id`、Source/协议/请求哈希、`attempt`、`retry_count`、`status`。
+  完成标记含上述身份、`status:validated_success`、结果/账本/状态 SHA256；账本严格包含 T0
+  `realtime_ledger_policy.required_fields`，并包含传输、Source/协议身份与 usage，但不含原始响应。
+- 无 API 测试覆盖配置冻结、令牌桶、临时 `429` 重试、完成包恢复跳过、本地验证隔离、预算熔断、
+  Batch 目录/字段混用拒绝。
+
+待 T0 冻结/审阅项：实时全局 manifest 的正式写入、授权文件 v2.0.0 解析与真正 CLI 执行
+编排尚未开启；因此 `--realtime-execute` 当前会在读取密钥和联网前明确阻断。待 T4 对上述
+产物字段独立 QA、T0 合并授权/执行账本门后，才可实现并授权真正实时调用。
 
 ## 2026-09-05：Batch 结果接收闭环补充
 
