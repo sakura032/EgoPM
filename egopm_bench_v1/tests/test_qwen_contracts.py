@@ -285,7 +285,7 @@ def test_default_preflight_is_read_only_and_execute_is_blocked(tmp_path: Path, m
     with pytest.raises(module.ContractError, match="项目目录内"):
         module.managed_relative_path(tmp_path.parent / "outside" / "cue_library.jsonl")
 
-    with pytest.raises(module.ContractError, match="仅允许无 API 预检"):
+    with pytest.raises(module.ContractError, match="confirmation"):
         module.run(module.argparse.Namespace(**common, execute=True))
     assert not common["success_marker"].exists()
 

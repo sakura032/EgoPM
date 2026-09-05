@@ -413,11 +413,12 @@ def package_manifest(atoms: list[dict[str, Any]], source_sha256: str, protocol_s
     return manifest
 
 
-def build_packages(atoms: list[dict[str, Any]], source_sha256: str, prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str, run_id: str) -> list[dict[str, Any]]:
+def build_packages(atoms: list[dict[str, Any]], source_sha256: str, prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str, run_id: str, shard_offset: int = 0) -> list[dict[str, Any]]:
     """每 500 Atom 一个逻辑 shard，再以五条/24K 双门限稳定贪心分 package。"""
 
     manifests: list[dict[str, Any]] = []
-    for shard_index, start in enumerate(range(0, len(atoms), settings.shard_size)):
+    for local_shard_index, start in enumerate(range(0, len(atoms), settings.shard_size)):
+        shard_index = local_shard_index + shard_offset
         current: list[dict[str, Any]] = []
         package_index = 0
         for atom in atoms[start : start + settings.shard_size]:
@@ -933,6 +934,116 @@ def execution_readiness_report(
     }
 
 
+def materialize_task_from_source(
+    source_path: Path,
+    source_validator: jsonschema.Draft202012Validator,
+    source_sha256: str,
+    task_index: int,
+    prompt: str,
+    schema: dict[str, Any],
+    settings: Settings,
+    protocol_sha256: str,
+    run_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """只 materialize 一个已授权 task 的 Atom 与请求行，避免全量 Source 常驻内存。"""
+
+    per_task = int(settings.batch_file_policy["logical_shards_per_task"])
+    first_shard = task_index * per_task
+    last_shard = first_shard + per_task - 1
+    atoms: list[dict[str, Any]] = []
+    previous_id: str | None = None
+    for position, atom in enumerate(iter_jsonl(source_path)):
+        validate_record(source_validator, atom, "Source Atom")
+        atom_id = atom.get("atom_id")
+        if not isinstance(atom_id, str) or (previous_id is not None and atom_id <= previous_id):
+            raise ContractError("Source Atom 顺序或 atom_id 不符合冻结合同")
+        previous_id = atom_id
+        shard_index = position // settings.shard_size
+        if first_shard <= shard_index <= last_shard:
+            atoms.append(atom)
+        elif shard_index > last_shard:
+            break
+    if not atoms:
+        raise ContractError("授权 task 未找到对应的 Source Atom")
+    manifests = build_packages(atoms, source_sha256, prompt, schema, settings, protocol_sha256, run_id, shard_offset=first_shard)
+    atom_by_id = {atom["atom_id"]: atom for atom in atoms}
+    tasks = build_batch_tasks(manifests, atom_by_id, prompt, schema, settings)
+    expected = next((task for task in tasks if task["batch_task_index"] == task_index), None)
+    if expected is None:
+        raise ContractError("无法构造授权 task 的 Batch 请求")
+    return manifests, {line["custom_id"]: line for line in expected["request_lines"]}
+
+
+def write_batch_input_temp(path: Path, request_lines: Iterable[dict[str, Any]]) -> str:
+    """以临时文件写入 JSONL 并返回 SHA256；调用方必须在上传后删除该明文文件。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    digest = hashlib.sha256()
+    with temporary.open("wb") as handle:
+        for line in request_lines:
+            encoded = (json.dumps(line, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            handle.write(encoded)
+            digest.update(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    return digest.hexdigest()
+
+
+def submit_authorized_wave(
+    arguments: argparse.Namespace,
+    settings: Settings,
+    marker: dict[str, Any],
+    source_validator: jsonschema.Draft202012Validator,
+    prompt: str,
+    schema: dict[str, Any],
+    protocol_sha256: str,
+    authorization: dict[str, Any],
+) -> dict[str, Any]:
+    """提交已授权波次的 Batch task；不下载结果、不写 Cue，返回无正文远端句柄。"""
+
+    if arguments.wave_index != 1:
+        raise ContractError("当前首个受控 API 入口仅允许先提交第 1 波")
+    api_key_name = "DASHSCOPE_API_KEY"
+    api_key = os.environ.get(api_key_name)
+    if not api_key:
+        raise ContractError(f"缺少环境变量 {api_key_name}；未发出请求")
+    run_id = arguments.run_id or f"wave_{arguments.wave_index:02d}"
+    manifests, request_by_id = materialize_task_from_source(
+        arguments.source_atoms, source_validator, str(marker["sha256"]), 0, prompt, schema, settings, protocol_sha256, run_id
+    )
+    line_list = list(request_by_id.values())
+    estimated_cost = sum(len(json.dumps(line, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1 for line in line_list) / 1_000_000 * settings.input_price_cny_per_million_tokens
+    estimated_cost += sum(len(manifest["atoms"]) for manifest in manifests) * settings.output_tokens_per_atom / 1_000_000 * settings.output_price_cny_per_million_tokens
+    load_execution_authorization(arguments.authorization, settings, str(marker["sha256"]), protocol_sha256, 1, estimated_cost)
+    run_root = arguments.run_root / f"wave_{arguments.wave_index:02d}"
+    input_path = run_root / "task_000.batch.jsonl"
+    input_sha = write_batch_input_temp(input_path, line_list)
+    try:
+        transport = BatchFileTransport(settings.endpoint, api_key)
+        remote_file_id = transport.upload_input_file(input_path)
+        created = transport.create_batch(remote_file_id, settings, {
+            "run_id": run_id, "batch_task_index": "0", "source_atoms_sha256": str(marker["sha256"]),
+            "cue_execution_protocol_sha256": protocol_sha256, "batch_input_sha256": input_sha,
+        })
+    finally:
+        # 输入包含 Source 文本，上传结束（成功或失败）都必须删除本地明文。
+        if input_path.exists():
+            input_path.unlink()
+    batch_id = created.get("id") if isinstance(created, dict) else None
+    if not isinstance(batch_id, str) or not batch_id:
+        raise ContractError("Batch 创建未返回 batch_id")
+    state = {
+        "run_id": run_id, "wave_index": 1, "batch_task_index": 0, "batch_id": batch_id,
+        "remote_file_id": remote_file_id, "batch_input_sha256": input_sha,
+        "source_atoms_sha256": marker["sha256"], "cue_execution_protocol_sha256": protocol_sha256,
+        "request_count": len(line_list), "status": "submitted", "remote_cleanup_status": "pending_t4_cue_qa",
+    }
+    atomic_write_json(run_root / settings.execution["batch_execution_policy"]["execution_state_filename"], state)
+    return {key: state[key] for key in ("wave_index", "batch_task_index", "batch_id", "remote_file_id", "batch_input_sha256", "request_count", "status")}
+
+
 class BatchFileTransport:
     """第 05 阶段的最小 Batch File HTTP 适配器；仅在显式生产命令中持有环境变量密钥。"""
 
@@ -1036,8 +1147,8 @@ class BatchFileTransport:
 def run(arguments: argparse.Namespace) -> int:
     """装配第 05 阶段；默认预检或只读执行就绪核验均不得调用网络。"""
 
-    if arguments.execute or arguments.rerun_failed_packages:
-        raise ContractError("v2.2 当前仅允许无 API 预检；禁止创建 Batch、上传文件、下载结果或写正式 Cue")
+    if arguments.rerun_failed_packages:
+        raise ContractError("失败 package 重跑必须在独立授权与 T4 审阅后启用")
 
     settings = settings_from_registry(arguments.model_registry)
     marker = verified_source(arguments.source_atoms, arguments.source_success)
@@ -1050,6 +1161,20 @@ def run(arguments: argparse.Namespace) -> int:
     # 预检不写可恢复工件，故使用稳定名称即可；正式 run_id 只能在未来获单独授权的执行阶段引入。
     run_id = arguments.run_id or "preflight_no_api"
     protocol_sha256 = protocol_hash(settings, arguments.prompt, arguments.inference_schema)
+    if arguments.execute:
+        if getattr(arguments, "confirmation", "") != "START_WAVE_1_API":
+            raise ContractError("生产调用需要显式 confirmation=START_WAVE_1_API")
+        if getattr(arguments, "authorization", None) is None:
+            raise ContractError("生产调用必须提供本机执行授权文件")
+        report = streaming_preflight_report(
+            arguments.source_atoms, source_validator, str(marker["sha256"]), prompt, schema, settings, protocol_sha256, arguments.run_id or "wave_01"
+        )
+        result = submit_authorized_wave(arguments, settings, marker, source_validator, prompt, schema, protocol_sha256, load_execution_authorization(
+            arguments.authorization, settings, str(marker["sha256"]), protocol_sha256, arguments.wave_index,
+            execution_readiness_report(report, settings, str(marker["sha256"]), arguments.wave_index, arguments.authorization)["wave_cny_upper_bound_proxy"],
+        ))
+        print(json.dumps({"mode": "batch_wave_submitted", "network_called": True, **result}, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     report = streaming_preflight_report(
         arguments.source_atoms,
         source_validator,
@@ -1088,7 +1213,8 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--authorization", type=Path, help="本机未提交的执行授权 JSON")
     parser.add_argument("--wave-index", type=int, default=1, help="八波计划中的目标波次（1--8）")
     parser.add_argument("--validate-execution-plan", action="store_true", help="只校验授权、波次和预算，绝不联网")
-    parser.add_argument("--execute", action="store_true", help="生产调用仍须用户明确下达开始 API 的指令")
+    parser.add_argument("--confirmation", default="", help="必须精确为 START_WAVE_1_API 才允许提交首波")
+    parser.add_argument("--execute", action="store_true", help="提交首波 Batch；需授权文件和显式 confirmation")
     parser.add_argument("--rerun-failed-packages", action="store_true")
     return parser.parse_args(argv)
 
