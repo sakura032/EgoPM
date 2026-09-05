@@ -338,6 +338,53 @@ def test_eight_wave_authorization_requires_budget_hash_and_retention_consent(tmp
         module.execution_readiness_report(report, settings, "source", 1, authorization)
 
 
+def test_batch_transport_uses_fake_http_and_never_persists_remote_text(tmp_path: Path) -> None:
+    """传输适配器以假 HTTP 验证上传、建任务、轮询和流式读取，不连接真实千问。"""
+
+    module = load_script()
+
+    class FakeResponse:
+        def __init__(self, payload: bytes) -> None:
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self) -> bytes:
+            return self.payload
+
+        def __iter__(self):
+            return iter(self.payload.splitlines(keepends=True))
+
+    seen: list[tuple[str, str]] = []
+
+    def fake_open(request, timeout: int):
+        seen.append((request.method, request.full_url))
+        if request.full_url.endswith("/files"):
+            return FakeResponse(b'{"id":"file_input"}')
+        if request.full_url.endswith("/batches"):
+            return FakeResponse(b'{"id":"batch_1","status":"validating"}')
+        if request.full_url.endswith("/batches/batch_1"):
+            return FakeResponse(b'{"id":"batch_1","status":"completed","output_file_id":"file_output"}')
+        if request.full_url.endswith("/files/file_output/content"):
+            return FakeResponse(b'{"custom_id":"x","response":{"body":{}}}\n')
+        return FakeResponse(b'{"id":"deleted"}')
+
+    transport = module.BatchFileTransport("https://example.invalid/v1", "synthetic-key", fake_open)
+    input_file = tmp_path / "batch.jsonl"
+    input_file.write_text('{"custom_id":"x"}\n', encoding="utf-8")
+    assert transport.upload_input_file(input_file) == "file_input"
+    settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
+    assert transport.create_batch("file_input", settings, {"run_id": "synthetic"})["id"] == "batch_1"
+    assert transport.get_batch("batch_1")["status"] == "completed"
+    assert list(transport.stream_jsonl_file("file_output"))[0]["custom_id"] == "x"
+    transport.delete_file("file_input")
+    assert all("synthetic-key" not in url for _, url in seen)
+
+
 def cue_for(atom: dict[str, Any]) -> dict[str, Any]:
     """构造第 06/07 既有回归使用的合成 accepted Cue。"""
 

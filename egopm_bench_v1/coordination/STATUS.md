@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；v2.2 八波执行合同、授权模板和只读核验已冻结 | 已获教师方案同意，但尚无本机授权文件中的具体总预算、批准人和时间；远端上传/接收实现及其无 API 模拟尚待完成 | 填写未提交授权文件并完成远端执行器/模拟测试后，由用户明确下达开始 API 指令 |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；v2.2 八波合同、授权模板/核验及 Batch 上传、创建、轮询、流式接收、远端删除适配器均已通过 fake HTTP 测试 | 尚无本机授权文件中的具体总预算、批准人和时间；用户尚未明确下达开始 API 指令 | 填写未提交授权文件后，由用户明确批准第 1 波开始联网 |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
@@ -40,3 +40,4 @@
 - `CR-2026-009` 已登记为 v2.2 紧凑推理协议与 96 token/Atom 的无 API 设计：短键/枚举码只存在于模型推理对象，程序仍回填既有最终 Cue Schema。按输入提示词/Schema 体积门与 96 token 输出门的保守设计代理，Batch File 上界为 `¥35.3738941`；这不是实测 token 或生产预算，当前未创建 Schema、代码、Batch 文件或远端任务。
 - `CR-2026-009` 的无 API 实施现已由 T0 审阅完成：协议/短码 Schema 为 `21e01f6`，任务清单与账本终态冻结为 `738b7d9`、`b851583`；T2 生产者为 `c9cc106`、`a47b409`，合同对齐及流式预检修复为 `9378f6c` 与本次审阅提交；T4 独立 QA 为 `28461b7`、`0c47001`。全仓 synthetic 测试为 `46 passed in 2.06s`。冻结 Source 的流式只读预检为 74160 package、742 shard、75 task，最大行 `10943` UTF-8 字节，输入字节代理 `217655725`、输出上界 `35596704` token，按冻结 Batch 价格单次成功请求上界 `¥36.0042541`（输入 `¥21.7655725`、输出 `¥14.2386816`）。预检未读密钥、未联网、未写 Cue/SUCCESS；仅临时报告在 pytest 目录中生成。
 - 教师已同意采用八波方案：`1 + 6×10 + 14 = 75` task。T0 已冻结授权文件版本、波次数量、每波最多一个提交中 task、轮询退避、每波 `0` 个本地验证隔离项上限及 T4 QA 后远端清理门；授权文件必须为本机未提交的 `cues/CUE_EXECUTION_AUTHORIZATION.json`，同时绑定 Source SHA、协议 SHA、预算、波次和数据保留/隔离同意。当前模板刻意为未批准状态，不读取密钥或联网。
+- Batch File 适配器已具备上传临时输入、创建任务、读取状态、流式读取结果/错误 JSONL 与删除远端文件的最小 HTTP 操作，并以 fake HTTP 完成无网络测试；异常只保留 HTTP 状态与无正文摘要。真实调用前仍由授权文件、`--execute` 和用户本轮明确指令三重门控制。

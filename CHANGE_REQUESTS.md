@@ -101,7 +101,8 @@ Source/协议 SHA、远端文本保留至 T4 Cue QA 的同意，以及隔离项�
 
 冻结的执行核验仅计算波次 task 范围和费用代理，明确报告 `network_called=false`、
 `credentials_read=false`、`formal_outputs_written=false`。真实上传、创建、轮询、结果接收和远端删除
-必须另有无 API 模拟测试，并且只在用户再次明确下达开始 API 指令后运行。
+已由标准库 HTTP 适配器及 fake HTTP 覆盖；适配器不将远端 `response`/`error` 写盘。它仍只在用户再次
+明确下达开始 API 指令、存在有效本机授权文件且 `DASHSCOPE_API_KEY` 已设置时运行。
 
 生产时若 v2.2 成功请求在本地解析、短码映射或最终 QA 中失败，必须隔离该 package；禁止自动改回
 128 token、禁止静默回退到 v2.1、禁止自动重发。任何此类处置均须新的用户授权和新的协议/预算决定。

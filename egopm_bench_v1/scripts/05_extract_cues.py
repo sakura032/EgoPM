@@ -14,10 +14,13 @@ import hashlib
 import json
 import os
 import sys
+import uuid
+from urllib import error as urlerror
+from urllib import request as urlrequest
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import jsonschema
 import yaml
@@ -928,6 +931,106 @@ def execution_readiness_report(
         "remote_cleanup_gate": settings.execution["batch_execution_policy"]["remote_cleanup_gate"],
         "max_local_validation_quarantine_per_wave": settings.execution["batch_execution_policy"]["max_local_validation_quarantine_per_wave"],
     }
+
+
+class BatchFileTransport:
+    """第 05 阶段的最小 Batch File HTTP 适配器；仅在显式生产命令中持有环境变量密钥。"""
+
+    def __init__(self, endpoint: str, api_key: str, opener: Callable[..., Any] = urlrequest.urlopen) -> None:
+        """绑定官方兼容端点与短生命周期密钥；禁止将密钥或响应正文写入对象字段。"""
+
+        if not endpoint.startswith("https://") or not api_key:
+            raise ContractError("Batch 传输需要 HTTPS endpoint 与非空环境变量密钥")
+        self.endpoint = endpoint.rstrip("/")
+        self._api_key = api_key
+        self._opener = opener
+
+    def _open(self, method: str, path: str, data: bytes | None, content_type: str | None) -> Any:
+        """发送单次 HTTP 请求；异常仅报告状态，不回显可能含文本的远端错误正文。"""
+
+        headers = {"Authorization": f"Bearer {self._api_key}"}
+        if content_type is not None:
+            headers["Content-Type"] = content_type
+        request = urlrequest.Request(f"{self.endpoint}{path}", data=data, headers=headers, method=method)
+        try:
+            return self._opener(request, timeout=60)
+        except urlerror.HTTPError as error:
+            raise ContractError(f"Batch 远端返回 HTTP {error.code}") from error
+        except urlerror.URLError as error:
+            raise ContractError("Batch 远端连接失败") from error
+
+    def request_json(self, method: str, path: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
+        """调用 JSON API 并仅返回结构化元数据；不得记录响应原文。"""
+
+        data = None if payload is None else json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        with self._open(method, path, data, "application/json" if data is not None else None) as response:
+            try:
+                value = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ContractError("Batch 远端 JSON 元数据不可解析") from error
+        if not isinstance(value, dict):
+            raise ContractError("Batch 远端 JSON 元数据必须为对象")
+        return value
+
+    def upload_input_file(self, path: Path) -> str:
+        """上传临时 Batch JSONL，返回远端 file ID；调用方必须在成功后删除本地明文。"""
+
+        if not path.is_file():
+            raise ContractError("待上传的临时 Batch 输入文件不存在")
+        boundary = f"----EgoPM{uuid.uuid4().hex}"
+        prefix = (
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nbatch\r\n"
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{path.name}\"\r\n"
+            "Content-Type: application/jsonl\r\n\r\n"
+        ).encode("utf-8")
+        suffix = f"\r\n--{boundary}--\r\n".encode("utf-8")
+        # 此处允许短暂读取一个 task 的输入（当前最多约 11 MB）；上传完成后由执行器
+        # 无条件删除临时文件，不能将 Source 文本遗留在可恢复运行目录。
+        payload = prefix + path.read_bytes() + suffix
+        with self._open("POST", "/files", payload, f"multipart/form-data; boundary={boundary}") as response:
+            try:
+                value = json.loads(response.read().decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ContractError("上传 Batch 输入后的元数据不可解析") from error
+        file_id = value.get("id") if isinstance(value, dict) else None
+        if not isinstance(file_id, str) or not file_id:
+            raise ContractError("上传 Batch 输入未返回远端 file ID")
+        return file_id
+
+    def create_batch(self, input_file_id: str, settings: Settings, metadata: dict[str, str]) -> dict[str, Any]:
+        """以冻结端点和 24 小时窗口创建远端任务，元数据仅含哈希与 ID。"""
+
+        return self.request_json("POST", "/batches", {
+            "input_file_id": input_file_id,
+            "endpoint": settings.batch_file_policy["request_endpoint"],
+            "completion_window": settings.batch_file_policy["completion_window"],
+            "metadata": metadata,
+        })
+
+    def get_batch(self, batch_id: str) -> dict[str, Any]:
+        """读取一个远端 Batch 状态；状态正文只在内存中用于状态机判断。"""
+
+        return self.request_json("GET", f"/batches/{batch_id}")
+
+    def stream_jsonl_file(self, file_id: str) -> Iterable[dict[str, Any]]:
+        """流式读取结果或错误 JSONL，不在本地落盘原始 response/error。"""
+
+        with self._open("GET", f"/files/{file_id}/content", None, None) as response:
+            for raw_line in response:
+                if not raw_line.strip():
+                    continue
+                try:
+                    value = json.loads(raw_line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                    raise ContractError("远端 Batch 结果行不可解析") from error
+                if not isinstance(value, dict):
+                    raise ContractError("远端 Batch 结果行必须为对象")
+                yield value
+
+    def delete_file(self, file_id: str) -> None:
+        """删除远端输入、结果或错误文件；仅在 T4 Cue QA 通过后的清理命令调用。"""
+
+        self.request_json("DELETE", f"/files/{file_id}")
 
 
 def run(arguments: argparse.Namespace) -> int:
