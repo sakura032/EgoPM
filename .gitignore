@@ -21,6 +21,7 @@ egopm_bench_v1/logs/model_runs/**
 
 # 每次正式 Batch 运行的审批文件含预算和负责人信息，只留本机且不含密钥。
 egopm_bench_v1/cues/CUE_EXECUTION_AUTHORIZATION.json
+egopm_bench_v1/cues/batch/
 
 # Atomic-production intermediates and local caches
 *.tmp
