@@ -3,7 +3,7 @@
 ## 交接元数据
 
 - 分支：`main`。
-- 本次 T4 接收闭环提交：待 T0 合并后填写；基线 QA 提交为 `28461b7`。
+- 本次 T4 接收闭环提交：`5f18cb6`；基线 QA 提交为 `28461b7`。
 - 治理合同版本：`v1.1.0`。
 - 数据合同版本：Source Atom Schema 为 `v1.1.0`；最终 `cue_candidate` Schema 仍为 `v1.0.0`；Cue 执行协议为 `v2.2.1`，协议哈希 payload 为 `v2.0.0`，模型 ID 为 `qwen3.7-flash`。
 - 修改文件：`scripts/11_validate_all.py`、`tests/test_validators.py`、本交接文件。
