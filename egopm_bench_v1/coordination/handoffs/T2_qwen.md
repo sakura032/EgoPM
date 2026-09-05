@@ -23,9 +23,10 @@
 - 无 API 测试覆盖配置冻结、令牌桶、临时 `429` 重试、完成包恢复跳过、本地验证隔离、预算熔断、
   Batch 目录/字段混用拒绝。
 
-待 T0 冻结/审阅项：实时全局 manifest 的正式写入、授权文件 v2.0.0 解析与真正 CLI 执行
-编排尚未开启；因此 `--realtime-execute` 当前会在读取密钥和联网前明确阻断。待 T4 对上述
-产物字段独立 QA、T0 合并授权/执行账本门后，才可实现并授权真正实时调用。
+`--realtime-execute` 已具备受控编排：先重建冻结 Source、写无正文全局 manifest/run state、
+验证 `authorization_version:v2.0.0` 与 Source/协议哈希、核对输出上界预算，最后才读取环境
+变量 `DASHSCOPE_API_KEY` 并调用实时传输。其默认入口仍只做预检；不得在 T4 独立 QA 和 T0
+明确启动许可前使用执行开关。正式 Cue library 与 SUCCESS 仍不由本命令生成。
 
 ## 2026-09-05：Batch 结果接收闭环补充
 

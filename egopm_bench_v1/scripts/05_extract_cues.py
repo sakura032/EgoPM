@@ -1181,6 +1181,80 @@ def realtime_shards_manifest(run_id: str, manifests: list[dict[str, Any]], run_r
     return value
 
 
+def load_realtime_authorization(path: Path, source_sha256: str, protocol_sha256: str, policy: RealtimePolicy) -> dict[str, Any]:
+    """验证单独的实时授权；旧 Batch 授权版本或协议哈希一律不能启动实时调用。"""
+
+    authorization = read_json(path)
+    required = {"authorization_version", "approved", "approved_by", "approved_at", "maximum_total_cny", "source_atoms_sha256", "cue_execution_protocol_sha256", "accept_quarantine_manual_review_only"}
+    if not required.issubset(authorization) or authorization.get("authorization_version") != policy.authorization_version:
+        raise ContractError("实时授权缺少字段或不是冻结的 v2.0.0 授权版本")
+    if authorization.get("approved") is not True or authorization.get("source_atoms_sha256") != source_sha256 or authorization.get("cue_execution_protocol_sha256") != protocol_sha256:
+        raise ContractError("实时授权未批准或未绑定当前 Source/实时协议")
+    budget = authorization.get("maximum_total_cny")
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget <= 0:
+        raise ContractError("实时授权预算无效")
+    if authorization.get("accept_quarantine_manual_review_only") is not True:
+        raise ContractError("实时授权必须确认本地验证隔离仅人工处理")
+    return authorization
+
+
+def materialize_realtime_run(arguments: argparse.Namespace, settings: Settings, source_validator: jsonschema.Draft202012Validator, source_sha256: str, prompt: str, schema: dict[str, Any], protocol_sha256: str) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """从冻结 Source 重建实时包；仅在显式执行确认后调用，清单不含文本正文。"""
+
+    atoms = []
+    for atom in iter_jsonl(arguments.source_atoms):
+        validate_record(source_validator, atom, "Source Atom")
+        atoms.append(atom)
+    atoms = ordered_atoms(atoms)
+    base = build_packages(atoms, source_sha256, prompt, schema, settings, protocol_sha256, arguments.run_id)
+    return [realtime_manifest(manifest) for manifest in base], {atom["atom_id"]: atom for atom in atoms}
+
+
+def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, policy: RealtimePolicy, marker: dict[str, Any], source_validator: jsonschema.Draft202012Validator, prompt: str, schema: dict[str, Any], protocol_sha256: str) -> dict[str, Any]:
+    """运行经授权的实时 package 序列，逐包持久化状态并在预算/隔离门处立即停止。
+
+    此函数仅由 `--realtime-execute` 调用。先完成所有本地哈希、授权、全局清单及预算预留
+    校验，再读取环境密钥；默认预检路径永远不会到达此处。
+    """
+
+    if arguments.run_root.name == "batch" or "batch" in arguments.run_root.parts:
+        raise ContractError("实时执行必须使用 cues/realtime，禁止复用已取消 Batch 根目录")
+    authorization = load_realtime_authorization(arguments.authorization, str(marker["sha256"]), protocol_sha256, policy)
+    manifests, atoms = materialize_realtime_run(arguments, settings, source_validator, str(marker["sha256"]), prompt, schema, protocol_sha256)
+    preflight = realtime_shards_manifest(arguments.run_id, manifests, arguments.run_root, settings)
+    # 以每包输出上限和输入字节代理预留全额，防止在第一条请求前就超过用户授权上限。
+    predicted = 0.0
+    for manifest in manifests:
+        package_atoms = [atoms[item["atom_id"]] for item in manifest["atoms"]]
+        input_proxy = max(1, request_utf8_bytes(prompt, schema, package_atoms, settings) // 4)
+        output_upper = settings.output_tokens_per_atom * len(package_atoms)
+        predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
+        predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
+    if predicted > float(authorization["maximum_total_cny"]):
+        raise ContractError("实时输出 token 上界已超过授权预算；未读取密钥或联网")
+    atomic_write_json(arguments.run_root / settings.layout["run_state_filename"], {**preflight, "status": "running", "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": 0.0, "raw_response_saved": False})
+    atomic_write_jsonl(arguments.run_root / settings.layout["realtime_shards_manifest"], [preflight])
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise ContractError("缺少环境变量 DASHSCOPE_API_KEY；未发出实时请求")
+    transport = RealtimeTransport(settings.endpoint, api_key)
+    request_bucket, token_bucket = TokenBucket(policy.requests_per_minute), TokenBucket(policy.tokens_per_minute)
+    spent = 0.0
+    outcomes: dict[str, int] = {}
+    for manifest in manifests:
+        status, charged, event = execute_realtime_package(manifest, atoms, prompt, schema, settings, policy, transport, arguments.run_root, float(authorization["maximum_total_cny"]) - spent, request_bucket, token_bucket)
+        if status == "recovered_skip":
+            continue
+        validate_realtime_ledger_event(event)
+        append_ledger_event(arguments.run_root / settings.layout["run_ledger_filename"], event)
+        spent += charged
+        outcomes[status] = outcomes.get(status, 0) + 1
+        atomic_write_json(arguments.run_root / settings.layout["run_state_filename"], {**preflight, "status": status if status != "validated_success" else "running", "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": spent, "outcomes": outcomes, "raw_response_saved": False})
+        if status in {"budget_stopped", "local_validation_quarantine"}:
+            break
+    return {"mode": "realtime_run", "network_called": True, "spent_cny": spent, "outcomes": outcomes, "formal_cue_library_written": False}
+
+
 def merge_completed_packages(manifests: list[dict[str, Any]], run_root: Path, settings: Settings, output: Path) -> int:
     """按数字 shard/package 顺序合并；任何未完成或失败包都会阻止写最终 Cue JSONL。"""
 
@@ -1758,7 +1832,9 @@ def run(arguments: argparse.Namespace) -> int:
             raise ContractError("实时生产需要显式 confirmation=START_REALTIME_CUE_API")
         if getattr(arguments, "authorization", None) is None:
             raise ContractError("实时生产必须提供重新绑定 v3 协议的本机授权文件")
-        raise ContractError("实时执行入口待 T0/T4 对全局 manifest 与授权账本完成最终审阅；本次未读取密钥或联网")
+        result = execute_realtime_run(arguments, settings, realtime_policy, marker, source_validator, prompt, schema, protocol_sha256)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     report = realtime_preflight_report(arguments.source_atoms, source_validator, str(marker["sha256"]), prompt, schema, settings, realtime_policy, protocol_sha256)
     print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
@@ -1818,7 +1894,7 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cue-schema", type=Path, default=ROOT / "schemas/cue_candidate.schema.json")
     parser.add_argument("--inference-schema", type=Path, default=ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     parser.add_argument("--prompt", type=Path, default=ROOT / "prompts/cue_extractor_v3_compact.md")
-    parser.add_argument("--run-root", type=Path, default=ROOT / "cues/batch")
+    parser.add_argument("--run-root", type=Path, default=ROOT / "cues/realtime")
     parser.add_argument("--output", type=Path, default=ROOT / "cues/cue_library.jsonl")
     parser.add_argument("--success-marker", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
     parser.add_argument("--run-id")
