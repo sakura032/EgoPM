@@ -1,6 +1,6 @@
 contract_version: v1.1.0
 config_version: v1.1.0
-registry_version: v1.3.0
+registry_version: v1.4.0
 credential_environment_variable: DASHSCOPE_API_KEY
 credential_policy: environment_only
 raw_response_policy: forbidden
@@ -9,7 +9,8 @@ default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 models:
   cue_extraction:
-    model_id: qwen3.7-flash-2026-07-15
+    # Batch API 当前接受模型族基础别名；日期快照仅在实时接口可用。
+    model_id: qwen3.7-flash
     thinking_enabled: false
     reasoning_effort: none
     temperature: 0
@@ -17,7 +18,7 @@ models:
     schema: cue_candidate.schema.json
     schema_version: v1.0.0
     execution:
-      cue_execution_policy_version: v2.2.0
+      cue_execution_policy_version: v2.2.1
       # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
       protocol_hash_payload_version: v2.0.0
       mode: explicit_batch_file_execute_only

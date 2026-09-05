@@ -248,7 +248,7 @@ def settings_from_registry(path: Path) -> Settings:
         raise ContractError("Cue v2.2 缺少 package、Batch、紧凑码、价格或分片布局配置")
 
     expected_execution = {
-        "cue_execution_policy_version": "v2.2.0",
+        "cue_execution_policy_version": "v2.2.1",
         "protocol_hash_payload_version": "v2.0.0",
         "mode": "explicit_batch_file_execute_only",
         "shard_size_atoms": 500,
@@ -287,7 +287,7 @@ def settings_from_registry(path: Path) -> Settings:
     # 逐项冻结是为了避免“代码默认值”在价格、并发、回填字段或恢复规则变更时继续生产。
     if (
         registry.get("contract_version") != CONTRACT_VERSION or registry.get("config_version") != CONFIG_VERSION
-        or cue.get("model_id") != "qwen3.7-flash-2026-07-15" or cue.get("thinking_enabled") is not False
+        or cue.get("model_id") != "qwen3.7-flash" or cue.get("thinking_enabled") is not False
         or cue.get("reasoning_effort") != "none" or cue.get("temperature") != 0
         or cue.get("prompt_version") != "cue_extractor_v3_compact" or cue.get("schema") != "cue_candidate.schema.json"
         or cue.get("schema_version") != CUE_SCHEMA_VERSION

@@ -107,7 +107,7 @@ def test_v22_request_only_contains_item_index_and_text() -> None:
     assert len((ROOT / "prompts/cue_extractor_v3_compact.md").read_bytes()) <= 450
     request = module.build_request("测试", schema, [source_atom(index) for index in range(1, 6)], settings)
 
-    assert request["model"] == "qwen3.7-flash-2026-07-15"
+    assert request["model"] == "qwen3.7-flash"
     assert request["enable_thinking"] is False
     assert request["max_tokens"] == 480
     user_payload = json.loads(request["messages"][1]["content"])
@@ -401,7 +401,7 @@ def cue_for(atom: dict[str, Any]) -> dict[str, Any]:
         "source_text": atom["visible_text"],
         "confidence": 0.9,
         "ambiguity_reason": None,
-        "model_id": "qwen3.7-flash-2026-07-15",
+        "model_id": "qwen3.7-flash",
         "prompt_version": "cue_extractor_v1",
         "schema_version": "v1.0.0",
         "run_id": "run_fixture",

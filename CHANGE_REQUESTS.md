@@ -3,6 +3,28 @@
 本文件由 T0 维护，用于记录跨角色、跨门禁或需要冻结执行语义的变更。本文件不授权绕过
 任何 `SUCCESS`、哈希、质量验证或用户预算确认门。
 
+## CR-2026-010：Batch API 模型标识兼容性修正
+
+### 状态与决策边界
+
+- 状态：**T0 已批准并落实；旧 Wave 1 输入作废，必须重新绑定授权后才可重提。**
+- 发现：2026-09-05 第 1 波任务 `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 在服务端文件校验阶段失败，错误为
+  `model_not_found`，明确指出 `qwen3.7-flash-2026-07-15` 不受 Batch API 支持；`request_counts.total=0`，因此未发生推理调用。
+- 根因：模型登记沿用了实时接口可用的日期快照 ID，而 Batch API 要求模型族基础别名。
+- 修正：Cue 执行模型从 `qwen3.7-flash-2026-07-15` 改为 Batch 支持的基础别名 `qwen3.7-flash`。这不是更换模型家族，
+  仍为同一 Qwen Flash 能力；仅修正传输接口的合法模型标识。参考 [Batch 推理文档](https://help.aliyun.com/zh/model-studio/batch-inference)。
+- 影响：模型登记版本升为 `v1.4.0`，Cue 执行协议升为 `v2.2.1`，协议 SHA、Batch 输入 SHA 和运行授权绑定值均改变；Source、Cue 最终 Schema、
+  package 上限、费用单价、波次计划和 370799 条覆盖范围不变。旧 Batch 输入不得重用，也不得与新协议结果合并。
+- 失败批次保留无正文状态和远端文件 ID 供审计；不得对旧 `batch_id` 重试。重新提交前应由用户在本机授权文件中写入新的协议 SHA，
+  并重新执行无 API 预检；T0 不代替用户调用 API。
+
+### 验收门
+
+1. `model_registry.yaml`、请求构造和最终 Cue 回填的模型 ID 全部为 `qwen3.7-flash`，不存在旧快照漂移。
+2. 全仓无 API 测试及 `git diff --check` 通过；根据新配置重新计算协议 SHA。
+3. 本机 `CUE_EXECUTION_AUTHORIZATION.json` 的 `source_atoms_sha256` 不变，`cue_execution_protocol_sha256` 必须更新为新值；预算仍不得超过已批准的 `¥40`。
+4. 仅在用户重新下达 Wave 1 执行命令后，才允许上传新的输入文件；旧远端文件按既定清理门处理。
+
 ## CR-2026-009：Cue v2.2 紧凑推理协议——短码、默认回填与 96 token 输出上限
 
 ### 状态与决策边界

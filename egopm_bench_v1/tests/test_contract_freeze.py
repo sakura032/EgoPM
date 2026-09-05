@@ -80,10 +80,11 @@ def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
     registry = yaml.safe_load((CONFIG_DIR / "model_registry.yaml").read_text(encoding="utf-8"))
     cue = registry["models"]["cue_extraction"]
     execution = cue["execution"]
-    assert registry["registry_version"] == "v1.3.0"
+    assert registry["registry_version"] == "v1.4.0"
     assert registry["raw_response_policy"] == "forbidden"
+    assert cue["model_id"] == "qwen3.7-flash"
     assert cue["prompt_version"] == "cue_extractor_v3_compact"
-    assert execution["cue_execution_policy_version"] == "v2.2.0"
+    assert execution["cue_execution_policy_version"] == "v2.2.1"
     assert execution["protocol_hash_payload_version"] == "v2.0.0"
     assert execution["mode"] == "explicit_batch_file_execute_only"
     assert execution["shard_size_atoms"] == 500
