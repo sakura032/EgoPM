@@ -48,7 +48,7 @@ def setup(value: Any) -> tuple[Any, Any, dict[str, Any], dict[str, dict[str, Any
 
 def response(valid: bool = True, costly: bool = False) -> dict[str, Any]:
     """生成内存中的紧凑模型响应；不保存服务端原始文本。"""
-    payload = {"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A"}]} if valid else {"items": []}
+    payload = {"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A"}]} if valid else {"items": []}
     amount = 1_000_000 if costly else 10
     return {"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}], "usage": {"prompt_tokens": amount, "completion_tokens": amount, "total_tokens": amount * 2}}
 
@@ -113,8 +113,7 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     ("payload", "expected_code", "expected_path"),
     [
         ("{", "JSON_PARSE", "/"),
-        (json.dumps({"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "不存在", "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_NOT_SUBSTRING", "/items/0/x"),
-        (json.dumps({"items": [{"n": 0, "t": "A", "p": [["P", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A"}]}, ensure_ascii=False), "PREDICATE_CUE_TYPE_MISMATCH", "/items/0/p"),
+        (json.dumps({"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "不存在", "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_NOT_SUBSTRING", "/items/0/x"),
     ],
 )
 def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
@@ -171,7 +170,7 @@ def test_server_compatible_inference_schema_keeps_entity_deduplication_locally()
     assert "uniqueItems" not in json.dumps(schema, ensure_ascii=False)
     inference_validator = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     cue_validator = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
-    duplicate = {"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A", "e": ["物品", "物品"]}]}
+    duplicate = {"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A", "e": ["物品", "物品"]}]}
     with pytest.raises(value.LocalValidationError, match="ENTITY_DUPLICATE"):
         value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
 

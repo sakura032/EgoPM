@@ -725,9 +725,6 @@ def expand_compact_cue_for_qa(
         raise ValueError("紧凑 Cue 的字段集合不符合 v2.2 冻结短码协议")
     if not isinstance(compact["n"], int) or isinstance(compact["n"], bool) or not 0 <= compact["n"] < 5:
         raise ValueError("紧凑 Cue 的 n 必须是 package 内 0..4 索引")
-    cue_code = compact["t"]
-    if cue_code not in type_codes:
-        raise ValueError("紧凑 Cue 含未知 cue_type 短码")
     predicates = compact["p"]
     if not isinstance(predicates, list) or not predicates:
         raise ValueError("紧凑 Cue 必须含非空谓词数组")
@@ -739,8 +736,7 @@ def expand_compact_cue_for_qa(
         if slot_code not in type_codes or operator_code not in operator_codes or not isinstance(value, str) or not value:
             raise ValueError("紧凑谓词含未知短码或空 value")
         clauses.append({"slot": type_codes[slot_code], "operator": operator_codes[operator_code], "value": value})
-    if not any(predicate[0] == cue_code for predicate in predicates):
-        raise ValueError("至少一个谓词 slot 必须与 cue_type 短码一致")
+    cue_code = predicates[0][0]
     supporting_span = compact["x"]
     source_text = atom["visible_text"]
     if not isinstance(supporting_span, str) or not supporting_span or supporting_span not in source_text:

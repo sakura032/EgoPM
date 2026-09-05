@@ -315,7 +315,7 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
         "split": "train",
         "visible_text": "A person starts preparing food in a kitchen.",
     }
-    compact = {"n": 0, "t": "A", "p": [["A", "^", "preparing food"]], "x": "preparing food", "c": 80, "v": "A"}
+    compact = {"n": 0, "p": [["A", "^", "preparing food"]], "x": "preparing food", "c": 80, "v": "A"}
     expanded = qa.expand_compact_cue_for_qa(compact, atom, contract, "run_synthetic_v22", config)
     collector = qa.IssueCollector()
     qa.validate_schema([expanded], ROOT / "schemas" / "cue_candidate.schema.json", "cue", "T2 cue", collector)
@@ -325,7 +325,7 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
     try:
         qa.expand_compact_cue_for_qa(unknown, atom, contract, "run_synthetic_v22", config)
     except ValueError as error:
-        assert "未知" in str(error)
+        assert "字段集合" in str(error)
     else:
         raise AssertionError("未知短码不得被静默展开")
 

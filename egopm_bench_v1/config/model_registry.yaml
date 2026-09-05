@@ -18,9 +18,9 @@ models:
     schema: cue_candidate.schema.json
     schema_version: v1.0.0
     execution:
-      cue_execution_policy_version: v3.2.0
+      cue_execution_policy_version: v3.3.0
       # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
-      protocol_hash_payload_version: v3.2.0
+      protocol_hash_payload_version: v3.3.0
       mode: explicit_realtime_execute_only
       shard_size_atoms: 500
       max_retries: 2
@@ -37,13 +37,13 @@ models:
         response_correlation_field: n
       controlled_field_policy:
         model_input_fields: [item_index, text]
-        model_output_fields: [n, t, p, x, c, v, e, s, a, r]
+        model_output_fields: [n, p, x, c, v, e, s, a, r]
         program_backfilled_fields: [cue_id, atom_id, split, source_text, model_id, prompt_version, schema_version, run_id]
         raw_model_response_storage: forbidden
       compact_inference_policy:
         cue_type_codes: {T: time, P: person, L: place, O: object, A: activity, S: state_change}
         operator_codes: {"=": eq, "!": not_eq, "+": present, "-": absent, "^": starts, "$": ends, "~": contains}
-        required_fields: [n, t, p, x, c, v]
+        required_fields: [n, p, x, c, v]
         optional_defaults: {e: [], s: null, a: null, r: null}
         confidence_scale: 100
       realtime_api_policy:

@@ -443,7 +443,7 @@ def settings_from_registry(path: Path) -> Settings:
     }
     expected_controlled = {
         "model_input_fields": ["item_index", "text"],
-        "model_output_fields": ["n", "t", "p", "x", "c", "v", "e", "s", "a", "r"],
+            "model_output_fields": ["n", "p", "x", "c", "v", "e", "s", "a", "r"],
         "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"],
         "raw_model_response_storage": "forbidden",
     }
@@ -472,7 +472,7 @@ def settings_from_registry(path: Path) -> Settings:
         or compact != {
             "cue_type_codes": {"T": "time", "P": "person", "L": "place", "O": "object", "A": "activity", "S": "state_change"},
             "operator_codes": {"=": "eq", "!": "not_eq", "+": "present", "-": "absent", "^": "starts", "$": "ends", "~": "contains"},
-            "required_fields": ["n", "t", "p", "x", "c", "v"], "optional_defaults": {"e": [], "s": None, "a": None, "r": None}, "confidence_scale": 100,
+            "required_fields": ["n", "p", "x", "c", "v"], "optional_defaults": {"e": [], "s": None, "a": None, "r": None}, "confidence_scale": 100,
         }
         or batch != {
             "logical_shards_per_task": 10, "completion_window": "24h", "max_requests_per_file": 50000,
@@ -852,9 +852,10 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
         # 使兼容性修复不放宽最终 Cue 的实体去重质量门。
         if len(entities) != len(set(entities)):
             raise LocalValidationError("ENTITY_DUPLICATE", f"/items/{item['n']}/e")
-        cue_type = cue_codes.get(item["t"])
+        # 主 cue 类型由第一个 predicate 槽位确定，避免模型重复回显 t 与 p 时发生语义漂移。
+        cue_type = cue_codes.get(item["p"][0][0])
         if not isinstance(cue_type, str):
-            raise LocalValidationError("UNKNOWN_CUE_TYPE_CODE", f"/items/{item['n']}/t")
+            raise LocalValidationError("UNKNOWN_PRIMARY_PREDICATE_CODE", f"/items/{item['n']}/p/0")
         clauses: list[dict[str, str]] = []
         for compact_clause in item["p"]:
             slot = cue_codes.get(compact_clause[0])
@@ -865,8 +866,6 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
         # 连续原文和主槽位门在展开前检查，避免正确 JSON 被错误 Atom 或错误语义接纳。
         if item["x"] not in atom["visible_text"]:
             raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/x")
-        if not any(clause["slot"] == cue_type for clause in clauses):
-            raise LocalValidationError("PREDICATE_CUE_TYPE_MISMATCH", f"/items/{item['n']}/p")
         status = {"A": "accepted", "R": "rejected", "N": "needs_review"}.get(item["v"])
         if status is None:
             raise LocalValidationError("UNKNOWN_VALIDATION_STATUS_CODE", f"/items/{item['n']}/v")

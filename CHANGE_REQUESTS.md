@@ -522,3 +522,14 @@ CR-2026-008/009 的实现输入。这些数值只证明五条分包的可重现�
 当前唯一的实施指导是 CR-2026-009：T0 先冻结 v2.2，随后 T2/T4 只完成 Batch File 与紧凑推理协议
 的无 API 实现、独立 QA 和冻结 Source 预检。完成前不得调用千问、上传 Batch 文件、创建远端任务或
 写 Cue、SUCCESS、Seed 或 Life Log。
+
+### 实时协议 v3.3.0 补充决议（2026-09-05）
+
+`realtime_v5_01` 与 `realtime_v6_01` 的无正文验证账本均显示
+`PREDICATE_CUE_TYPE_MISMATCH`。模型短对象中的 `t` 与 `p[0][0]` 表达同一语义，却可能不一致；
+这不是最终 Cue Schema 所必需的信息，并会造成不必要的输出 token 与本地隔离。
+
+因此，冻结协议 `v3.3.0`：推理对象删除 `t`，模型只生成
+`n,p,x,c,v,e,s,a,r`；程序以已验证的 `p[0][0]` 回填最终 `cue_type`。这不改变最终
+`cue_candidate.schema.json`、受控字段、Atom 覆盖、分包顺序或恢复边界。旧 run 不能与该协议混合；
+下一次 API 尝试必须使用新的协议 SHA、新授权绑定和新的 run ID。
