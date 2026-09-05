@@ -1337,16 +1337,58 @@ def load_realtime_authorization(path: Path, source_sha256: str, protocol_sha256:
     return authorization
 
 
-def materialize_realtime_run(arguments: argparse.Namespace, settings: Settings, source_validator: jsonschema.Draft202012Validator, source_sha256: str, prompt: str, schema: dict[str, Any], protocol_sha256: str) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
-    """从冻结 Source 重建实时包；仅在显式执行确认后调用，清单不含文本正文。"""
+def materialize_realtime_wave(
+    arguments: argparse.Namespace,
+    settings: Settings,
+    source_validator: jsonschema.Draft202012Validator,
+    source_sha256: str,
+    prompt: str,
+    schema: dict[str, Any],
+    protocol_sha256: str,
+    task_indexes: list[int],
+    logical_shards_per_task: int,
+    on_progress: Callable[[int, int], None],
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+    """流式重建一个实时波次的包，避免把全量 Source Atom 常驻内存。
 
-    atoms = []
-    for atom in iter_jsonl(arguments.source_atoms):
+    输入是冻结 Source、当前八波 task 范围及无正文进度回调；输出是该波的实时清单和
+    Atom 查找表。第 05 阶段只须验证并保留目标 task 的十-shard 区间；Wave 1 因而只读
+    前 5,000 条 Atom。跳过的前置行不进入内存，超过末 shard 后立即停止，既保持冻结
+    shard 编号又避免完整 370,799 条 Atom 的启动内存峰值。
+    """
+
+    if not task_indexes:
+        raise ContractError("实时波次缺少冻结 task 范围")
+    first_shard = min(task_indexes) * logical_shards_per_task
+    last_shard = (max(task_indexes) + 1) * logical_shards_per_task - 1
+    atoms: list[dict[str, Any]] = []
+    previous_atom_id: str | None = None
+    scanned_atoms = selected_atoms = 0
+    for position, atom in enumerate(iter_jsonl(arguments.source_atoms)):
+        shard_index = position // settings.shard_size
+        if shard_index > last_shard:
+            break
+        scanned_atoms += 1
+        if shard_index < first_shard:
+            continue
         validate_record(source_validator, atom, "Source Atom")
+        atom_id = atom.get("atom_id")
+        if not isinstance(atom_id, str) or (previous_atom_id is not None and atom_id <= previous_atom_id):
+            raise ContractError("目标实时波次的 Source Atom 顺序不符合冻结合同")
+        previous_atom_id = atom_id
         atoms.append(atom)
-    atoms = ordered_atoms(atoms)
-    base = build_packages(atoms, source_sha256, prompt, schema, settings, protocol_sha256, arguments.run_id)
-    return [realtime_manifest(manifest) for manifest in base], {atom["atom_id"]: atom for atom in atoms}
+        selected_atoms += 1
+        # 每完成一个逻辑 shard 回报一次；进度只有计数，不会暴露字幕或请求正文。
+        if selected_atoms % settings.shard_size == 0:
+            on_progress(scanned_atoms, selected_atoms)
+    on_progress(scanned_atoms, selected_atoms)
+    if not atoms:
+        raise ContractError("所选实时波次未找到任何冻结 Source Atom")
+    base = build_packages(atoms, source_sha256, prompt, schema, settings, protocol_sha256, arguments.run_id, shard_offset=first_shard)
+    manifests = [realtime_manifest(manifest) for manifest in base]
+    if any(manifest["realtime_task_index"] not in task_indexes for manifest in manifests):
+        raise ContractError("实时波次 materialize 出现越界 task")
+    return manifests, {atom["atom_id"]: atom for atom in atoms}
 
 
 def progress_snapshot(total: int, completed: int, outcomes: dict[str, int], budget: BudgetTracker, started_at: float, in_flight: int, status: str, wave_index: int, task_indexes: list[int]) -> dict[str, Any]:
@@ -1515,9 +1557,29 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     # Wave 2；每个波次各自拥有清单、账本、状态与 progress.json。
     wave_root = arguments.run_root / f"wave_{arguments.wave_index:02d}"
     authorization = load_realtime_authorization(arguments.authorization, str(marker["sha256"]), protocol_sha256, policy)
-    all_manifests, atoms = materialize_realtime_run(arguments, settings, source_validator, str(marker["sha256"]), prompt, schema, protocol_sha256)
     task_indexes = realtime_wave_task_indexes(arguments.wave_index, policy)
-    manifests = [item for item in all_manifests if item.get("realtime_task_index") in task_indexes]
+    preparation_started = time.monotonic()
+    preparation_budget = BudgetTracker(float(authorization["maximum_total_cny"]))
+
+    def report_preparation(scanned_atoms: int, selected_atoms: int) -> None:
+        """在 Source 流式扫描时发布无正文快照，避免启动阶段长时间静默。"""
+
+        snapshot = progress_snapshot(0, 0, {}, preparation_budget, preparation_started, 0, "preparing_source", arguments.wave_index, task_indexes)
+        snapshot.update({
+            "run_id": arguments.run_id,
+            "source_atoms_sha256": str(marker["sha256"]),
+            "cue_execution_protocol_sha256": protocol_sha256,
+            "scanned_source_atoms": scanned_atoms,
+            "selected_source_atoms": selected_atoms,
+            "raw_response_saved": False,
+        })
+        write_realtime_progress(wave_root, settings, snapshot)
+        print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
+
+    manifests, atoms = materialize_realtime_wave(
+        arguments, settings, source_validator, str(marker["sha256"]), prompt, schema,
+        protocol_sha256, task_indexes, policy.logical_shards_per_task, report_preparation,
+    )
     if not manifests:
         raise ContractError("所选实时波次没有冻结 package；未读取密钥或联网")
     preflight = {**realtime_shards_manifest(arguments.run_id, manifests, wave_root, settings), "wave_index": arguments.wave_index, "wave_task_indexes": task_indexes}

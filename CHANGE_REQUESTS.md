@@ -44,6 +44,9 @@
 8. 每 15 秒和每个 package 终态均原子写无正文 `progress.json`。最终 QA 必须聚合 `wave_01` 至
    `wave_08`，确认 task `0..74` 完整无重叠，且根级累计账本与各波账本并集一致；否则禁止写
    `CUE_LIBRARY_SUCCESS.json`。
+9. 波次启动不得为便捷性把全量 Source Atom 常驻内存。执行器必须流式验证、仅保留当前波的
+   target shard；Wave 1 在越过 shard `9` 后立即停止读取，并在每完成一个 shard 时发布无正文
+   `preparing_source` 进度。该启动快照不含请求、响应或字幕正文。
 
 ### 实施与启动门
 

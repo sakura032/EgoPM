@@ -147,6 +147,32 @@ def test_server_compatible_inference_schema_keeps_entity_deduplication_locally()
         value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
 
 
+def test_materialize_realtime_wave_stops_after_selected_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Wave 1 只能保留十个 shard，并在越过边界后停止读取完整 Source。"""
+    value = module(); settings, _policy, _manifest, _rows = setup(value)
+    yielded = [0]
+
+    def stream(_path: Path) -> Any:
+        for index in range(6_000):
+            yielded[0] += 1
+            row = atom(index)
+            row["atom_id"] = f"src_a_{index:05d}"
+            yield row
+
+    monkeypatch.setattr(value, "iter_jsonl", stream)
+    monkeypatch.setattr(value, "validate_record", lambda *_args: None)
+    progress: list[tuple[int, int]] = []
+    arguments = SimpleNamespace(source_atoms=tmp_path / "synthetic.jsonl", run_id="synthetic")
+    manifests, indexed = value.materialize_realtime_wave(
+        arguments, settings, None, "source", "p", {"type": "object"}, "protocol", [0], 10,
+        lambda scanned, selected: progress.append((scanned, selected)),
+    )
+    assert yielded[0] == 5_001
+    assert len(indexed) == 5_000 and len(manifests) == 1_000
+    assert {item["realtime_shard_index"] for item in manifests} == set(range(10))
+    assert progress[-1] == (5_000, 5_000)
+
+
 def test_atomic_replace_retries_windows_share_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Windows 短暂占用应重试成功，且替换前的真实状态文件不会被预先删除。"""
     value = module(); target = tmp_path / "state.json"; target.write_text('{"old":true}\n', encoding="utf-8")
@@ -177,7 +203,7 @@ def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkey
         time.sleep(0.02)
         with lock: current[0] -= 1
         return "validated_success", 0.001, value.realtime_ledger_event(item, "validated_success", 0, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
-    monkeypatch.setattr(value, "materialize_realtime_run", lambda *_args: (manifests, rows))
+    monkeypatch.setattr(value, "materialize_realtime_wave", lambda *_args: (manifests, rows))
     monkeypatch.setattr(value, "load_realtime_authorization", lambda *_args: {"maximum_total_cny": 10.0})
     monkeypatch.setattr(value, "execute_realtime_package", fake_execute)
     monkeypatch.setattr(value, "RealtimeTransport", lambda *_args: object())
