@@ -1414,6 +1414,8 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
         queue = state_path.parent / "item_audit_queue.jsonl"
         if not queue.is_file() or not isinstance(state.get("unresolved_item_count"), int) or state["unresolved_item_count"] <= 0:
             raise ContractError("实时逐项审计状态缺少无正文队列；禁止自动重发")
+        if state.get("unaccounted_usage_audit") is True:
+            return "needs_item_audit_unaccounted"
         return "needs_item_audit_from_quarantine" if state.get("legacy_local_validation_quarantine") == {"code": "JSON_PARSE", "path": "/"} else "needs_item_audit"
     diagnostic = state.get("local_validation_failure")
     if (
@@ -1550,7 +1552,7 @@ def execute_realtime_package(
         return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
     migrate_legacy_json_parse_quarantine(manifest, run_root, settings)
     recovered_terminal = realtime_recovery_terminal_status(manifest, run_root, settings)
-    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit", "needs_item_audit_from_quarantine"}:
+    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit", "needs_item_audit_from_quarantine", "needs_item_audit_unaccounted"}:
         # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
         # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
         return "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit", 0.0, {"outcome": "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit"}
@@ -1949,6 +1951,60 @@ def cumulative_realtime_events(run_root: Path) -> dict[str, dict[str, Any]]:
     return events
 
 
+def reconcile_realtime_terminal_ledgers(
+    manifests: list[dict[str, Any]], wave_root: Path, execution_root: Path, settings: Settings, policy: RealtimePolicy,
+) -> None:
+    """受控补齐已终态 package 的累计账本，绝不从响应或猜测值重建 usage。
+
+    输入是冻结清单及同一 run 的波次/累计目录；输出为补齐后的无正文账本。它位于第 05
+    阶段恢复的离线边界：只复制通过身份、终态、usage 与无正文门的 package ledger 行。
+    若逐项审计包缺少可核验 usage，则写持久安全标识并保持人工审计阻断，绝不重发。
+    """
+
+    events = cumulative_realtime_events(execution_root)
+    wave_ledger = wave_root / settings.layout["run_ledger_filename"]
+    global_ledger = execution_root / "realtime_cumulative_ledger.jsonl"
+    for manifest in manifests:
+        terminal = realtime_recovery_terminal_status(manifest, wave_root, settings)
+        if terminal is None or manifest["realtime_request_id"] in events:
+            continue
+        files = package_paths(wave_root, manifest, {**settings.layout, "package_directory": "packages"})
+        if not files["ledger"].is_file():
+            if terminal.startswith("needs_item_audit"):
+                state_path = realtime_package_state_path(wave_root, manifest)
+                atomic_write_json(state_path, {**read_json(state_path), "unaccounted_usage_audit": True, "raw_response_saved": False})
+                continue
+            raise ContractError("实时终态缺少 package 无正文账本；禁止自动重发")
+        rows = list(iter_jsonl(files["ledger"]))
+        if len(rows) != 1:
+            raise ContractError("实时 package 账本必须恰有一条终态；禁止自动重发")
+        event = rows[0]
+        try:
+            require_accounted_realtime_terminal(manifest, terminal, {str(manifest["realtime_request_id"]): event})
+            realtime_event_cost(event, policy)
+        except ContractError:
+            if terminal.startswith("needs_item_audit"):
+                state_path = realtime_package_state_path(wave_root, manifest)
+                atomic_write_json(state_path, {**read_json(state_path), "unaccounted_usage_audit": True, "raw_response_saved": False})
+                continue
+            raise
+        usage = event.get("usage")
+        if (
+            not isinstance(usage, dict)
+            or not all(isinstance(usage.get(key), int) and not isinstance(usage.get(key), bool) and usage.get(key) >= 0
+                       for key in ("prompt_tokens", "completion_tokens", "total_tokens"))
+            or usage["prompt_tokens"] + usage["completion_tokens"] != usage["total_tokens"]
+        ):
+            if terminal.startswith("needs_item_audit"):
+                state_path = realtime_package_state_path(wave_root, manifest)
+                atomic_write_json(state_path, {**read_json(state_path), "unaccounted_usage_audit": True, "raw_response_saved": False})
+                continue
+            raise ContractError("实时终态账本缺少可核验 usage；禁止自动重发")
+        append_ledger_event(wave_ledger, event)
+        append_ledger_event(global_ledger, event)
+        events[str(manifest["realtime_request_id"])] = event
+
+
 def initialise_cumulative_budget(run_root: Path, preflight: dict[str, Any], authorization: dict[str, Any], policy: RealtimePolicy) -> BudgetTracker:
     """验证共享运行根并从所有波次账本恢复 `¥80` 全局累计费用。"""
 
@@ -2053,6 +2109,11 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         raise ContractError("所选实时波次没有冻结 package；未读取密钥或联网")
     preflight = {**realtime_shards_manifest(arguments.run_id, manifests, wave_root, settings), "wave_index": arguments.wave_index, "wave_task_indexes": task_indexes}
     require_completed_prior_waves(execution_root, arguments.wave_index, preflight, settings)
+    # 旧 v8 曾在 package 账本已落盘后中断累计追加；先离线迁移/核对，再从补齐的
+    # 账本恢复预算，确保后续请求既不重发也不把已发生费用误作余额。
+    for manifest in manifests:
+        migrate_legacy_json_parse_quarantine(manifest, wave_root, settings)
+    reconcile_realtime_terminal_ledgers(manifests, wave_root, execution_root, settings, policy)
     budget = initialise_cumulative_budget(execution_root, preflight, authorization, policy)
     # 恢复前先离线扫描全部终态。隔离 package 已经发生服务端调用且可能已计费，必须
     # 以状态、失败标记和累计账本三重一致性跳过，不能因缺少 SUCCESS 而被再次提交。
@@ -2066,9 +2127,10 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         if recovered_status is None:
             remaining_manifests.append(manifest)
             continue
-        require_accounted_realtime_terminal(manifest, recovered_status, cumulative_events)
+        if recovered_status != "needs_item_audit_unaccounted":
+            require_accounted_realtime_terminal(manifest, recovered_status, cumulative_events)
         completed += 1
-        outcome_status = "needs_item_audit" if recovered_status == "needs_item_audit_from_quarantine" else recovered_status
+        outcome_status = "needs_item_audit" if recovered_status in {"needs_item_audit_from_quarantine", "needs_item_audit_unaccounted"} else recovered_status
         outcomes[outcome_status] = outcomes.get(outcome_status, 0) + 1
     # 只为尚未请求的 package 预留预算；已在账本中的成功或隔离调用不能被重复预留，
     # 否则一次安全恢复会被错误阻断，也会掩盖真实的剩余授权。

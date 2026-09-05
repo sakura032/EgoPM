@@ -439,6 +439,23 @@ def test_legacy_json_parse_quarantine_migrates_to_item_audit_without_transport(t
     )
 
 
+def test_reconcile_package_ledger_backfills_missing_cumulative_audit_event(tmp_path: Path) -> None:
+    """已有逐项审计 package 的安全账本可补回累计账本，恢复时无需重发。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+
+    class Invalid:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            return response(False)
+
+    execution_root = tmp_path / "runs" / "synthetic"; wave_root = execution_root / "wave_01"
+    terminal = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Invalid(), wave_root, 1.0, *buckets(value, policy))
+    assert terminal[0] == "needs_item_audit"
+    value.reconcile_realtime_terminal_ledgers([manifest], wave_root, execution_root, settings, policy)
+    events = value.cumulative_realtime_events(execution_root)
+    assert events[manifest["realtime_request_id"]]["outcome"] == "needs_item_audit"
+    assert (wave_root / settings.layout["run_ledger_filename"]).is_file()
+
+
 def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> None:
     """Wave 2 必须从共享无正文账本继承 Wave 1 已发生费用，不能重新获得完整 ¥80。"""
     value = module(); _settings, policy, manifest, _rows = setup(value)
