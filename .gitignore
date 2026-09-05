@@ -16,6 +16,13 @@ Egolife/
 *.wav
 *.mp3
 
+# 正式 Source 派生产物保留本机，以 SUCCESS 哈希追溯，不进入代码仓库。
+egopm_bench_v1/source/raw_srt_segments.jsonl
+egopm_bench_v1/source/source_split_map.jsonl
+egopm_bench_v1/source/source_video_atoms.jsonl
+egopm_bench_v1/source/source_video_atoms_draft.jsonl
+.local_source_backup/
+
 # Model raw responses can contain third-party text and must remain local.
 egopm_bench_v1/logs/model_runs/**
 
