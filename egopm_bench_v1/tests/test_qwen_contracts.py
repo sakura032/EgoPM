@@ -6,10 +6,16 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
+import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any
+from types import SimpleNamespace
+from urllib import error as urlerror
 
 import pytest
 
@@ -101,3 +107,106 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     assert result[0] == "budget_stopped"
     with pytest.raises(value.ContractError, match="Batch"): value.realtime_package_state_path(tmp_path / "batch", manifest)
     with pytest.raises(value.ContractError, match="Batch"): value.validate_realtime_ledger_event({**result[2], "batch_custom_id": "x"})
+
+
+def test_http_400_has_safe_diagnostic_without_raw_body() -> None:
+    """HTTP 400 必须终结为无正文诊断，且不把原始错误体暴露给运行状态。"""
+    value = module(); settings, policy, *_ = setup(value)
+    payload = b'{"error":{"code":"invalid_parameter","message":"body.model is invalid\\nno source text"}}'
+    failure = urlerror.HTTPError("https://example.invalid", 400, "Bad Request", None, io.BytesIO(payload))
+    transport = value.RealtimeTransport(settings.endpoint, "synthetic", open_call=lambda *_args, **_kwargs: (_ for _ in ()).throw(failure))
+    with pytest.raises(value.RealtimeServiceError) as caught:
+        transport.complete({"model": settings.model_id}, policy)
+    assert caught.value.status_code == 400 and caught.value.retryable is False
+    assert caught.value.safe_diagnostic() == {"http_status": 400, "service_code": "invalid_parameter", "service_message": "body.model is invalid no source text"}
+    assert "{" not in str(caught.value)
+
+
+def test_permanent_http_400_writes_safe_failed_terminal_state(tmp_path: Path) -> None:
+    """不可重试的 400 要写可恢复失败终态与诊断，但不写服务端原始正文。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    class InvalidRequest:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            raise value.RealtimeServiceError(400, False, "invalid_parameter", "body.response_format is unsupported")
+    result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, InvalidRequest(), tmp_path / "realtime", 1.0, *buckets(value, policy))
+    state = json.loads((tmp_path / "realtime" / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8"))
+    assert result[0] == "service_transport_exhausted" and result[2]["retry_eligible"] is False
+    assert state["service_error"] == {"http_status": 400, "service_code": "invalid_parameter", "service_message": "body.response_format is unsupported"}
+    assert "choices" not in json.dumps(state, ensure_ascii=False)
+
+
+def test_atomic_replace_retries_windows_share_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Windows 短暂占用应重试成功，且替换前的真实状态文件不会被预先删除。"""
+    value = module(); target = tmp_path / "state.json"; target.write_text('{"old":true}\n', encoding="utf-8")
+    temporary = tmp_path / "state.unique.tmp"; temporary.write_text('{"new":true}\n', encoding="utf-8")
+    original = Path.replace; calls = [0]
+    def replace(path: Path, destination: Path) -> Path:
+        calls[0] += 1
+        if calls[0] == 1:
+            assert target.read_text(encoding="utf-8") == '{"old":true}\n'
+            raise PermissionError(5, "share lock")
+        return original(path, destination)
+    monkeypatch.setattr(Path, "replace", replace)
+    value.atomic_replace(temporary, target, retries=2, sleep=lambda _seconds: None)
+    assert calls[0] == 2 and target.read_text(encoding="utf-8") == '{"new":true}\n'
+
+
+def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """调度器最多保留十个在飞包，并在无正文 progress.json 记录完成数和 ETA。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    manifests = []
+    for index in range(12):
+        base = value.package_manifest([rows["src_a_001"]], "source", "protocol", "synthetic", 0, index)
+        manifests.append(value.realtime_manifest(base))
+    current = [0]; peak = [0]; lock = threading.Lock()
+    def fake_execute(item: dict[str, Any], *_args: Any, **_kwargs: Any) -> tuple[str, float, dict[str, Any]]:
+        with lock:
+            current[0] += 1; peak[0] = max(peak[0], current[0])
+        time.sleep(0.02)
+        with lock: current[0] -= 1
+        return "validated_success", 0.001, value.realtime_ledger_event(item, "validated_success", 0, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+    monkeypatch.setattr(value, "materialize_realtime_run", lambda *_args: (manifests, rows))
+    monkeypatch.setattr(value, "load_realtime_authorization", lambda *_args: {"maximum_total_cny": 10.0})
+    monkeypatch.setattr(value, "execute_realtime_package", fake_execute)
+    monkeypatch.setattr(value, "RealtimeTransport", lambda *_args: object())
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic")
+    args = SimpleNamespace(run_root=tmp_path / "realtime", authorization=tmp_path / "authorization.json", run_id="synthetic", wave_index=1)
+    marker = {"sha256": "source"}
+    result = value.execute_realtime_run(args, settings, policy, marker, object(), "p", {"type": "object"}, "protocol")
+    progress = json.loads((args.run_root / "wave_01" / "progress.json").read_text(encoding="utf-8"))
+    assert peak[0] == policy.maximum_in_flight == 10
+    assert result["outcomes"] == {"validated_success": 12}
+    assert (progress["wave_index"], progress["wave_task_indexes"], progress["total_packages"], progress["completed_packages"], progress["in_flight_packages"]) == (1, [0], 12, 12, 0)
+    assert "source_text" not in json.dumps(progress, ensure_ascii=False)
+
+
+def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> None:
+    """Wave 2 必须从共享无正文账本继承 Wave 1 已发生费用，不能重新获得完整 ¥80。"""
+    value = module(); _settings, policy, manifest, _rows = setup(value)
+    preflight = {"run_id": "shared", "source_atoms_sha256": "source", "cue_execution_protocol_sha256": "protocol"}
+    event = value.realtime_ledger_event(manifest, "validated_success", 0, {"prompt_tokens": 1_000_000, "completion_tokens": 0, "total_tokens": 1_000_000})
+    event["realtime_request_id"] = "wave_01_request"
+    value.append_ledger_event(tmp_path / "wave_01" / "realtime_run_ledger.jsonl", event)
+    tracker = value.initialise_cumulative_budget(tmp_path, preflight, {"maximum_total_cny": 80.0}, policy)
+    assert tracker.spent_cny() == pytest.approx(0.2)
+    assert tracker.maximum_cny - tracker.spent_cny() == pytest.approx(79.8)
+    cumulative = json.loads((tmp_path / "realtime_cumulative_progress.json").read_text(encoding="utf-8"))
+    assert cumulative["accounted_request_count"] == 1 and "source_text" not in json.dumps(cumulative, ensure_ascii=False)
+
+
+def test_later_wave_requires_each_prior_wave_to_complete(tmp_path: Path) -> None:
+    """启动 Wave 2 前必须离线确认 Wave 1 同 run/Source/协议下零失败地完整完成。"""
+    value = module(); settings, _policy, *_ = setup(value)
+    preflight = {"run_id": "shared", "source_atoms_sha256": "source", "cue_execution_protocol_sha256": "protocol"}
+    success = {
+        "status": "completed", "run_id": "shared", "source_atoms_sha256": "source", "cue_execution_protocol_sha256": "protocol",
+        "wave_index": 1, "total_packages": 3, "completed_packages": 3, "in_flight_packages": 0,
+        "validated_success_packages": 3, "local_validation_quarantine_packages": 0,
+        "service_transport_exhausted_packages": 0, "budget_stopped_packages": 0,
+    }
+    value.atomic_write_json(tmp_path / "wave_01" / "progress.json", success)
+    value.require_completed_prior_waves(tmp_path, 2, preflight, settings)
+    success["service_transport_exhausted_packages"] = 1
+    value.atomic_write_json(tmp_path / "wave_01" / "progress.json", success)
+    with pytest.raises(value.ContractError, match="尚未完整成功"):
+        value.require_completed_prior_waves(tmp_path, 2, preflight, settings)

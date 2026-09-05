@@ -15,10 +15,13 @@
 - 以 `execution.transport` 为唯一分支条件。实时协议只读取 `cues/realtime`；若配置不是 `realtime_chat_completions` 或运行根不是该固定目录，立即阻断。`cues/batch`、`batch_id`、`batch_task_index`、远端文件 ID 等取消 Batch 状态不能混入实时恢复。
 - `CUE_LIBRARY_SUCCESS.json` 必须绑定 Source 哈希、完整 v3 协议哈希、实时 transport、分片清单 SHA256、运行状态 SHA256、运行账本 SHA256 与“原始响应禁止”声明；最终 Cue Schema 仍为 `v1.0.0`。
 - 固定验证 `realtime_shards_manifest.jsonl`、`realtime_run_state.json`、`realtime_run_ledger.jsonl`。它们只能含包 ID、请求 SHA256、协议/Source 血缘、usage、重试、费用和终态等无正文元数据；请求、响应、错误、Atom 文本和 Batch 字段均被递归拒绝。
+- 运行时 `progress.json` 必须是原子写入的无正文快照。最终审计检查其波次严格属于冻结的 `1 + 6×10 + 14` task 范围、最多 `10` 个在飞 package、终态计数守恒，并与同波 run-state 一致；任一跨波、超并发或正文键都会阻断。
+- T2 的每波子目录与根级累计账本设计经过合成测试：Wave 2 从 Wave 1 的无正文 usage 恢复实际费用，`¥80` 是跨八波的唯一累计上限，不能按波重置；不同 run、Source、协议或授权预算的累计状态必须阻断恢复。
+- 若运行根存在任一 `wave_XX` 子目录，最终 QA 自动切换到八波聚合门：必须同时存在 `wave_01` 至 `wave_08`、全部 `completed`，其 task 范围必须恰好覆盖 `0..74` 且不重叠；根级 `realtime_cumulative_ledger.jsonl` 必须按 `realtime_request_id` 与八个波次账本并集逐行一致。任一缺波、重复、遗漏或累计账本不一致均禁止 `CUE_LIBRARY_SUCCESS.json`。
 - 每个 package 的 `realtime_state.json`、`*.ledger.jsonl`、`*.complete.json` 由固定路径定位。完成标记必须校验实际 `result`、ledger、state 的 SHA256，防止片段被替换后复用旧完成状态。
 - ledger 只接受 T0 冻结的终态集。最终 `CUE_LIBRARY_SUCCESS` 仅接受每个 package 的唯一 `validated_success`；`local_validation_quarantine`、`budget_stopped` 或服务传输失败都不能自动重排、不能产生最终成功标记。
 - run-state 中实际估算费用不得超过已授权预算；超过即由费用熔断阻断。usage 必须保持无正文且 `prompt_tokens + completion_tokens = total_tokens`。
-- 独立合成测试覆盖：协议/限流/价格漂移、Source/协议错配、实时标记伪装为 Batch、包请求摘要错配、正文键泄露、本地隔离伪装为可重试、预算超额和完成片段哈希篡改。
+- 独立合成测试覆盖：协议/限流/价格漂移、Source/协议错配、实时标记伪装为 Batch、包请求摘要错配、正文键泄露、本地隔离伪装为可重试、预算超额、跨八波累计预算、波次范围、十并发上限、进度计数及完成片段哈希篡改。
 
 ## Python 中文说明与关键注释验收
 
@@ -30,8 +33,8 @@
 ## 测试与结果
 
 ```powershell
-python -m pytest -q egopm_bench_v1/tests/test_validators.py --basetemp .pytest_cache/t4-realtime-dev3
-# 结果：19 passed
+python -m pytest -q
+# 结果：47 passed
 
 git diff --check
 # 结果：通过

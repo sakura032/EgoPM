@@ -120,10 +120,21 @@ def write_valid_realtime_artifacts(qa, config, marker: dict) -> None:
     run_state = {
         "run_id": "run_synthetic_v30", "transport": "realtime_chat_completions", "source_atoms_sha256": marker["source_atoms_sha256"],
         "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"], "status": "completed", "authorized_budget_cny": 40.0,
-        "estimated_cost_cny": 0.01, "usage_summary": marker["usage_summary"],
+        "estimated_cost_cny": 0.01, "usage_summary": marker["usage_summary"], "wave_index": 1, "wave_task_indexes": [0],
     }
     run_state_path = root / "realtime_run_state.json"
     run_state_path.write_text(json.dumps(run_state, ensure_ascii=False), encoding="utf-8")
+    # 进度文件只记录数值、波次和费用；此合成快照验证 T4 会拒绝扩大到其他波次、
+    # 超过十个在飞 package 或混入原始模型正文的运行状态。
+    progress = {
+        "status": "completed", "wave_index": 1, "wave_task_indexes": [0],
+        "total_packages": 1, "completed_packages": 1, "validated_success_packages": 1,
+        "local_validation_quarantine_packages": 0, "service_transport_exhausted_packages": 0,
+        "budget_stopped_packages": 0, "in_flight_packages": 0, "authorized_budget_cny": 40.0,
+        "spent_cny": 0.01, "elapsed_seconds": 1.0, "eta_seconds": 0.0,
+        "raw_response_saved": False, "updated_at": "2026-08-31T00:00:00+00:00",
+    }
+    (root / "progress.json").write_text(json.dumps(progress, ensure_ascii=False), encoding="utf-8")
     run_ledger = dict(ledger)
     run_ledger["run_id"] = "run_synthetic_v30"
     run_ledger_path = root / "realtime_run_ledger.jsonl"
@@ -387,6 +398,32 @@ def test_cue_v30_rejects_non_success_or_requeued_package(tmp_path: Path) -> None
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
     assert any(issue["issue_type"] == "cue_realtime_ledger_terminal" for issue in collector.issues)
+
+
+def test_cue_v30_rejects_progress_outside_frozen_wave_or_inflight_limit(tmp_path: Path) -> None:
+    """最终实时 QA 必须拒绝跨波、超十并发和含正文的进度快照。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    progress_path = qa.realtime_root(config) / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress.update({"wave_index": 2, "wave_task_indexes": [0], "in_flight_packages": 11})
+    progress_path.write_text(json.dumps(progress, ensure_ascii=False), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert {"cue_realtime_progress_wave", "cue_realtime_progress_inflight"}.issubset(issue_types)
+
+    write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    progress_path = qa.realtime_root(config) / "progress.json"
+    progress = json.loads(progress_path.read_text(encoding="utf-8"))
+    progress["error"] = "不得保存的合成服务端正文"
+    progress_path.write_text(json.dumps(progress, ensure_ascii=False), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_realtime_progress_raw_content" for issue in collector.issues)
 
 
 def test_cue_v30_rejects_budget_overrun_and_batch_artifact_mix(tmp_path: Path) -> None:

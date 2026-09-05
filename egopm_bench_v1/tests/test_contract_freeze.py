@@ -126,8 +126,12 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     }
     assert execution["realtime_ledger_policy"]["terminal_outcomes"] == ["validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"]
     assert execution["realtime_execution_policy"]["execution_confirmation"] == "START_REALTIME_CUE_API"
+    assert execution["realtime_execution_policy"]["wave_task_counts"] == [1, 10, 10, 10, 10, 10, 10, 14]
+    assert execution["realtime_execution_policy"]["logical_shards_per_task"] == 10
+    assert execution["realtime_execution_policy"]["progress_update_interval_seconds"] == 15
     assert execution["shard_layout"]["root"] == "cues/realtime"
     assert execution["shard_layout"]["realtime_shards_manifest"] == "realtime_shards_manifest.jsonl"
+    assert execution["shard_layout"]["progress_filename"] == "progress.json"
     assert execution["pricing_snapshot"] == {
         "pricing_version": "2026-09-05_cn-beijing_realtime_list",
         "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",

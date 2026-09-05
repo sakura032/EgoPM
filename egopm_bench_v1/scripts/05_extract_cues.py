@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 import hashlib
 import json
 import os
+import re
 import sys
+import threading
 import time
 import uuid
 from urllib import error as urlerror
@@ -50,6 +53,9 @@ class RealtimePolicy:
     transient_http_statuses: frozenset[int]
     retry_backoff_initial_seconds: int
     retry_backoff_max_seconds: int
+    progress_update_interval_seconds: int
+    wave_task_counts: tuple[int, ...]
+    logical_shards_per_task: int
     authorization_version: str
     maximum_local_validation_quarantine: int
     input_price_cny_per_million_tokens: float
@@ -94,6 +100,11 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
     for name in ("maximum_in_flight", "requests_per_minute", "tokens_per_minute", "request_timeout_seconds", "retry_backoff_initial_seconds", "retry_backoff_max_seconds"):
         if not isinstance(realtime.get(name), int) or realtime[name] <= 0:
             raise ContractError(f"实时限流字段无效：{name}")
+    if not isinstance(realtime_execution.get("progress_update_interval_seconds"), int) or realtime_execution["progress_update_interval_seconds"] <= 0:
+        raise ContractError("实时进度刷新间隔无效")
+    counts = realtime_execution.get("wave_task_counts")
+    if counts != [1, 10, 10, 10, 10, 10, 10, 14] or not isinstance(realtime_execution.get("logical_shards_per_task"), int) or realtime_execution["logical_shards_per_task"] != 10:
+        raise ContractError("实时执行必须冻结原八波 task 范围与每 task 十个逻辑 shard")
     for name in ("input_price_cny_per_million_tokens", "output_price_cny_per_million_tokens"):
         if not isinstance(pricing.get(name), (int, float)) or isinstance(pricing[name], bool) or pricing[name] < 0:
             raise ContractError(f"实时价格字段无效：{name}")
@@ -119,6 +130,8 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
         transient_http_statuses=frozenset(realtime["retryable_http_statuses"]),
         retry_backoff_initial_seconds=int(realtime["retry_backoff_initial_seconds"]),
         retry_backoff_max_seconds=int(realtime["retry_backoff_max_seconds"]),
+        progress_update_interval_seconds=int(realtime_execution["progress_update_interval_seconds"]),
+        wave_task_counts=tuple(counts), logical_shards_per_task=int(realtime_execution["logical_shards_per_task"]),
         authorization_version=str(realtime_execution.get("authorization_version", "")),
         maximum_local_validation_quarantine=int(realtime_execution["max_local_validation_quarantine_per_run"]),
         input_price_cny_per_million_tokens=float(pricing["input_price_cny_per_million_tokens"]),
@@ -225,30 +238,58 @@ def jsonl_row_count(path: Path) -> int:
 
 
 def atomic_write_json(path: Path, value: Any) -> None:
-    """完成并 fsync 临时 JSON 后再原子替换，避免 SUCCESS 或标记半写入。"""
+    """完成并 fsync 临时 JSON 后再以 Windows 安全重试替换，避免状态半写入。
+
+    输入是目标路径和 JSON 值；输出是完整替换后的 JSON。第 05 阶段会有多个实时
+    worker 同时写不同 package，而 Windows 杀毒软件或索引器可能短暂占用目标文件；
+    因此临时文件使用唯一名并有限重试。重试耗尽时绝不删除既有状态文件，也不继续
+    发请求，调用者必须显式处理这个可恢复的本地持久化故障。
+    """
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         handle.write(json.dumps(value, ensure_ascii=False, sort_keys=True, indent=2))
         handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    temporary.replace(path)
+    atomic_replace(temporary, path)
 
 
 def atomic_write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     """全量 fsync JSONL 临时文件再替换，防止合并读到半个 package 结果。"""
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f"{path.name}.tmp")
+    temporary = path.with_name(f"{path.name}.{uuid.uuid4().hex}.tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         for row in rows:
             handle.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
             handle.write("\n")
         handle.flush()
         os.fsync(handle.fileno())
-    temporary.replace(path)
+    atomic_replace(temporary, path)
+
+
+def atomic_replace(temporary: Path, path: Path, retries: int = 6, sleep: Callable[[float], None] = time.sleep) -> None:
+    """有限重试 Windows 的文件替换；失败时保留旧目标与唯一临时文件。
+
+    输入是已 fsync 的临时文件和目标文件；输出是原子替换后的目标。该函数位于第 05
+    阶段的所有状态/结果落盘路径，专门处理 `WinError 5` 等短暂共享锁；不调用
+    `unlink`，从而不会覆盖或删除用户已有的真实执行状态。
+    """
+
+    for attempt in range(retries):
+        try:
+            temporary.replace(path)
+            return
+        except PermissionError as error:
+            if attempt + 1 == retries:
+                raise ContractError(f"Windows 文件替换连续失败，已保留旧状态与临时文件：{path}") from error
+            sleep(0.05 * (2 ** attempt))
+        except OSError as error:
+            if attempt + 1 == retries:
+                raise ContractError(f"状态文件替换失败，已保留旧状态与临时文件：{path}") from error
+            sleep(0.05 * (2 ** attempt))
 
 
 def append_ledger_event(path: Path, event: dict[str, Any]) -> None:
@@ -935,8 +976,10 @@ class RealtimeTransport:
             with self._open(request, timeout=policy.request_timeout_seconds) as response:
                 payload = json.loads(response.read().decode("utf-8"))
         except urlerror.HTTPError as error:
-            # 仅返回状态码类别；禁止把可能含原文的服务端错误正文写入账本或异常消息。
-            raise RealtimeServiceError(error.code, error.code in policy.transient_http_statuses) from error
+            # 错误正文只能在内存中解析为受限诊断字段；绝不把完整服务端正文、提示词或
+            # Atom 文本写盘。这样既能定位 400 配置错误，也不突破原始响应禁止保存规则。
+            error_code, error_message = safe_http_error_details(error)
+            raise RealtimeServiceError(error.code, error.code in policy.transient_http_statuses, error_code, error_message) from error
         except (urlerror.URLError, TimeoutError, OSError) as error:
             raise RealtimeServiceError(None, True) from error
         except (UnicodeDecodeError, json.JSONDecodeError) as error:
@@ -949,10 +992,48 @@ class RealtimeTransport:
 class RealtimeServiceError(RuntimeError):
     """无正文实时服务错误；仅携带能决定安全重试的状态类别。"""
 
-    def __init__(self, status_code: int | None, retryable: bool) -> None:
-        super().__init__("实时服务请求失败")
+    def __init__(self, status_code: int | None, retryable: bool, error_code: str | None = None, error_message: str | None = None) -> None:
+        summary = f"实时服务请求失败（HTTP {status_code}）" if status_code is not None else "实时服务请求失败（网络或传输层）"
+        super().__init__(summary)
         self.status_code = status_code
         self.retryable = retryable
+        self.error_code = error_code
+        self.error_message = error_message
+
+    def safe_diagnostic(self) -> dict[str, Any]:
+        """返回可写入状态/账本的受限诊断，不包含原始 HTTP 正文。"""
+
+        return {
+            "http_status": self.status_code,
+            "service_code": self.error_code,
+            "service_message": self.error_message,
+        }
+
+
+def safe_http_error_details(error: urlerror.HTTPError) -> tuple[str | None, str | None]:
+    """从 HTTP 错误体提取受限 code/message；输入正文永不返回或落盘。
+
+    仅接受 JSON object 的 `error.code`/`code` 及 `error.message`/`message`，并限制字符
+    集、长度和换行。这让运行者知道服务端拒绝的是哪个参数，同时防止服务端回显请求
+    正文时被写入无正文账本。
+    """
+
+    try:
+        raw = error.read(8192).decode("utf-8", errors="replace")
+        value = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, None
+    detail = value.get("error", value) if isinstance(value, dict) else None
+    if not isinstance(detail, dict):
+        return None, None
+    code = detail.get("code")
+    message = detail.get("message")
+    safe_code = code if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,80}", code) else None
+    if isinstance(message, str):
+        safe_message = " ".join(message.split())[:240]
+    else:
+        safe_message = None
+    return safe_code, safe_message
 
 
 class TokenBucket:
@@ -968,6 +1049,7 @@ class TokenBucket:
         self.clock = clock
         self.sleep = sleep
         self.updated_at = clock()
+        self._lock = threading.Lock()
 
     def acquire(self, amount: int) -> None:
         """阻塞至足够配额；单次超容量说明冻结单包上界和限流配置不兼容。"""
@@ -975,13 +1057,42 @@ class TokenBucket:
         if amount <= 0 or amount > self.capacity:
             raise ContractError("令牌请求超出冻结桶容量")
         while True:
-            now = self.clock()
-            self.tokens = min(self.capacity, self.tokens + (now - self.updated_at) * self.capacity / self.window_seconds)
-            self.updated_at = now
-            if self.tokens >= amount:
-                self.tokens -= amount
-                return
-            self.sleep((amount - self.tokens) * self.window_seconds / self.capacity)
+            with self._lock:
+                now = self.clock()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated_at) * self.capacity / self.window_seconds)
+                self.updated_at = now
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                delay = (amount - self.tokens) * self.window_seconds / self.capacity
+            # 不能在锁内等待，否则一个 TPM 等待会人为阻塞所有无关的 RPM 获取。
+            self.sleep(delay)
+
+
+class BudgetTracker:
+    """并发实时包共享的费用账本锁；输入是授权上限，输出是线程安全的累计费用。
+
+    该对象位于第 05 阶段实时执行器。服务端 usage 只会在本地 Schema 验证后进入费用
+    账本；锁保证十个并发 worker 不会各自读取同一余额而错误地允许超额继续调度。
+    """
+
+    def __init__(self, maximum_cny: float, spent_cny: float = 0.0) -> None:
+        self.maximum_cny = maximum_cny
+        self._spent_cny = spent_cny
+        self._lock = threading.Lock()
+
+    def record_charge(self, charged_cny: float) -> tuple[bool, float]:
+        """原子记录已发生的费用；返回是否仍未越过授权上限及累计费用。"""
+
+        with self._lock:
+            self._spent_cny += charged_cny
+            return self._spent_cny <= self.maximum_cny, self._spent_cny
+
+    def spent_cny(self) -> float:
+        """读取受锁保护的累计费用，供无正文 progress 快照使用。"""
+
+        with self._lock:
+            return self._spent_cny
 
 
 def realtime_package_state_path(run_root: Path, manifest: dict[str, Any]) -> Path:
@@ -1004,12 +1115,17 @@ def realtime_protocol_hash(settings: Settings, prompt_path: Path, inference_sche
 def realtime_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     """把共享包清单投影为实时身份，移除全部 Batch 字段以防混用。"""
 
+    task_index = manifest.get("batch_task_index")
+    if not isinstance(task_index, int) or task_index < 0:
+        raise ContractError("实时清单缺少由冻结八波计划导出的 task 索引")
     forbidden = {"batch_task_index", "batch_custom_id", "batch_input_sha256", "remote_file_id"}
     if forbidden.intersection(manifest):
         # `package_manifest` 历史上包含 batch_task_index；实时运行必须新建清单而非悄悄
         # 清洗旧 Batch 执行状态，故调用方要使用此函数生成新的独立 identity。
         manifest = {key: value for key, value in manifest.items() if key not in forbidden}
-    value = {**manifest, "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"]}
+    # `realtime_task_index` 只是原冻结八波范围的本地调度投影，不是 Batch 身份，也不会
+    # 写入远端请求。保留它可保证实时切换不扩大原先已授权的任务覆盖范围。
+    value = {**manifest, "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"], "realtime_task_index": task_index}
     value["realtime_request_id"] = f"rt_{value['package_id']}_{canonical_sha256(value)[:10]}"
     value["request_sha256"] = canonical_sha256({"package_id": value["package_id"], "atoms": value["atoms"], "transport": value["transport"]})
     return value
@@ -1024,7 +1140,7 @@ def realtime_usage_cost(usage: dict[str, int | None], policy: RealtimePolicy) ->
     return prompt_tokens / 1_000_000 * policy.input_price_cny_per_million_tokens + completion_tokens / 1_000_000 * policy.output_price_cny_per_million_tokens
 
 
-def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: int, usage: dict[str, int | None], failure_class: str | None = None) -> dict[str, Any]:
+def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: int, usage: dict[str, int | None], failure_class: str | None = None, service_error: dict[str, Any] | None = None) -> dict[str, Any]:
     """生成实时无正文账本；逐请求记录 usage、重试和终态。"""
 
     return {
@@ -1032,26 +1148,30 @@ def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: i
         "transport": "realtime_chat_completions", "input_atom_ids": [row["atom_id"] for row in manifest["atoms"]],
         "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
         "request_time": utc_now(), "request_sha256": manifest["request_sha256"], "outcome": outcome, "attempt": retry_count + 1, "retry_count": retry_count, "usage": usage,
-        "retry_eligible": outcome == "service_transport_exhausted", "failure_origin": failure_class, "raw_response_saved": False, "raw_response_path": None,
+        "retry_eligible": outcome == "service_transport_exhausted" and failure_class == "transient_service", "failure_origin": failure_class,
+        "service_error": service_error, "raw_response_saved": False, "raw_response_path": None,
     }
 
 
 def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
     """拒绝缺失身份、使用量或混入 Batch 字段的实时账本行。"""
 
-    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "realtime_request_id", "transport", "raw_response_saved"}
+    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "realtime_request_id", "transport", "raw_response_saved", "service_error"}
     if not required.issubset(event) or event.get("transport") != "realtime_chat_completions":
         raise ContractError("实时账本缺少冻结字段或传输标识不符")
     if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
         raise ContractError("实时账本不得混入 Batch 身份字段")
     if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"}:
         raise ContractError("实时账本具有未知终态")
+    diagnostic = event.get("service_error")
+    if diagnostic is not None and (not isinstance(diagnostic, dict) or set(diagnostic) != {"http_status", "service_code", "service_message"}):
+        raise ContractError("实时账本的服务诊断字段无效")
 
 
 def execute_realtime_package(
     manifest: dict[str, Any], atoms_by_id: dict[str, dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings,
     policy: RealtimePolicy, transport: RealtimeTransport, run_root: Path, budget_remaining_cny: float,
-    request_bucket: TokenBucket, token_bucket: TokenBucket,
+    request_bucket: TokenBucket, token_bucket: TokenBucket, budget_tracker: BudgetTracker | None = None,
 ) -> tuple[str, float, dict[str, Any]]:
     """执行一个实时包并安全终结；成功、服务失败、隔离与预算熔断互斥。
 
@@ -1084,9 +1204,14 @@ def execute_realtime_package(
         except RealtimeServiceError as error:
             attempts += 1
             if error.retryable and attempts <= settings.max_retries:
+                # 重试等待同样处于全局 RPM/TPM 桶之外；避免一个临时错误占用 worker 后
+                # 紧密重发，触发服务端二次限流。
+                time.sleep(min(policy.retry_backoff_max_seconds, policy.retry_backoff_initial_seconds * (2 ** (attempts - 1))))
                 continue
-            event = realtime_ledger_event(manifest, "service_transport_exhausted", attempts, normalise_usage({}), "transient_service" if error.retryable else "permanent_service")
-            atomic_write_json(state_path, {**read_json(state_path), "status": "service_transport_exhausted", "retry_count": attempts})
+            failure_class = "transient_service" if error.retryable else "permanent_service"
+            diagnostic = error.safe_diagnostic()
+            event = realtime_ledger_event(manifest, "service_transport_exhausted", attempts, normalise_usage({}), failure_class, diagnostic)
+            atomic_write_json(state_path, {**read_json(state_path), "status": "service_transport_exhausted", "retry_count": attempts, "service_error": diagnostic, "raw_response_saved": False})
             return "service_transport_exhausted", 0.0, event
         try:
             content = response.get("choices", [{}])[0].get("message", {}).get("content")
@@ -1096,7 +1221,10 @@ def execute_realtime_package(
             cues = parse_inference_items(parsed, atoms, load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"), load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"])
             usage = normalise_usage(response)
             charged = realtime_usage_cost(usage, policy)
-            if charged > budget_remaining_cny:
+            within_budget = charged <= budget_remaining_cny
+            if budget_tracker is not None:
+                within_budget, _ = budget_tracker.record_charge(charged)
+            if not within_budget:
                 event = realtime_ledger_event(manifest, "budget_stopped", attempts, usage, "post_response_budget_exceeded")
                 atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts})
                 return "budget_stopped", charged, event
@@ -1115,10 +1243,16 @@ def execute_realtime_package(
             })
             return "validated_success", charged, event
         except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
-            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, normalise_usage(response), "local_validation")
+            # 本地验证失败不等于服务端未计费：若 usage 完整，仍须写入共同预算账本，然后
+            # 立即隔离并停止，不能把一次已发生调用误报为零成本。
+            usage = normalise_usage(response)
+            charged = realtime_usage_cost(usage, policy) if all(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens")) else 0.0
+            if budget_tracker is not None:
+                budget_tracker.record_charge(charged)
+            event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, usage, "local_validation")
             atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "raw_response_saved": False})
             atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts})
-            return "local_validation_quarantine", 0.0, event
+            return "local_validation_quarantine", charged, event
     raise AssertionError("实时重试循环未终结")
 
 
@@ -1210,8 +1344,161 @@ def materialize_realtime_run(arguments: argparse.Namespace, settings: Settings, 
     return [realtime_manifest(manifest) for manifest in base], {atom["atom_id"]: atom for atom in atoms}
 
 
+def progress_snapshot(total: int, completed: int, outcomes: dict[str, int], budget: BudgetTracker, started_at: float, in_flight: int, status: str, wave_index: int, task_indexes: list[int]) -> dict[str, Any]:
+    """生成无正文实时进度快照，供终端输出和 `progress.json` 安全查询。
+
+    输入是 package 计数、终态计数、费用账本和单调时间；输出只含数字、状态和 ETA，
+    不含 Source 文本、请求体、模型响应或密钥。它位于第 05 阶段的实时调度循环。
+    """
+
+    elapsed = max(0.0, time.monotonic() - started_at)
+    eta = (elapsed / completed * (total - completed)) if completed else None
+    return {
+        "status": status, "wave_index": wave_index, "wave_task_indexes": task_indexes, "total_packages": total, "completed_packages": completed,
+        "validated_success_packages": outcomes.get("validated_success", 0),
+        "local_validation_quarantine_packages": outcomes.get("local_validation_quarantine", 0),
+        "service_transport_exhausted_packages": outcomes.get("service_transport_exhausted", 0),
+        "budget_stopped_packages": outcomes.get("budget_stopped", 0), "in_flight_packages": in_flight,
+        "authorized_budget_cny": budget.maximum_cny, "spent_cny": budget.spent_cny(),
+        "elapsed_seconds": round(elapsed, 3), "eta_seconds": round(eta, 3) if eta is not None else None,
+        "raw_response_saved": False, "updated_at": utc_now(),
+    }
+
+
+def write_realtime_progress(run_root: Path, settings: Settings, snapshot: dict[str, Any]) -> None:
+    """原子写入实时 `progress.json`；输入快照不含正文，输出为可跨终端查询的状态。"""
+
+    filename = settings.layout.get("progress_filename")
+    if not isinstance(filename, str) or filename != "progress.json":
+        raise ContractError("实时配置缺少冻结的 progress.json 文件名")
+    atomic_write_json(run_root / filename, snapshot)
+
+
+def stamped_wave_progress(snapshot: dict[str, Any], preflight: dict[str, Any]) -> dict[str, Any]:
+    """把波次快照绑定到 run、Source 与协议哈希，供下一波离线启动门核验。"""
+
+    return {
+        **snapshot, "run_id": preflight["run_id"], "source_atoms_sha256": preflight["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": preflight["cue_execution_protocol_sha256"], "raw_response_saved": False,
+    }
+
+
+def require_completed_prior_waves(run_root: Path, wave_index: int, preflight: dict[str, Any], settings: Settings) -> None:
+    """在启动后续波前离线验证前序 progress，拒绝遗漏、失败或身份不一致的波次。
+
+    输入是共享运行根、目标波次和当前无正文预检身份；输出为通过的顺序启动门。该函数
+    位于第 05 阶段实时入口，必须在读取环境密钥前运行，避免未完成前波与后波同时花费。
+    """
+
+    for prior_wave in range(1, wave_index):
+        path = run_root / f"wave_{prior_wave:02d}" / str(settings.layout["progress_filename"])
+        if not path.is_file():
+            raise ContractError(f"前序 Wave {prior_wave} 缺少 progress.json；未读取密钥或联网")
+        progress = read_json(path)
+        expected = {
+            "run_id": preflight["run_id"], "source_atoms_sha256": preflight["source_atoms_sha256"],
+            "cue_execution_protocol_sha256": preflight["cue_execution_protocol_sha256"], "wave_index": prior_wave,
+        }
+        if any(progress.get(key) != value for key, value in expected.items()):
+            raise ContractError(f"前序 Wave {prior_wave} 的 run、Source、协议或波次身份不一致；未读取密钥或联网")
+        total, completed, in_flight = progress.get("total_packages"), progress.get("completed_packages"), progress.get("in_flight_packages")
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (total, completed, in_flight)):
+            raise ContractError(f"前序 Wave {prior_wave} 的 progress 计数无效；未读取密钥或联网")
+        if (
+            progress.get("status") != "completed" or completed != total or in_flight != 0
+            or progress.get("validated_success_packages") != total
+            or any(progress.get(field) != 0 for field in ("local_validation_quarantine_packages", "service_transport_exhausted_packages", "budget_stopped_packages"))
+        ):
+            raise ContractError(f"前序 Wave {prior_wave} 尚未完整成功；未读取密钥或联网")
+
+
+def realtime_event_cost(event: dict[str, Any], policy: RealtimePolicy) -> float:
+    """从无正文账本事件计算已发生费用；缺 usage 只能记零并由失败门停止后续执行。"""
+
+    usage = event.get("usage")
+    return realtime_usage_cost(usage, policy) if isinstance(usage, dict) and all(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens")) else 0.0
+
+
+def cumulative_realtime_events(run_root: Path) -> dict[str, dict[str, Any]]:
+    """读取所有波次和全局账本的无正文事件，以 request id 去重恢复全局预算。"""
+
+    events: dict[str, dict[str, Any]] = {}
+    paths = [run_root / "realtime_cumulative_ledger.jsonl"] + list(run_root.glob("wave_*/realtime_run_ledger.jsonl"))
+    for path in paths:
+        if not path.is_file():
+            continue
+        for event in iter_jsonl(path):
+            request_id = event.get("realtime_request_id")
+            if not isinstance(request_id, str) or not request_id:
+                raise ContractError("实时累计账本缺少 request id")
+            previous = events.get(request_id)
+            if previous is not None and canonical_sha256(previous) != canonical_sha256(event):
+                raise ContractError("实时累计账本出现冲突的重复 request id")
+            events[request_id] = event
+    return events
+
+
+def initialise_cumulative_budget(run_root: Path, preflight: dict[str, Any], authorization: dict[str, Any], policy: RealtimePolicy) -> BudgetTracker:
+    """验证共享运行根并从所有波次账本恢复 `¥80` 全局累计费用。"""
+
+    path = run_root / "realtime_cumulative_progress.json"
+    identity = {key: preflight[key] for key in ("run_id", "source_atoms_sha256", "cue_execution_protocol_sha256")}
+    if path.exists():
+        existing = read_json(path)
+        if any(existing.get(key) != value for key, value in identity.items()) or existing.get("authorized_budget_cny") != authorization["maximum_total_cny"]:
+            raise ContractError("实时共享预算目录属于不同 run、Source、协议或授权；未读取密钥或联网")
+    events = cumulative_realtime_events(run_root)
+    spent = sum(realtime_event_cost(event, policy) for event in events.values())
+    tracker = BudgetTracker(float(authorization["maximum_total_cny"]), spent)
+    atomic_write_json(path, {**identity, "authorized_budget_cny": tracker.maximum_cny, "spent_cny": tracker.spent_cny(), "accounted_request_count": len(events), "raw_response_saved": False, "updated_at": utc_now()})
+    return tracker
+
+
+def write_cumulative_budget(run_root: Path, preflight: dict[str, Any], tracker: BudgetTracker) -> None:
+    """写共享无正文预算快照；每波子目录不拥有独立预算上限。"""
+
+    events = cumulative_realtime_events(run_root)
+    atomic_write_json(run_root / "realtime_cumulative_progress.json", {
+        "run_id": preflight["run_id"], "source_atoms_sha256": preflight["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": preflight["cue_execution_protocol_sha256"], "authorized_budget_cny": tracker.maximum_cny,
+        "spent_cny": tracker.spent_cny(), "accounted_request_count": len(events), "raw_response_saved": False, "updated_at": utc_now(),
+    })
+
+
+def initialise_realtime_run(preflight: dict[str, Any], run_root: Path, settings: Settings, authorization: dict[str, Any]) -> None:
+    """创建或验证实时运行身份，拒绝旧协议目录被新并发执行器错误恢复。
+
+    输入是本轮无正文清单和授权；输出是初始状态文件。若目标目录已有运行状态，必须
+    完全匹配 run id、Source 哈希、协议哈希和 package 身份哈希，绝不覆盖真实旧状态。
+    """
+
+    state_path = run_root / settings.layout["run_state_filename"]
+    if state_path.exists():
+        existing = read_json(state_path)
+        identity = ("run_id", "source_atoms_sha256", "cue_execution_protocol_sha256", "wave_index", "wave_task_indexes", "package_count", "package_ids_sha256")
+        if any(existing.get(key) != preflight.get(key) for key in identity):
+            raise ContractError("实时运行目录属于不同的 Source、协议或 run_id；请使用新的 run_root，未读取密钥或联网")
+        return
+    atomic_write_json(state_path, {**preflight, "status": "running", "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": 0.0, "raw_response_saved": False})
+    atomic_write_jsonl(run_root / settings.layout["realtime_shards_manifest"], [preflight])
+
+
+def realtime_wave_task_indexes(wave_index: int, policy: RealtimePolicy) -> list[int]:
+    """返回原八波计划中一个波次的 task 范围，禁止实时路径擅自扩大覆盖集合。
+
+    输入是用户选择的 1--8 波索引；输出是固定的 task 索引列表。第 05 阶段实时调度
+    仅接收该列表中的 package，以维持原先 `1, 6×10, 14` task 分波授权边界。
+    """
+
+    counts = list(policy.wave_task_counts)
+    if not isinstance(wave_index, int) or not 1 <= wave_index <= len(counts):
+        raise ContractError("实时 wave_index 必须是 1..8")
+    start = sum(counts[:wave_index - 1])
+    return list(range(start, start + counts[wave_index - 1]))
+
+
 def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, policy: RealtimePolicy, marker: dict[str, Any], source_validator: jsonschema.Draft202012Validator, prompt: str, schema: dict[str, Any], protocol_sha256: str) -> dict[str, Any]:
-    """运行经授权的实时 package 序列，逐包持久化状态并在预算/隔离门处立即停止。
+    """以最多十个在飞 package 执行实时请求，并持续写无正文进度与可恢复状态。
 
     此函数仅由 `--realtime-execute` 调用。先完成所有本地哈希、授权、全局清单及预算预留
     校验，再读取环境密钥；默认预检路径永远不会到达此处。
@@ -1219,9 +1506,17 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
 
     if arguments.run_root.name == "batch" or "batch" in arguments.run_root.parts:
         raise ContractError("实时执行必须使用 cues/realtime，禁止复用已取消 Batch 根目录")
+    # 波次是独立的恢复与审计边界。`cues/realtime/wave_01` 的旧失败不能阻止或混入
+    # Wave 2；每个波次各自拥有清单、账本、状态与 progress.json。
+    wave_root = arguments.run_root / f"wave_{arguments.wave_index:02d}"
     authorization = load_realtime_authorization(arguments.authorization, str(marker["sha256"]), protocol_sha256, policy)
-    manifests, atoms = materialize_realtime_run(arguments, settings, source_validator, str(marker["sha256"]), prompt, schema, protocol_sha256)
-    preflight = realtime_shards_manifest(arguments.run_id, manifests, arguments.run_root, settings)
+    all_manifests, atoms = materialize_realtime_run(arguments, settings, source_validator, str(marker["sha256"]), prompt, schema, protocol_sha256)
+    task_indexes = realtime_wave_task_indexes(arguments.wave_index, policy)
+    manifests = [item for item in all_manifests if item.get("realtime_task_index") in task_indexes]
+    if not manifests:
+        raise ContractError("所选实时波次没有冻结 package；未读取密钥或联网")
+    preflight = {**realtime_shards_manifest(arguments.run_id, manifests, wave_root, settings), "wave_index": arguments.wave_index, "wave_task_indexes": task_indexes}
+    require_completed_prior_waves(arguments.run_root, arguments.wave_index, preflight, settings)
     # 以每包输出上限和输入字节代理预留全额，防止在第一条请求前就超过用户授权上限。
     predicted = 0.0
     for manifest in manifests:
@@ -1230,29 +1525,75 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         output_upper = settings.output_tokens_per_atom * len(package_atoms)
         predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
         predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
-    if predicted > float(authorization["maximum_total_cny"]):
-        raise ContractError("实时输出 token 上界已超过授权预算；未读取密钥或联网")
-    atomic_write_json(arguments.run_root / settings.layout["run_state_filename"], {**preflight, "status": "running", "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": 0.0, "raw_response_saved": False})
-    atomic_write_jsonl(arguments.run_root / settings.layout["realtime_shards_manifest"], [preflight])
+    budget = initialise_cumulative_budget(arguments.run_root, preflight, authorization, policy)
+    if predicted > budget.maximum_cny - budget.spent_cny():
+        raise ContractError("当前波输出 token 上界已超过实时全局剩余授权预算；未读取密钥或联网")
+    initialise_realtime_run(preflight, wave_root, settings, authorization)
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
         raise ContractError("缺少环境变量 DASHSCOPE_API_KEY；未发出实时请求")
     transport = RealtimeTransport(settings.endpoint, api_key)
     request_bucket, token_bucket = TokenBucket(policy.requests_per_minute), TokenBucket(policy.tokens_per_minute)
-    spent = 0.0
     outcomes: dict[str, int] = {}
-    for manifest in manifests:
-        status, charged, event = execute_realtime_package(manifest, atoms, prompt, schema, settings, policy, transport, arguments.run_root, float(authorization["maximum_total_cny"]) - spent, request_bucket, token_bucket)
-        if status == "recovered_skip":
-            continue
-        validate_realtime_ledger_event(event)
-        append_ledger_event(arguments.run_root / settings.layout["run_ledger_filename"], event)
-        spent += charged
-        outcomes[status] = outcomes.get(status, 0) + 1
-        atomic_write_json(arguments.run_root / settings.layout["run_state_filename"], {**preflight, "status": status if status != "validated_success" else "running", "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": spent, "outcomes": outcomes, "raw_response_saved": False})
-        if status in {"budget_stopped", "local_validation_quarantine"}:
-            break
-    return {"mode": "realtime_run", "network_called": True, "spent_cny": spent, "outcomes": outcomes, "formal_cue_library_written": False}
+    started_at = time.monotonic()
+    completed = 0
+    next_index = 0
+    pending: dict[Future[tuple[str, float, dict[str, Any]]], dict[str, Any]] = {}
+    stop_status: str | None = None
+
+    def submit_next(pool: ThreadPoolExecutor) -> bool:
+        """只提交一个尚未完成的包，令 in-flight 上限可由冻结配置强制。"""
+
+        nonlocal next_index
+        while next_index < len(manifests):
+            manifest = manifests[next_index]
+            next_index += 1
+            future = pool.submit(execute_realtime_package, manifest, atoms, prompt, schema, settings, policy, transport, wave_root, budget.maximum_cny - budget.spent_cny(), request_bucket, token_bucket, budget)
+            pending[future] = manifest
+            return True
+        return False
+
+    with ThreadPoolExecutor(max_workers=policy.maximum_in_flight, thread_name_prefix="egopm-realtime") as pool:
+        while len(pending) < policy.maximum_in_flight and submit_next(pool):
+            pass
+        last_progress = 0.0
+        while pending:
+            timeout = max(0.1, policy.progress_update_interval_seconds - (time.monotonic() - last_progress))
+            finished, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
+            if not finished:
+                snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, len(pending), "running", arguments.wave_index, task_indexes), preflight)
+                write_realtime_progress(wave_root, settings, snapshot)
+                print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
+                last_progress = time.monotonic()
+                continue
+            for future in finished:
+                pending.pop(future)
+                status, _charged, event = future.result()
+                if status == "recovered_skip":
+                    completed += 1
+                    outcomes["validated_success"] = outcomes.get("validated_success", 0) + 1
+                else:
+                    validate_realtime_ledger_event(event)
+                    append_ledger_event(wave_root / settings.layout["run_ledger_filename"], event)
+                    append_ledger_event(arguments.run_root / "realtime_cumulative_ledger.jsonl", event)
+                    write_cumulative_budget(arguments.run_root, preflight, budget)
+                    completed += 1
+                    outcomes[status] = outcomes.get(status, 0) + 1
+                    if status in {"budget_stopped", "local_validation_quarantine", "service_transport_exhausted"}:
+                        stop_status = status
+            if stop_status is None:
+                while len(pending) < policy.maximum_in_flight and submit_next(pool):
+                    pass
+            snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, len(pending), stop_status or "running", arguments.wave_index, task_indexes), preflight)
+            write_realtime_progress(wave_root, settings, snapshot)
+            print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
+            last_progress = time.monotonic()
+
+    final_status = stop_status or "completed"
+    snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, 0, final_status, arguments.wave_index, task_indexes), preflight)
+    write_realtime_progress(wave_root, settings, snapshot)
+    atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})
+    return {"mode": "realtime_run", "network_called": True, "spent_cny": budget.spent_cny(), "outcomes": outcomes, "formal_cue_library_written": False}
 
 
 def merge_completed_packages(manifests: list[dict[str, Any]], run_root: Path, settings: Settings, output: Path) -> int:

@@ -203,7 +203,30 @@ REALTIME_RUN_STATE_REQUIRED_FIELDS = {
     "authorized_budget_cny",
     "estimated_cost_cny",
     "usage_summary",
+    "wave_index",
+    "wave_task_indexes",
 }
+# `progress.json` 是运行中的只读查询快照而不是 Cue 产物；但最终 SUCCESS 审计仍需
+# 检查其末态，以证明实际调度没有突破已批准的八波边界或十个在飞 package 上限。
+REALTIME_PROGRESS_REQUIRED_FIELDS = {
+    "status",
+    "wave_index",
+    "wave_task_indexes",
+    "total_packages",
+    "completed_packages",
+    "validated_success_packages",
+    "local_validation_quarantine_packages",
+    "service_transport_exhausted_packages",
+    "budget_stopped_packages",
+    "in_flight_packages",
+    "authorized_budget_cny",
+    "spent_cny",
+    "elapsed_seconds",
+    "eta_seconds",
+    "raw_response_saved",
+    "updated_at",
+}
+REALTIME_WAVE_TASK_COUNTS = (1, 10, 10, 10, 10, 10, 10, 14)
 REALTIME_RAW_CONTENT_EXTRA_FIELDS = {
     "batch_custom_id",
     "batch_id",
@@ -1010,7 +1033,7 @@ def realtime_layout(config: RunConfig) -> dict[str, Any]:
     layout = execution["shard_layout"]
     if execution.get("transport") != "realtime_chat_completions" or str(layout.get("root")) != "cues/realtime":
         raise ValueError("冻结实时协议未声明 cues/realtime 运行根")
-    required = {"realtime_shards_manifest", "run_ledger_filename", "run_state_filename", "package_directory", "ledger_suffix", "completion_suffix"}
+    required = {"realtime_shards_manifest", "run_ledger_filename", "run_state_filename", "progress_filename", "package_directory", "ledger_suffix", "completion_suffix"}
     if required.difference(layout):
         raise ValueError(f"冻结实时布局缺少 {sorted(required.difference(layout))}")
     return layout
@@ -1045,6 +1068,111 @@ def has_forbidden_realtime_content(value: Any) -> bool:
     if isinstance(value, list):
         return any(has_forbidden_realtime_content(item) for item in value)
     return False
+
+
+def validate_realtime_progress_snapshot(
+    progress: dict[str, Any],
+    run_state: dict[str, Any],
+    policy: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+    path: Path,
+) -> bool:
+    """验证无正文进度快照与冻结波次、在飞上限及最终运行状态一致。
+
+    输入是生产者原子写入的 `progress.json`、同一运行状态和冻结实时策略；输出是
+    布尔门禁结果。该检查不读取任何请求或响应正文，避免把便利的进度文件变成数据
+    泄露旁路，也避免十个并发 worker 意外跨越当前被批准的一个波次。
+    """
+
+    valid = True
+    if has_forbidden_realtime_content(progress):
+        collector.add("BLOCKER", "cue_realtime_progress_raw_content", str(path), "无请求/响应/错误正文", "发现正文键", owner)
+        return False
+    missing = sorted(REALTIME_PROGRESS_REQUIRED_FIELDS.difference(progress))
+    if missing:
+        collector.add("BLOCKER", "cue_realtime_progress_fields", str(path), "完整无正文进度字段", f"缺少 {missing}", owner)
+        return False
+    wave_index = progress["wave_index"]
+    if not isinstance(wave_index, int) or not 1 <= wave_index <= len(REALTIME_WAVE_TASK_COUNTS):
+        collector.add("BLOCKER", "cue_realtime_progress_wave", str(path), "1--8 的波次索引", repr(wave_index), owner)
+        return False
+    wave_start = sum(REALTIME_WAVE_TASK_COUNTS[:wave_index - 1])
+    expected_tasks = list(range(wave_start, wave_start + REALTIME_WAVE_TASK_COUNTS[wave_index - 1]))
+    if progress["wave_task_indexes"] != expected_tasks:
+        collector.add("BLOCKER", "cue_realtime_progress_wave", f"{path}:wave_task_indexes", repr(expected_tasks), repr(progress["wave_task_indexes"]), owner)
+        valid = False
+    if run_state.get("wave_index") != wave_index or run_state.get("wave_task_indexes") != expected_tasks:
+        collector.add("BLOCKER", "cue_realtime_progress_lineage", str(path), "与 run state 为同一冻结波次", repr({"progress": wave_index, "state": run_state.get("wave_index")}), owner)
+        valid = False
+    numeric_fields = REALTIME_PROGRESS_REQUIRED_FIELDS.intersection({
+        "total_packages", "completed_packages", "validated_success_packages",
+        "local_validation_quarantine_packages", "service_transport_exhausted_packages",
+        "budget_stopped_packages", "in_flight_packages",
+    })
+    for field in numeric_fields:
+        if not isinstance(progress[field], int) or isinstance(progress[field], bool) or progress[field] < 0:
+            collector.add("BLOCKER", "cue_realtime_progress_value", f"{path}:{field}", "非负整数", repr(progress[field]), owner)
+            valid = False
+    maximum_in_flight = policy.get("maximum_in_flight")
+    if not isinstance(maximum_in_flight, int) or maximum_in_flight != 10 or progress["in_flight_packages"] > maximum_in_flight:
+        collector.add("BLOCKER", "cue_realtime_progress_inflight", str(path), "最多 10 个在飞 package", repr(progress.get("in_flight_packages")), owner)
+        valid = False
+    terminal_count = sum(progress[field] for field in (
+        "validated_success_packages", "local_validation_quarantine_packages",
+        "service_transport_exhausted_packages", "budget_stopped_packages",
+    ) if isinstance(progress.get(field), int) and not isinstance(progress.get(field), bool))
+    if terminal_count != progress["completed_packages"] or progress["completed_packages"] + progress["in_flight_packages"] > progress["total_packages"]:
+        collector.add("BLOCKER", "cue_realtime_progress_counts", str(path), "终态计数一致且 completed + in_flight 不超过总数", repr(progress), owner)
+        valid = False
+    if progress["status"] != "completed" or progress["in_flight_packages"] != 0 or progress["completed_packages"] != progress["total_packages"]:
+        collector.add("BLOCKER", "cue_realtime_progress_terminal", str(path), "completed、零在飞且全部 package 已终结", repr(progress), owner)
+        valid = False
+    return valid
+
+
+def validate_all_realtime_waves(root: Path, layout: dict[str, Any], policy: dict[str, Any], collector: IssueCollector, owner: str) -> bool:
+    """聚合验证八个实时波次，要求完整、不重叠且与根级累计账本一致。
+
+    该函数只读每个 `wave_XX` 子目录的状态、进度和无正文账本。最终 SUCCESS 之前，
+    八波必须全部完成；根级累计账本按 `realtime_request_id` 去重后必须与各波账本并集
+    相等，防止某一波遗漏费用或把同一请求重复计入 `¥80` 总预算。
+    """
+
+    directories = [root / f"wave_{index:02d}" for index in range(1, 9)]
+    if not any(path.exists() for path in directories):
+        return True
+    valid = True
+    seen_tasks: set[int] = set()
+    wave_events: dict[str, dict[str, Any]] = {}
+    for index, directory in enumerate(directories, start=1):
+        state = load_json(directory / str(layout["run_state_filename"]), collector, "cue_realtime_wave_state", owner)
+        progress = load_json(directory / str(layout["progress_filename"]), collector, "cue_realtime_wave_progress", owner)
+        if state is None or progress is None:
+            valid = False
+            continue
+        valid = validate_realtime_progress_snapshot(progress, state, policy, collector, owner, directory / str(layout["progress_filename"])) and valid
+        if state.get("status") != "completed":
+            collector.add("BLOCKER", "cue_realtime_wave_terminal", str(directory), "completed", repr(state.get("status")), owner); valid = False
+        tasks = progress.get("wave_task_indexes")
+        if isinstance(tasks, list):
+            overlap = seen_tasks.intersection(tasks)
+            if overlap:
+                collector.add("BLOCKER", "cue_realtime_wave_overlap", str(directory), "波次 task 不重叠", repr(sorted(overlap)), owner); valid = False
+            seen_tasks.update(tasks)
+        for event in read_jsonl(directory / str(layout["run_ledger_filename"]), collector, "cue_realtime_wave_ledger", owner):
+            request_id = event.get("realtime_request_id")
+            if not isinstance(request_id, str) or request_id in wave_events:
+                collector.add("BLOCKER", "cue_realtime_wave_ledger_identity", str(directory), "跨波唯一 request id", repr(request_id), owner); valid = False
+            elif has_forbidden_realtime_content(event):
+                collector.add("BLOCKER", "cue_realtime_raw_content", str(directory), "无正文累计账本", "发现正文键", owner); valid = False
+            else: wave_events[request_id] = event
+    if seen_tasks != set(range(sum(REALTIME_WAVE_TASK_COUNTS))):
+        collector.add("BLOCKER", "cue_realtime_wave_coverage", str(root), "完整 75 个冻结 task", repr(sorted(seen_tasks)), owner); valid = False
+    cumulative = {event.get("realtime_request_id"): event for event in read_jsonl(root / "realtime_cumulative_ledger.jsonl", collector, "cue_realtime_cumulative_ledger", owner)}
+    if set(cumulative) != set(wave_events) or any(canonical_sha256(cumulative[key]) != canonical_sha256(value) for key, value in wave_events.items()):
+        collector.add("BLOCKER", "cue_realtime_cumulative_ledger", str(root), "根级账本等于八波账本并集", f"累计 {len(cumulative)} / 波次 {len(wave_events)}", owner); valid = False
+    return valid
 
 
 def validate_realtime_execution_lineage(
@@ -1117,6 +1245,13 @@ def validate_realtime_artifacts(
     manifest_path = realtime_shards_manifest_path(config)
     run_state_path = root / str(layout["run_state_filename"])
     run_ledger_path = root / str(layout["run_ledger_filename"])
+    progress_path = root / str(layout["progress_filename"])
+    # v3.1 起实际执行按 wave 子目录隔离。只要存在任一波目录，最终 SUCCESS 必须走
+    # 八波聚合门，不能再把旧单根工件误当成完整运行。
+    if any((root / f"wave_{index:02d}").exists() for index in range(1, 9)):
+        registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+        policy = registry.get("models", {}).get("cue_extraction", {}).get("execution", {}).get("realtime_api_policy", {}) if isinstance(registry, dict) else {}
+        return validate_all_realtime_waves(root, layout, policy, collector, owner)
     valid = True
     for path, field in ((manifest_path, "realtime_shards_manifest_sha256"), (run_state_path, "realtime_run_state_sha256"), (run_ledger_path, "realtime_run_ledger_sha256")):
         if not path.is_file():
@@ -1151,6 +1286,14 @@ def validate_realtime_artifacts(
     if isinstance(run_state.get("authorized_budget_cny"), (int, float)) and isinstance(run_state.get("estimated_cost_cny"), (int, float)) and run_state["estimated_cost_cny"] > run_state["authorized_budget_cny"]:
         collector.add("BLOCKER", "cue_realtime_budget_fuse", str(run_state_path), "estimated_cost_cny 不超过授权预算", repr(run_state), owner)
         valid = False
+    progress = load_json(progress_path, collector, "cue_realtime_progress", owner)
+    if progress is None:
+        valid = False
+    else:
+        registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+        policy = registry.get("models", {}).get("cue_extraction", {}).get("execution", {}).get("realtime_api_policy", {}) if isinstance(registry, dict) else {}
+        valid = validate_realtime_progress_snapshot(progress, run_state, policy, collector, owner, progress_path) and valid
+        valid = validate_all_realtime_waves(root, layout, policy, collector, owner) and valid
     rows = read_jsonl(manifest_path, collector, "cue_realtime_manifest", owner)
     if marker["realtime_shard_count"] != len(rows):
         collector.add("BLOCKER", "cue_realtime_shard_count", "cue", str(len(rows)), repr(marker["realtime_shard_count"]), owner)

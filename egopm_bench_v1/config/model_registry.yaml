@@ -74,6 +74,11 @@ models:
         max_local_validation_quarantine_per_run: 0
         failure_retry_requires_same_protocol: true
         explicit_rerun_failed_packages_only: true
+        # 实时只替换传输层，继续采用已获教师同意的 1 + 6×10 + 14 task 八波范围。
+        wave_task_counts: [1, 10, 10, 10, 10, 10, 10, 14]
+        logical_shards_per_task: 10
+        # 进度快照只含计数、估算费用与状态，绝不包含字幕、请求体或模型原始响应。
+        progress_update_interval_seconds: 15
       token_accounting:
         authoritative_source: response_usage
         input_field: prompt_tokens
@@ -101,6 +106,7 @@ models:
         failed_suffix: .failed.json
         run_ledger_filename: realtime_run_ledger.jsonl
         run_state_filename: realtime_run_state.json
+        progress_filename: progress.json
         merge_order: numeric_shard_index_ascending
       recovery:
         require_matching_source_hash: true

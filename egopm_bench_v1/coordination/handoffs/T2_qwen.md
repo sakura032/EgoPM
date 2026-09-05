@@ -159,3 +159,50 @@ Batch task；最大 Batch 请求行 `10943` UTF-8 字节，输入字节代理上
 - `CR-2026-009` 的无 API T2 实现待 T0/T4 审阅。任何真正 Batch 上传、轮询、下载、远端清理、
   正式 Cue 合并和 SUCCESS 写入均不在本提交中，须另获用户的预算与执行授权。
 - T4 应针对完整协议哈希、任务总清单、账本终态和最终 SUCCESS 的 Batch 血缘字段实施独立 QA。
+
+## 实时 v3.1 故障恢复交接（2026-09-05）
+
+本节覆盖用户首次实时启动暴露的 HTTP `400` 与 Windows `PermissionError`；它不改动
+任何用户真实运行目录、Source、Cue library 或 SUCCESS。
+
+### 本次修改
+
+- `scripts/05_extract_cues.py`
+  - 状态和 JSONL 写入使用唯一临时文件并对 Windows 共享锁有限重试；重试耗尽会保留旧
+    状态和临时文件后中止，绝不删除真实 `realtime_state.json`。
+  - HTTP 错误只在内存中提取受限的状态码、服务 `code` 和净化限长 `message`。完整错误体、
+    请求体、字幕和模型原始响应均不保存。HTTP `400` 写无正文
+    `service_transport_exhausted` 终态且不重试，调度器不再提交新包。
+  - RPM/TPM 桶与费用账本均加锁；`ThreadPoolExecutor` 最多 `10` 个在飞 package，worker
+    仅写自身 package 文件，主线程单独追加全局账本。
+  - 每 15 秒及每个完成事件原子写波次目录内 `progress.json` 并打印同一无正文快照：波次、
+    task 范围、总数、完成/成功/隔离/服务失败/预算停止、在飞数、预算、累计费用、耗时与 ETA。
+  - 实时路径读取 `realtime_execution_policy` 冻结的八波范围
+    `[1,10,10,10,10,10,10,14]` 和每 task 十个逻辑 shard。`--wave-index` 只调度该波；每波
+    使用独立根目录 `cues/realtime/wave_XX`，不能与其它波或旧协议恢复状态混合。
+- `tests/test_qwen_contracts.py`
+  - 新增 HTTP `400` 安全诊断/终态、Windows 原子替换重试、十并发上限和按波
+    `progress.json` 无正文测试。
+
+### 真实运行恢复边界
+
+旧 `cues/realtime` 目录的 `183` 个无计费 HTTP `400` 失败状态及一个 `requesting` 状态
+绝不覆盖、绝不自动重发。T0/T4 完成新协议 SHA 和授权复核后，用户必须采用新的 run id；
+新执行会从独立 `cues/realtime/wave_01` 开始，仅处理 task 0。每波通过门禁后才可授权下一波。
+
+### 全八波累计预算补充
+
+`¥80` 是同一 `run_id`、Source 哈希和协议哈希下八个波次的共同上限，不会在
+`wave_XX` 子目录中重置。共享根 `cues/realtime` 新增无正文
+`realtime_cumulative_ledger.jsonl` 和 `realtime_cumulative_progress.json`：每次波内事件先
+写波账本、再写累计账本和累计费用快照；恢复时按 `realtime_request_id` 去重扫描所有波账本
+和累计账本，重建已经发生的真实 usage 费用。若共享身份或授权预算不匹配，执行在读取密钥
+或联网前拒绝。新增测试验证 Wave 2 会从 Wave 1 已花费用量继续核算。
+
+### 波次顺序启动门补充
+
+启动 `Wave N`（`N>1`）时，执行器会在读取 `DASHSCOPE_API_KEY` 前逐一读取共享根下
+`wave_01` 到 `wave_{N-1}` 的 `progress.json`。每个前序波必须具有一致的 run id、Source
+哈希和协议哈希，且 `status=completed`、完成数等于总数、在飞数为零、成功数等于总数、
+隔离/服务失败/预算停止均为零；任何缺失、身份不一致或失败都会阻断下一波。进度快照已
+绑定上述身份字段；测试覆盖 Wave 2 的通过与失败阻断场景。
