@@ -1,6 +1,6 @@
 contract_version: v1.1.0
 config_version: v1.1.0
-registry_version: v1.4.0
+registry_version: v1.5.0
 credential_environment_variable: DASHSCOPE_API_KEY
 credential_policy: environment_only
 raw_response_policy: forbidden
@@ -9,7 +9,7 @@ default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 models:
   cue_extraction:
-    # Batch API 当前接受模型族基础别名；日期快照仅在实时接口可用。
+    # 基础别名同时适用于北京实时接口；日期快照不再作为本次实时协议的冻结标识。
     model_id: qwen3.7-flash
     thinking_enabled: false
     reasoning_effort: none
@@ -18,13 +18,13 @@ models:
     schema: cue_candidate.schema.json
     schema_version: v1.0.0
     execution:
-      cue_execution_policy_version: v2.2.1
+      cue_execution_policy_version: v3.0.0
       # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
-      protocol_hash_payload_version: v2.0.0
-      mode: explicit_batch_file_execute_only
+      protocol_hash_payload_version: v3.0.0
+      mode: explicit_realtime_execute_only
       shard_size_atoms: 500
       max_retries: 2
-      transport: batch_file
+      transport: realtime_chat_completions
       package_policy:
         maximum_atoms: 5
         maximum_request_utf8_bytes: 24000
@@ -46,68 +46,68 @@ models:
         required_fields: [n, t, p, x, c, v]
         optional_defaults: {e: [], s: null, a: null, r: null}
         confidence_scale: 100
-      batch_file_policy:
-        logical_shards_per_task: 10
-        completion_window: 24h
-        max_requests_per_file: 50000
-        max_input_file_bytes: 500000000
-        max_request_line_bytes: 1000000
-        request_endpoint: /v1/chat/completions
-        custom_id_format: v22_s{shard_index:05d}_p{package_index:03d}_{manifest_sha256_8}
-        local_request_body_storage: temporary_delete_after_upload
-        local_raw_result_storage: forbidden_stream_only
-        remote_files_delete_after_cue_qa: required
+      realtime_api_policy:
+        request_endpoint: /chat/completions
+        maximum_in_flight: 10
+        requests_per_minute: 300
+        tokens_per_minute: 1000000
+        token_reservation: serialized_utf8_request_bytes_plus_max_tokens
+        retryable_http_statuses: [408, 429, 500, 502, 503, 504]
+        retry_backoff_initial_seconds: 2
+        retry_backoff_max_seconds: 60
+        request_timeout_seconds: 60
+        request_body_storage: temporary_memory_only
+        raw_response_storage: forbidden_stream_only
         successful_local_validation_failure: quarantine_no_auto_retry
-      batch_ledger_policy:
-        required_fields: [batch_task_index, batch_custom_id, batch_input_sha256, remote_file_id, remote_cleanup_status, outcome]
-        terminal_outcomes: [validated_success, service_line_failure_requeueable, local_validation_quarantine]
-        require_single_terminal_outcome_per_custom_id: true
+      realtime_ledger_policy:
+        required_fields: [realtime_shard_index, package_id, request_sha256, attempt, outcome, usage, retry_eligible, failure_origin]
+        terminal_outcomes: [validated_success, service_transport_exhausted, local_validation_quarantine, budget_stopped]
+        require_single_terminal_outcome_per_package: true
         prohibit_requeue_after_local_validation_quarantine: true
-      batch_execution_policy:
-        authorization_version: v1.0.0
+        prohibit_requeue_after_budget_stop: true
+      realtime_execution_policy:
+        authorization_version: v2.0.0
         authorization_required: true
-        wave_task_counts: [1, 10, 10, 10, 10, 10, 10, 14]
-        max_submit_in_flight: 1
-        completion_poll_initial_seconds: 30
-        completion_poll_max_seconds: 300
-        max_local_validation_quarantine_per_wave: 0
-        remote_cleanup_gate: t4_cue_qa_done
-        execution_state_filename: execution_state.json
+        execution_confirmation: START_REALTIME_CUE_API
+        maximum_cost_reservation_fraction: 1.0
+        stop_before_authorized_budget_exceeded: true
+        max_local_validation_quarantine_per_run: 0
+        failure_retry_requires_same_protocol: true
+        explicit_rerun_failed_packages_only: true
       token_accounting:
         authoritative_source: response_usage
         input_field: prompt_tokens
         output_field: completion_tokens
         total_field: total_tokens
-        preflight_upper_bound: serialized_utf8_batch_request_bytes
+        preflight_upper_bound: serialized_utf8_realtime_request_bytes
         raw_response_storage: forbidden
       pricing_snapshot:
-        pricing_version: "2026-09-01_cn-beijing_batch_file_list"
+        pricing_version: "2026-09-05_cn-beijing_realtime_list"
         official_pricing_url: https://help.aliyun.com/zh/model-studio/model-pricing
-        input_price_cny_per_million_tokens: 0.1
-        output_price_cny_per_million_tokens: 0.4
+        input_price_cny_per_million_tokens: 0.2
+        output_price_cny_per_million_tokens: 0.8
         price_region: cn-beijing
         input_context_window_tokens: 32000
-        successful_requests_only_billed: true
+        successful_requests_only_billed: false
         context_cache_supported: false
       shard_layout:
-        root: cues/batch
-        batch_tasks_manifest: batch_tasks_manifest.jsonl
+        root: cues/realtime
+        realtime_shards_manifest: realtime_shards_manifest.jsonl
         package_directory: packages
         input_manifest_suffix: .input.jsonl
         output_suffix: .result.jsonl
         ledger_suffix: .ledger.jsonl
         completion_suffix: .complete.json
         failed_suffix: .failed.json
-        batch_input_suffix: .batch.jsonl
-        batch_manifest_suffix: .batch.json
-        batch_receipt_suffix: .batch_receipt.json
+        run_ledger_filename: realtime_run_ledger.jsonl
+        run_state_filename: realtime_run_state.json
         merge_order: numeric_shard_index_ascending
       recovery:
         require_matching_source_hash: true
         require_matching_protocol_hash: true
         rerun_only_incomplete_or_failed_packages: true
         completion_marker_requires_sha256: true
-        require_batch_custom_id_bijection: true
+        require_package_id_bijection: true
         prohibit_automatic_local_validation_retry: true
   seed_generation:
     model_id: qwen3.7-plus-2026-05-26

@@ -74,22 +74,22 @@ def test_split_policy_forbids_cross_session_relative_time_order() -> None:
     assert duplicate_policy["max_gap_seconds"] is None
 
 
-def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
-    """Cue v2.2 必须冻结 Batch、短码、96 token 和无 API 恢复边界。"""
+def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
+    """Cue v3 必须冻结实时限流、成本熔断、短码与无正文恢复边界。"""
 
     registry = yaml.safe_load((CONFIG_DIR / "model_registry.yaml").read_text(encoding="utf-8"))
     cue = registry["models"]["cue_extraction"]
     execution = cue["execution"]
-    assert registry["registry_version"] == "v1.4.0"
+    assert registry["registry_version"] == "v1.5.0"
     assert registry["raw_response_policy"] == "forbidden"
     assert cue["model_id"] == "qwen3.7-flash"
     assert cue["prompt_version"] == "cue_extractor_v3_compact"
-    assert execution["cue_execution_policy_version"] == "v2.2.1"
-    assert execution["protocol_hash_payload_version"] == "v2.0.0"
-    assert execution["mode"] == "explicit_batch_file_execute_only"
+    assert execution["cue_execution_policy_version"] == "v3.0.0"
+    assert execution["protocol_hash_payload_version"] == "v3.0.0"
+    assert execution["mode"] == "explicit_realtime_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2
-    assert execution["transport"] == "batch_file"
+    assert execution["transport"] == "realtime_chat_completions"
     assert execution["package_policy"] == {
         "maximum_atoms": 5,
         "maximum_request_utf8_bytes": 24000,
@@ -114,60 +114,42 @@ def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
         "optional_defaults": {"e": [], "s": None, "a": None, "r": None},
         "confidence_scale": 100,
     }
-    assert execution["batch_file_policy"] == {
-        "logical_shards_per_task": 10,
-        "completion_window": "24h",
-        "max_requests_per_file": 50000,
-        "max_input_file_bytes": 500000000,
-        "max_request_line_bytes": 1000000,
-        "request_endpoint": "/v1/chat/completions",
-        "custom_id_format": "v22_s{shard_index:05d}_p{package_index:03d}_{manifest_sha256_8}",
-        "local_request_body_storage": "temporary_delete_after_upload",
-        "local_raw_result_storage": "forbidden_stream_only",
-        "remote_files_delete_after_cue_qa": "required",
+    assert execution["realtime_api_policy"] == {
+        "request_endpoint": "/chat/completions", "maximum_in_flight": 10,
+        "requests_per_minute": 300, "tokens_per_minute": 1000000,
+        "token_reservation": "serialized_utf8_request_bytes_plus_max_tokens",
+        "retryable_http_statuses": [408, 429, 500, 502, 503, 504],
+        "retry_backoff_initial_seconds": 2, "retry_backoff_max_seconds": 60,
+        "request_timeout_seconds": 60, "request_body_storage": "temporary_memory_only",
+        "raw_response_storage": "forbidden_stream_only",
         "successful_local_validation_failure": "quarantine_no_auto_retry",
     }
-    assert execution["batch_ledger_policy"] == {
-        "required_fields": ["batch_task_index", "batch_custom_id", "batch_input_sha256", "remote_file_id", "remote_cleanup_status", "outcome"],
-        "terminal_outcomes": ["validated_success", "service_line_failure_requeueable", "local_validation_quarantine"],
-        "require_single_terminal_outcome_per_custom_id": True,
-        "prohibit_requeue_after_local_validation_quarantine": True,
-    }
-    assert execution["batch_execution_policy"] == {
-        "authorization_version": "v1.0.0",
-        "authorization_required": True,
-        "wave_task_counts": [1, 10, 10, 10, 10, 10, 10, 14],
-        "max_submit_in_flight": 1,
-        "completion_poll_initial_seconds": 30,
-        "completion_poll_max_seconds": 300,
-        "max_local_validation_quarantine_per_wave": 0,
-        "remote_cleanup_gate": "t4_cue_qa_done",
-        "execution_state_filename": "execution_state.json",
-    }
-    assert execution["shard_layout"]["root"] == "cues/batch"
-    assert execution["shard_layout"]["batch_tasks_manifest"] == "batch_tasks_manifest.jsonl"
+    assert execution["realtime_ledger_policy"]["terminal_outcomes"] == ["validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"]
+    assert execution["realtime_execution_policy"]["execution_confirmation"] == "START_REALTIME_CUE_API"
+    assert execution["shard_layout"]["root"] == "cues/realtime"
+    assert execution["shard_layout"]["realtime_shards_manifest"] == "realtime_shards_manifest.jsonl"
     assert execution["pricing_snapshot"] == {
-        "pricing_version": "2026-09-01_cn-beijing_batch_file_list",
+        "pricing_version": "2026-09-05_cn-beijing_realtime_list",
         "official_pricing_url": "https://help.aliyun.com/zh/model-studio/model-pricing",
-        "input_price_cny_per_million_tokens": 0.1,
-        "output_price_cny_per_million_tokens": 0.4,
+        "input_price_cny_per_million_tokens": 0.2,
+        "output_price_cny_per_million_tokens": 0.8,
         "price_region": "cn-beijing",
         "input_context_window_tokens": 32000,
-        "successful_requests_only_billed": True,
+        "successful_requests_only_billed": False,
         "context_cache_supported": False,
     }
     assert execution["token_accounting"]["authoritative_source"] == "response_usage"
-    assert execution["token_accounting"]["preflight_upper_bound"] == "serialized_utf8_batch_request_bytes"
+    assert execution["token_accounting"]["preflight_upper_bound"] == "serialized_utf8_realtime_request_bytes"
     assert execution["token_accounting"]["raw_response_storage"] == "forbidden"
     assert execution["recovery"] == {
         "require_matching_source_hash": True,
         "require_matching_protocol_hash": True,
         "rerun_only_incomplete_or_failed_packages": True,
         "completion_marker_requires_sha256": True,
-        "require_batch_custom_id_bijection": True,
+        "require_package_id_bijection": True,
         "prohibit_automatic_local_validation_retry": True,
     }
-    assert {"cue_execution_policy_version", "cue_execution_protocol_sha256", "cue_prompt_sha256", "cue_inference_schema_sha256", "source_atoms_sha256", "package_maximum_atoms", "package_maximum_request_utf8_bytes", "output_tokens_per_atom", "batch_task_id", "batch_custom_id", "batch_input_sha256", "remote_file_id", "remote_cleanup_status", "package_count", "usage_summary"}.issubset(registry["run_manifest_required_fields"])
+    assert {"cue_execution_policy_version", "cue_execution_protocol_sha256", "cue_prompt_sha256", "cue_inference_schema_sha256", "source_atoms_sha256", "package_maximum_atoms", "package_maximum_request_utf8_bytes", "output_tokens_per_atom", "package_count", "usage_summary"}.issubset(registry["run_manifest_required_fields"])
 
 
 def test_compact_cue_inference_schema_excludes_controlled_fields_and_stays_small() -> None:
