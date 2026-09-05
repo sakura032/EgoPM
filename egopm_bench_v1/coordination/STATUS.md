@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；CR-2026-010 后模型登记为 `qwen3.7-flash`、执行协议 `v2.2.1`、协议 SHA `c2a5db76c6e74cd09942aea020caa6c09ffcfcb9ce57f8a4e87dec8ec6421198`；旧 Wave 1 `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 在服务端校验阶段失败（`request_counts.total=0`） | 旧 Batch 输入不可重用；本机授权文件需重新绑定新协议 SHA；尚未重新提交 Wave 1，也没有 Cue/SUCCESS | T0 完成无 API 回归和协议哈希复算后，用户确认重新提交 Wave 1；不得重试旧 batch |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；模型 `qwen3.7-flash`、执行协议 `v2.2.1`、协议 SHA `c2a5db76c6e74cd09942aea020caa6c09ffcfcb9ce57f8a4e87dec8ec6421198`；第 1 波无 API 授权核验有效；Batch 提交、接收、流式逐包验证、无正文账本、断点恢复和 T4 receipt QA 已实现 | 旧 Batch `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 校验失败且不得重试；尚无新 Wave 1 远端任务、Cue 或 SUCCESS | 由用户用环境变量密钥提交新的第 1 波；完成后以独立接收确认调用接收器，T4 再执行 Cue QA |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
@@ -43,3 +43,4 @@
 - Batch File 适配器已具备上传临时输入、创建任务、读取状态、流式读取结果/错误 JSONL 与删除远端文件的最小 HTTP 操作，并以 fake HTTP 完成无网络测试；异常只保留 HTTP 状态与无正文摘要。当前 `--execute` 已接入授权波次提交入口，但结果接收与最终 Cue QA 仍未完成。
 - 2026-09-05：用户在 `.venv` 中自行提交第 1 波 API，task `0` 共 `1000` 请求，返回 `batch_id` `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 与输入文件 SHA256 `020ff3ead5741011b15a547b9067700d2273beab6d87227398910033853c0617`；本地仅保存无正文执行状态，远端清理状态为 `pending_t4_cue_qa`。尚未下载结果、生成 Cue 或写入 SUCCESS。
 - 2026-09-05：用户查询该 Batch 的错误明细，20 条服务端校验错误均为 `model_not_found`，指出 `qwen3.7-flash-2026-07-15` 不受 Batch API 支持；`request_counts.total=0`，判定未发生推理调用且旧任务不得重试。T0 以 `CR-2026-010` 将 Batch 模型标识修正为基础别名 `qwen3.7-flash`，升级登记/执行协议版本；Source 覆盖、Batch 价格、八波计划和预算上限不变。新协议授权绑定与 Wave 1 重提须由用户明确确认。
+- 2026-09-05：T2 已实现接收入口 `--receive`：它必须持有独立 `confirmation=RECEIVE_BATCH_RESULTS_API`、本机授权和运行时环境变量，接收前重建冻结 task 并校验 Source/协议/输入哈希及 `custom_id` 双向映射；远端 JSONL 仅流式读取，落盘仅为已验证 Cue 片段、无正文 ledger、结果行 SHA256 和收据。本地验证失败一律 quarantine，禁止自动重发。T4 已实现 receipt/ledger 的独立 QA；T0 在 `.venv` 复跑全仓无 API 测试为 `52 passed`。无 API 实现提交为 `824dd1f`，T4 QA 提交为 `5f18cb6`、`31b071c`。仍未读取密钥、联网、重提任务、写 Cue library 或 SUCCESS。
