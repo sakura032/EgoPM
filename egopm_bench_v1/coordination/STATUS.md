@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；CR-2026-010 后模型登记为 `qwen3.7-flash`、执行协议 `v2.2.1`；旧 Wave 1 `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 在服务端校验阶段失败（`request_counts.total=0`） | 旧 Batch 输入不可重用；本机授权文件需重新绑定新协议 SHA；尚未重新提交 Wave 1，也没有 Cue/SUCCESS | T0 完成无 API 回归和协议哈希复算后，用户确认重新提交 Wave 1；不得重试旧 batch |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；CR-2026-010 后模型登记为 `qwen3.7-flash`、执行协议 `v2.2.1`、协议 SHA `c2a5db76c6e74cd09942aea020caa6c09ffcfcb9ce57f8a4e87dec8ec6421198`；旧 Wave 1 `batch_1d50a9e3-733f-4baf-b754-bc1344d00f73` 在服务端校验阶段失败（`request_counts.total=0`） | 旧 Batch 输入不可重用；本机授权文件需重新绑定新协议 SHA；尚未重新提交 Wave 1，也没有 Cue/SUCCESS | T0 完成无 API 回归和协议哈希复算后，用户确认重新提交 Wave 1；不得重试旧 batch |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
