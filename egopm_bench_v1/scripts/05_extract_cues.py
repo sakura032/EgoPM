@@ -101,6 +101,32 @@ def normalise_supporting_text_for_substring(value: str) -> str:
     )
 
 
+def normalised_supporting_text_with_offsets(value: str) -> list[tuple[str, int, int]] | None:
+    """归一化单字段并保留每个保留字符对应的原文范围。
+
+    输入是一个 Atom 的单一证据字段；输出是归一化字符及其原始 Unicode code-point
+    左闭右开范围。它位于第 05 阶段的 v3.6 证据落盘边界：模型只给出可复核的 `x`，
+    程序从原字段确定性切片，因而最终 Cue 永不采用模型复写的正文。
+    """
+
+    retained: list[tuple[str, int, int]] = []
+    # 逐原始字符实施与比较端一致的 NFKC/casefold/过滤，并保留来源范围；被忽略的格式
+    # 字符不改变相邻实义字符的连续性，却仍由最终原文切片完整保留。
+    for index, source_character in enumerate(value):
+        for character in unicodedata.normalize("NFKC", source_character).casefold():
+            if (
+                not character.isspace()
+                and not unicodedata.category(character).startswith("P")
+                and unicodedata.category(character) != "Cf"
+            ):
+                retained.append((character, index, index + 1))
+    # 极少数跨字符组合在整体 NFKC 后无法安全地归属到唯一的原文范围。宁可隔离而不
+    # 推测边界；这保持比较规则严格等同于合同指定的整体 NFKC。
+    if "".join(character for character, _, _ in retained) != normalise_supporting_text_for_substring(value):
+        return None
+    return retained
+
+
 def supporting_text_field_for_code(code: str, item_index: int, field_codes: dict[str, Any]) -> str:
     """把紧凑字段码映射为最终证据字段名，并拒绝未知码。
 
@@ -170,12 +196,12 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
         raise ContractError("实时协议必须保留最多五条 Atom 与每 Atom 96 token 输出上限")
     if compact.get("supporting_text_field_codes") != {"T": "transcript", "D": "dense_caption", "V": "visible_text"}:
         raise ContractError("实时协议必须冻结 T/D/V 到单一证据字段的映射")
-    if compact.get("required_fields") != ["n", "f", "start", "end", "p", "c", "v"]:
-        raise ContractError("实时协议必须要求模型回传证据字段及其 Unicode 位置")
+    if compact.get("required_fields") != ["n", "f", "x", "p", "c", "v"]:
+        raise ContractError("实时协议必须要求模型回传证据字段及字段内证据片段")
     if controlled.get("model_input_fields") != ["item_index", "transcript", "dense_caption", "visible_text"]:
         raise ContractError("实时协议必须逐字段传入三类可追溯证据")
-    if controlled.get("model_output_fields") != ["n", "f", "start", "end", "p", "c", "v", "e", "s", "a", "r"]:
-        raise ContractError("实时协议必须冻结紧凑证据字段码与位置")
+    if controlled.get("model_output_fields") != ["n", "f", "x", "p", "c", "v", "e", "s", "a", "r"]:
+        raise ContractError("实时协议必须冻结紧凑证据字段码与字段内证据片段")
     if "supporting_text_field" not in controlled.get("program_backfilled_fields", []):
         raise ContractError("实时协议必须将 supporting_text_field 列为程序回填字段")
     if execution.get("max_retries") != 2:
@@ -927,21 +953,22 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
         supporting_text = atom.get(supporting_text_field)
         if not isinstance(supporting_text, str) or not supporting_text:
             raise LocalValidationError("SUPPORTING_TEXT_FIELD_UNAVAILABLE", f"/items/{item['n']}/f")
-        # 位置使用 Python 字符串的 Unicode code-point 偏移，左闭右开。程序自行切出原文，
-        # 从根源上避免模型逐字复写时的全半角、标点或大小写假阴性，同时不允许模型构造改写文本。
-        start = item["start"]
-        end = item["end"]
-        if end <= start or end > len(supporting_text):
-            raise LocalValidationError("SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE", f"/items/{item['n']}/end")
-        supporting_text_span = supporting_text[start:end]
-        # 两端只在上面选定的单一字段内使用同一纯格式归一化后连续包含。先拒绝归一化
-        # 为空的程序切片，避免只有标点、空白或零宽字符的区间成为任意字段的证据。
-        normalised_span = normalise_supporting_text_for_substring(supporting_text_span)
-        normalised_source = normalise_supporting_text_for_substring(supporting_text)
-        if not normalised_span:
-            raise LocalValidationError("SUPPORTING_TEXT_EMPTY_AFTER_NORMALIZATION", f"/items/{item['n']}/start")
-        if normalised_span not in normalised_source:
-            raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/start")
+        # v3.6 不再接受模型生成的字符偏移：`x` 与已选定的单一字段按冻结的纯格式
+        # 归一化规则连续匹配。命中位置由程序反向映射至原文，杜绝跨字段、改写或偏移单位歧义。
+        normalised_evidence = normalise_supporting_text_for_substring(item["x"])
+        normalised_source_with_offsets = normalised_supporting_text_with_offsets(supporting_text)
+        if normalised_source_with_offsets is None:
+            raise LocalValidationError("SUPPORTING_TEXT_NORMALIZATION_MAPPING_UNAVAILABLE", f"/items/{item['n']}/x")
+        normalised_source = "".join(character for character, _, _ in normalised_source_with_offsets)
+        if not normalised_evidence:
+            raise LocalValidationError("SUPPORTING_TEXT_EMPTY_AFTER_NORMALIZATION", f"/items/{item['n']}/x")
+        match_start = normalised_source.find(normalised_evidence)
+        if match_start < 0:
+            raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/x")
+        match_end = match_start + len(normalised_evidence) - 1
+        supporting_text_span = supporting_text[
+            normalised_source_with_offsets[match_start][1]:normalised_source_with_offsets[match_end][2]
+        ]
         status = {"A": "accepted", "R": "rejected", "N": "needs_review"}.get(item["v"])
         if status is None:
             raise LocalValidationError("UNKNOWN_VALIDATION_STATUS_CODE", f"/items/{item['n']}/v")

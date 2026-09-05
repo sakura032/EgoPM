@@ -706,6 +706,43 @@ def validate_batch_task_receipts(
     return valid
 
 
+def source_span_from_normalized_evidence(source: str, evidence: str) -> str:
+    """在一个原始字段内确定性恢复归一化连续证据的原文切片。
+
+    输入：同一 Atom 的单个来源字段与模型给出的 `x` 证据字符串。
+    输出：该字段中首个归一化连续命中的原始连续片段；找不到时抛出错误。
+    流水线位置：第 11 步 T4 对 v3.6 紧凑 Cue 的独立血缘复算。
+
+    不能把字段拼接后再查找：即使归一化允许空白、标点、全半角和大小写差异，
+    证据的开始、结束与保存内容也必须仍落在同一个声明字段的连续区间内。
+    """
+
+    normalized_evidence = cue_evidence_normalized_text(evidence)
+    if not normalized_evidence:
+        raise ValueError("紧凑 Cue 的归一化证据不能为空")
+    # 按原始字符累积被保留的规范字符，并保存每个规范字符对应的原文位置。NFKC
+    # 可能展开为多个字符，故每一个展开字符均回指同一原文字符；这使切片仍保持原文连续。
+    normalized_parts: list[str] = []
+    starts: list[int] = []
+    ends: list[int] = []
+    for index, character in enumerate(source):
+        for normalized_character in unicodedata.normalize("NFKC", character).casefold():
+            if (
+                not normalized_character.isspace()
+                and not unicodedata.category(normalized_character).startswith("P")
+                and unicodedata.category(normalized_character) != "Cf"
+            ):
+                normalized_parts.append(normalized_character)
+                starts.append(index)
+                ends.append(index + 1)
+    normalized_source = "".join(normalized_parts)
+    match_start = normalized_source.find(normalized_evidence)
+    if match_start < 0:
+        raise ValueError("紧凑 Cue 的归一化证据不在声明字段内连续出现")
+    match_end = match_start + len(normalized_evidence)
+    return source[starts[match_start] : ends[match_end - 1]]
+
+
 def expand_compact_cue_for_qa(
     compact: dict[str, Any],
     atom: dict[str, Any],
@@ -713,11 +750,11 @@ def expand_compact_cue_for_qa(
     run_id: str,
     config: RunConfig,
 ) -> dict[str, Any]:
-    """独立展开一条位置式紧凑 Cue，供 QA 复算最终 Schema 的原文证据。
+    """独立展开一条 v3.6 紧凑 Cue，供 QA 复算最终 Schema 的原文证据。
 
-    输入是模型给出的单字段码和 Unicode code-point 左闭右开区间；输出是程序从
-    同一 Atom 声明字段切出的最终 Cue。它位于第 11 步 T4 独立 QA，绝不信任模型
-    回传的证据文本，也不拼接 transcript、dense_caption 与 visible_text。
+    输入是模型给出的单字段码和归一化证据 `x`；输出是程序从同一 Atom 声明字段
+    恢复的原文连续片段。它位于第 11 步 T4 独立 QA，不拼接 transcript、
+    dense_caption 与 visible_text，也不接受释义、翻译或词序重排。
     """
 
     # 必须读取与当前 SUCCESS 同一份临时/正式配置：直接引用工作树全局 registry 会让
@@ -729,7 +766,7 @@ def expand_compact_cue_for_qa(
     required = set(compact_policy["required_fields"])
     optional = set(compact_policy["optional_defaults"])
     if not isinstance(compact, dict) or set(compact).difference(required | optional) or required.difference(compact):
-        raise ValueError("紧凑 Cue 的字段集合不符合 v2.2 冻结短码协议")
+        raise ValueError("紧凑 Cue 的字段集合不符合 v3.6 冻结短码协议")
     if not isinstance(compact["n"], int) or isinstance(compact["n"], bool) or not 0 <= compact["n"] < 5:
         raise ValueError("紧凑 Cue 的 n 必须是 package 内 0..4 索引")
     predicates = compact["p"]
@@ -759,12 +796,12 @@ def expand_compact_cue_for_qa(
     supporting_source = atom.get(supporting_field)
     if not isinstance(supporting_source, str) or not cue_evidence_normalized_text(supporting_source):
         raise ValueError("紧凑 Cue 指定的证据字段必须为归一化后非空字符串")
-    start, end = compact["start"], compact["end"]
-    if (not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int)
-            or isinstance(end, bool) or not 0 <= start < end <= len(supporting_source)):
-        raise ValueError("紧凑 Cue 的证据 Unicode 偏移越界")
-    # span 只能由程序切片得到，确保最终保存的每一个字符均可回溯到声明字段的连续区间。
-    supporting_span = supporting_source[start:end]
+    evidence = compact["x"]
+    if not isinstance(evidence, str):
+        raise ValueError("紧凑 Cue 的证据 x 必须为字符串")
+    # v3.6 不再依赖模型对字符偏移单位的理解；只允许单字段归一化连续命中，并由
+    # 程序恢复原始切片，杜绝将模型复写文本直接写入最终 Cue。
+    supporting_span = source_span_from_normalized_evidence(supporting_source, evidence)
     supporting_normalized = cue_evidence_normalized_text(supporting_span)
     if not supporting_normalized or supporting_normalized not in cue_evidence_normalized_text(supporting_source):
         raise ValueError("紧凑 Cue 的程序切片未形成声明字段中的有效连续证据")

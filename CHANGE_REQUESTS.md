@@ -3,6 +3,26 @@
 本文件由 T0 维护，用于记录跨角色、跨门禁或需要冻结执行语义的变更。本文件不授权绕过
 任何 `SUCCESS`、哈希、质量验证或用户预算确认门。
 
+## CR-2026-013：弃用裸位置偏移，恢复字段内归一化证据片段
+
+**状态：已冻结，待实现。**
+
+`realtime_v8_01` Wave 1 的 674 条无正文审计记录中，585 条为
+`SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE`，且主要位于 `/items/*/end`。原始模型响应按无正文规则
+不可恢复，不能安全判定是偏移单位还是字段错配。该运行及其 4,057 条暂存 Cue 冻结为审计材料：
+不得生成 `CUE_LIBRARY_SUCCESS.json`，不得进入 Seed，也不得和新运行混合。
+
+新紧凑对象弃用 `start`、`end` 并恢复 `x`，同时必须给出 `f`。`x` 只可作为同一 Atom 的
+`f` 指定字段中的单一连续证据片段；程序以 `NFKC + casefold` 并删除空白、Unicode 标点和
+`Cf` 字符后作连续包含匹配，最终 `supporting_text_span` 必须由原字段确定性切出。禁止跨字段、
+跨 Atom、释义、翻译、数值或单位改变及词序重排；不得保存模型正文。
+
+最终 Cue Schema 维持 `v1.1.0`，`supporting_text_field` 仍限定为 `transcript`、`dense_caption`
+或 `visible_text`，每 package 最多 5 Atom；逐项修复、无正文账本与审计队列规则不变。
+紧凑 Schema、提示词、解析器、协议哈希与 T4 QA 受影响，Cue 执行协议升为 `v3.6.0`。v3.6
+必须使用新 run ID、绑定新协议 SHA 的本机授权，授权上限仍为 `¥80`。`realtime_v8_01` 仅审计，
+不重跑、不重写、不作为新运行输入。
+
 ## CR-2026-012：Cue 显式证据字段与字段内格式归一化
 
 ### 状态、动机与范围
