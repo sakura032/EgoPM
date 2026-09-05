@@ -23,7 +23,7 @@
         "x": {"type": "string", "minLength": 1, "maxLength": 256},
         "c": {"type": "integer", "minimum": 0, "maximum": 100},
         "v": {"enum": ["A", "R", "N"]},
-        "e": {"type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 64}, "uniqueItems": true},
+        "e": {"type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1, "maxLength": 64}},
         "s": {"type": "string", "maxLength": 64},
         "a": {"type": "string", "maxLength": 64},
         "r": {"type": "string", "maxLength": 128}

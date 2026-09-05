@@ -806,6 +806,11 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
     cues: list[dict[str, Any]] = []
     for item in sorted(items, key=lambda value: value["n"]):
         atom = atoms[item["n"]]
+        entities = item.get("e", defaults["e"])
+        # 服务端 JSON Schema 子集拒绝 `uniqueItems`；本地在解析后立即恢复同一约束，
+        # 使兼容性修复不放宽最终 Cue 的实体去重质量门。
+        if len(entities) != len(set(entities)):
+            raise ContractError("e 中的实体不得重复")
         cue_type = cue_codes.get(item["t"])
         if not isinstance(cue_type, str):
             raise ContractError("出现未知 cue_type 短码")
@@ -826,7 +831,7 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
             raise ContractError("出现未知 validation_status 短码")
         cue = {
             "cue_id": f"cue_{atom['atom_id'].removeprefix('src_')}", "atom_id": atom["atom_id"],
-            "split": atom["split"], "entities": item.get("e", defaults["e"]),
+            "split": atom["split"], "entities": entities,
             "scene_type": item.get("s", defaults["s"]), "activity_type": item.get("a", defaults["a"]),
             "cue_type": cue_type, "normalized_predicate": {"all_of": clauses}, "supporting_text_span": item["x"],
             "source_text": atom["visible_text"], "confidence": item["c"] / settings.compact_policy["confidence_scale"],

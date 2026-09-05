@@ -135,6 +135,18 @@ def test_permanent_http_400_writes_safe_failed_terminal_state(tmp_path: Path) ->
     assert "choices" not in json.dumps(state, ensure_ascii=False)
 
 
+def test_server_compatible_inference_schema_keeps_entity_deduplication_locally() -> None:
+    """服务端不支持 uniqueItems 时，本地解析仍须拒绝重复实体。"""
+    value = module(); settings, _policy, _manifest, rows = setup(value)
+    schema = json.loads((ROOT / "schemas/cue_inference_batch_compact_v1.schema.json").read_text(encoding="utf-8"))
+    assert "uniqueItems" not in json.dumps(schema, ensure_ascii=False)
+    inference_validator = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    cue_validator = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
+    duplicate = {"items": [{"n": 0, "t": "A", "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A", "e": ["物品", "物品"]}]}
+    with pytest.raises(value.ContractError, match="实体不得重复"):
+        value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
+
+
 def test_atomic_replace_retries_windows_share_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Windows 短暂占用应重试成功，且替换前的真实状态文件不会被预先删除。"""
     value = module(); target = tmp_path / "state.json"; target.write_text('{"old":true}\n', encoding="utf-8")
