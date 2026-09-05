@@ -130,6 +130,7 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     assert execution["realtime_execution_policy"]["logical_shards_per_task"] == 10
     assert execution["realtime_execution_policy"]["progress_update_interval_seconds"] == 15
     assert execution["shard_layout"]["root"] == "cues/realtime"
+    assert execution["shard_layout"]["run_directory"] == "runs"
     assert execution["shard_layout"]["realtime_shards_manifest"] == "realtime_shards_manifest.jsonl"
     assert execution["shard_layout"]["progress_filename"] == "progress.json"
     assert execution["pricing_snapshot"] == {

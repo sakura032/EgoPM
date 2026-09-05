@@ -97,6 +97,7 @@ models:
         context_cache_supported: false
       shard_layout:
         root: cues/realtime
+        run_directory: runs
         realtime_shards_manifest: realtime_shards_manifest.jsonl
         package_directory: packages
         input_manifest_suffix: .input.jsonl

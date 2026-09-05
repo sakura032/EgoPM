@@ -1555,7 +1555,12 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         raise ContractError("实时执行必须使用 cues/realtime，禁止复用已取消 Batch 根目录")
     # 波次是独立的恢复与审计边界。`cues/realtime/wave_01` 的旧失败不能阻止或混入
     # Wave 2；每个波次各自拥有清单、账本、状态与 progress.json。
-    wave_root = arguments.run_root / f"wave_{arguments.wave_index:02d}"
+    run_directory = settings.layout.get("run_directory")
+    if run_directory != "runs" or not arguments.run_id:
+        raise ContractError("实时执行必须使用非空 run_id 与冻结的 runs 隔离目录")
+    # 旧失败 run 保留在共享根作审计；新 run 的累计账本和波次目录严格按 run_id 隔离。
+    execution_root = arguments.run_root / run_directory / arguments.run_id
+    wave_root = execution_root / f"wave_{arguments.wave_index:02d}"
     authorization = load_realtime_authorization(arguments.authorization, str(marker["sha256"]), protocol_sha256, policy)
     task_indexes = realtime_wave_task_indexes(arguments.wave_index, policy)
     preparation_started = time.monotonic()
@@ -1583,7 +1588,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     if not manifests:
         raise ContractError("所选实时波次没有冻结 package；未读取密钥或联网")
     preflight = {**realtime_shards_manifest(arguments.run_id, manifests, wave_root, settings), "wave_index": arguments.wave_index, "wave_task_indexes": task_indexes}
-    require_completed_prior_waves(arguments.run_root, arguments.wave_index, preflight, settings)
+    require_completed_prior_waves(execution_root, arguments.wave_index, preflight, settings)
     # 以每包输出上限和输入字节代理预留全额，防止在第一条请求前就超过用户授权上限。
     predicted = 0.0
     for manifest in manifests:
@@ -1592,7 +1597,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         output_upper = settings.output_tokens_per_atom * len(package_atoms)
         predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
         predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
-    budget = initialise_cumulative_budget(arguments.run_root, preflight, authorization, policy)
+    budget = initialise_cumulative_budget(execution_root, preflight, authorization, policy)
     if predicted > budget.maximum_cny - budget.spent_cny():
         raise ContractError("当前波输出 token 上界已超过实时全局剩余授权预算；未读取密钥或联网")
     initialise_realtime_run(preflight, wave_root, settings, authorization)
@@ -1642,8 +1647,8 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
                 else:
                     validate_realtime_ledger_event(event)
                     append_ledger_event(wave_root / settings.layout["run_ledger_filename"], event)
-                    append_ledger_event(arguments.run_root / "realtime_cumulative_ledger.jsonl", event)
-                    write_cumulative_budget(arguments.run_root, preflight, budget)
+                    append_ledger_event(execution_root / "realtime_cumulative_ledger.jsonl", event)
+                    write_cumulative_budget(execution_root, preflight, budget)
                     completed += 1
                     outcomes[status] = outcomes.get(status, 0) + 1
                     if status in {"budget_stopped", "local_validation_quarantine", "service_transport_exhausted"}:

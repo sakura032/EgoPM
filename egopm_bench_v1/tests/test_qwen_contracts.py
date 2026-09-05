@@ -211,7 +211,7 @@ def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkey
     args = SimpleNamespace(run_root=tmp_path / "realtime", authorization=tmp_path / "authorization.json", run_id="synthetic", wave_index=1)
     marker = {"sha256": "source"}
     result = value.execute_realtime_run(args, settings, policy, marker, object(), "p", {"type": "object"}, "protocol")
-    progress = json.loads((args.run_root / "wave_01" / "progress.json").read_text(encoding="utf-8"))
+    progress = json.loads((args.run_root / "runs" / args.run_id / "wave_01" / "progress.json").read_text(encoding="utf-8"))
     assert peak[0] == policy.maximum_in_flight == 10
     assert result["outcomes"] == {"validated_success": 12}
     assert (progress["wave_index"], progress["wave_task_indexes"], progress["total_packages"], progress["completed_packages"], progress["in_flight_packages"]) == (1, [0], 12, 12, 0)
