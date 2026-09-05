@@ -1,0 +1,12 @@
+{
+  "authorization_version": "v1.0.0",
+  "approved": false,
+  "approved_by": "待填写",
+  "approved_at": "待填写 ISO-8601 时间",
+  "maximum_total_cny": 40.0,
+  "allowed_wave_indexes": [1],
+  "source_atoms_sha256": "be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e",
+  "cue_execution_protocol_sha256": "执行前由 --validate-execution-plan 输出后填写",
+  "accept_remote_text_retention_until_t4_cue_qa": false,
+  "accept_quarantine_manual_review_only": false
+}

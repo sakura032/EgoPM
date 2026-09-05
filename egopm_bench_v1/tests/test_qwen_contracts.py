@@ -307,6 +307,37 @@ def test_synthetic_batch_task_manifest_only_has_metadata(tmp_path: Path) -> None
     assert "source_text" not in encoded and "starts cooking" not in encoded and '"body"' not in encoded
 
 
+def test_eight_wave_authorization_requires_budget_hash_and_retention_consent(tmp_path: Path) -> None:
+    """执行前核验只读授权文件；缺少同意或预算时绝不能把波次推进到联网阶段。"""
+
+    module = load_script()
+    settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
+    report = {
+        "package_count": 75,
+        "cue_execution_protocol_sha256": "protocol",
+        "cny_upper_bound_successful_requests_only": {"total_cny_upper_bound": 37.5},
+        "batch_task_manifests": [{"request_count": 1} for _ in range(75)],
+    }
+    authorization = tmp_path / "authorization.json"
+    module.atomic_write_json(authorization, {
+        "authorization_version": "v1.0.0", "approved": True, "approved_by": "synthetic",
+        "approved_at": "2026-09-05T00:00:00Z", "maximum_total_cny": 40.0,
+        "allowed_wave_indexes": [1], "source_atoms_sha256": "source",
+        "cue_execution_protocol_sha256": "protocol",
+        "accept_remote_text_retention_until_t4_cue_qa": True,
+        "accept_quarantine_manual_review_only": True,
+    })
+    readiness = module.execution_readiness_report(report, settings, "source", 1, authorization)
+    assert readiness["batch_task_indexes"] == [0]
+    assert readiness["batch_task_count"] == 1
+    assert readiness["authorization_status"] == "valid"
+    rejected = module.read_json(authorization)
+    rejected["maximum_total_cny"] = 0.1
+    module.atomic_write_json(authorization, rejected)
+    with pytest.raises(module.ContractError, match="预算不足"):
+        module.execution_readiness_report(report, settings, "source", 1, authorization)
+
+
 def cue_for(atom: dict[str, Any]) -> dict[str, Any]:
     """构造第 06/07 既有回归使用的合成 accepted Cue。"""
 

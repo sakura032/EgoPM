@@ -7,7 +7,7 @@
 
 ### 状态与决策边界
 
-- 状态：**v2.2 配置、紧凑推理 Schema、无 API 计划器、独立 QA 与冻结 Source 实测预检均已完成；未调用 API、未创建远端 Batch、未生成正式 Cue。**
+- 状态：**v2.2 配置、紧凑推理 Schema、无 API 计划器、独立 QA、冻结 Source 实测预检及八波授权核验已完成；未调用 API、未创建远端 Batch、未生成正式 Cue。**
 - 目标：在 CR-2026-008 的同模型 Batch File 之上，压缩模型可见的提示词、推理 Schema 和推理输出；
   最终 `cue_candidate.schema.json`、370799 条 Source Atom 覆盖、split、五条 package 上限、来源检查和
   程序回填语义均不得变化。
@@ -90,6 +90,18 @@ v2.2 协议哈希和 T4 独立 QA。
 4. T4 独立复算短码映射、默认回填、最终 Cue Schema、Source/split 血缘、Batch metadata 和无正文账本。
 5. 全部无 API 测试通过后，用户才能选择是否批准一个有硬性费用上限的独立 smoke 验证；该 smoke
    不能计入正式 370799 条基准，也不能用来跳过完整覆盖。
+
+### 执行授权与八波门
+
+教师已同意按照 `1 + 6×10 + 14` 个 task 分八波运行。每波只在前一波本地接收校验、账本审阅和
+预算复核通过后才允许提交。为避免聊天文本被误当成可审计授权，实际执行还必须在本机未提交的
+`cues/CUE_EXECUTION_AUTHORIZATION.json` 填写并校验：批准人和时间、明确总预算、允许波次、冻结
+Source/协议 SHA、远端文本保留至 T4 Cue QA 的同意，以及隔离项仅人工处置的同意。模板位于
+`config/CUE_EXECUTION_AUTHORIZATION.example.json`，不含密钥且默认 `approved=false`。
+
+冻结的执行核验仅计算波次 task 范围和费用代理，明确报告 `network_called=false`、
+`credentials_read=false`、`formal_outputs_written=false`。真实上传、创建、轮询、结果接收和远端删除
+必须另有无 API 模拟测试，并且只在用户再次明确下达开始 API 指令后运行。
 
 生产时若 v2.2 成功请求在本地解析、短码映射或最终 QA 中失败，必须隔离该 package；禁止自动改回
 128 token、禁止静默回退到 v2.1、禁止自动重发。任何此类处置均须新的用户授权和新的协议/预算决定。

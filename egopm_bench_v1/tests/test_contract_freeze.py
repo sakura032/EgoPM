@@ -132,6 +132,17 @@ def test_cue_execution_policy_freezes_v22_batch_compact_contract() -> None:
         "require_single_terminal_outcome_per_custom_id": True,
         "prohibit_requeue_after_local_validation_quarantine": True,
     }
+    assert execution["batch_execution_policy"] == {
+        "authorization_version": "v1.0.0",
+        "authorization_required": True,
+        "wave_task_counts": [1, 10, 10, 10, 10, 10, 10, 14],
+        "max_submit_in_flight": 1,
+        "completion_poll_initial_seconds": 30,
+        "completion_poll_max_seconds": 300,
+        "max_local_validation_quarantine_per_wave": 0,
+        "remote_cleanup_gate": "t4_cue_qa_done",
+        "execution_state_filename": "execution_state.json",
+    }
     assert execution["shard_layout"]["root"] == "cues/batch"
     assert execution["shard_layout"]["batch_tasks_manifest"] == "batch_tasks_manifest.jsonl"
     assert execution["pricing_snapshot"] == {

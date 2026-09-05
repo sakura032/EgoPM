@@ -848,8 +848,90 @@ def write_synthetic_batch_task_manifest(path: Path, tasks: list[dict[str, Any]],
     atomic_write_jsonl(path, rows)
 
 
+def wave_task_indexes(wave_index: int, settings: Settings) -> list[int]:
+    """按冻结的 1、6×10、14 计划返回一个波次的连续 task 编号。"""
+
+    policy = settings.execution.get("batch_execution_policy")
+    if not isinstance(policy, dict) or policy.get("wave_task_counts") != [1, 10, 10, 10, 10, 10, 10, 14]:
+        raise ContractError("Batch 波次计划未按冻结的八波合同配置")
+    counts = policy["wave_task_counts"]
+    if not isinstance(wave_index, int) or not 1 <= wave_index <= len(counts):
+        raise ContractError("wave_index 必须是 1..8")
+    start = sum(counts[: wave_index - 1])
+    return list(range(start, start + counts[wave_index - 1]))
+
+
+def load_execution_authorization(
+    path: Path,
+    settings: Settings,
+    source_sha256: str,
+    protocol_sha256: str,
+    wave_index: int,
+    wave_cost_upper_bound: float,
+) -> dict[str, Any]:
+    """校验本机、显式且可审计的执行授权；缺预算或数据保留同意即拒绝联网。"""
+
+    authorization = read_json(path)
+    policy = settings.execution["batch_execution_policy"]
+    required = {
+        "authorization_version", "approved", "approved_by", "approved_at", "maximum_total_cny",
+        "allowed_wave_indexes", "source_atoms_sha256", "cue_execution_protocol_sha256",
+        "accept_remote_text_retention_until_t4_cue_qa", "accept_quarantine_manual_review_only",
+    }
+    if required.difference(authorization):
+        raise ContractError("执行授权缺少冻结字段")
+    if authorization["authorization_version"] != policy["authorization_version"] or authorization["approved"] is not True:
+        raise ContractError("执行授权版本不匹配或尚未明确批准")
+    if authorization["source_atoms_sha256"] != source_sha256 or authorization["cue_execution_protocol_sha256"] != protocol_sha256:
+        raise ContractError("执行授权未绑定当前冻结 Source 或执行协议")
+    if wave_index not in authorization["allowed_wave_indexes"]:
+        raise ContractError("本次波次不在执行授权允许范围")
+    budget = authorization["maximum_total_cny"]
+    if not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget < wave_cost_upper_bound:
+        raise ContractError("执行授权预算不足以覆盖本波次保守上界")
+    if authorization["accept_remote_text_retention_until_t4_cue_qa"] is not True:
+        raise ContractError("未同意远端文本文件保留至 T4 Cue QA")
+    if authorization["accept_quarantine_manual_review_only"] is not True:
+        raise ContractError("未同意本地验证隔离项只能人工处置")
+    return authorization
+
+
+def execution_readiness_report(
+    report: dict[str, Any], settings: Settings, source_sha256: str, wave_index: int, authorization_path: Path | None) -> dict[str, Any]:
+    """输出不联网的波次就绪报告，供正式调用前复核预算、task 范围和授权文件。"""
+
+    task_indexes = wave_task_indexes(wave_index, settings)
+    tasks = report["batch_task_manifests"]
+    if len(tasks) != sum(settings.execution["batch_execution_policy"]["wave_task_counts"]):
+        raise ContractError("预检 task 数与八波计划不一致")
+    selected = [tasks[index] for index in task_indexes]
+    # 预检费用已是全量的保守上界。task 内 package 均由同一上限约束，按请求数比例切分
+    # 只用于授权前的保守预留；结束后仍只能以每条 response_usage 汇总作最终计费账本。
+    total_requests = int(report["package_count"])
+    selected_requests = sum(int(task["request_count"]) for task in selected)
+    wave_cost = float(report["cny_upper_bound_successful_requests_only"]["total_cny_upper_bound"]) * selected_requests / total_requests
+    authorization_status = "not_provided"
+    if authorization_path is not None and authorization_path.is_file():
+        load_execution_authorization(authorization_path, settings, source_sha256, report["cue_execution_protocol_sha256"], wave_index, wave_cost)
+        authorization_status = "valid"
+    return {
+        "mode": "batch_execution_readiness_no_api",
+        "network_called": False,
+        "credentials_read": False,
+        "formal_outputs_written": False,
+        "wave_index": wave_index,
+        "batch_task_indexes": task_indexes,
+        "batch_task_count": len(selected),
+        "package_count": selected_requests,
+        "wave_cny_upper_bound_proxy": wave_cost,
+        "authorization_status": authorization_status,
+        "remote_cleanup_gate": settings.execution["batch_execution_policy"]["remote_cleanup_gate"],
+        "max_local_validation_quarantine_per_wave": settings.execution["batch_execution_policy"]["max_local_validation_quarantine_per_wave"],
+    }
+
+
 def run(arguments: argparse.Namespace) -> int:
-    """装配第 05 阶段；当前 CR 只允许预检，任何执行开关都在本地合同门阻断。"""
+    """装配第 05 阶段；默认预检或只读执行就绪核验均不得调用网络。"""
 
     if arguments.execute or arguments.rerun_failed_packages:
         raise ContractError("v2.2 当前仅允许无 API 预检；禁止创建 Batch、上传文件、下载结果或写正式 Cue")
@@ -875,12 +957,18 @@ def run(arguments: argparse.Namespace) -> int:
         protocol_sha256,
         run_id,
     )
-    print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
+    if getattr(arguments, "validate_execution_plan", False):
+        readiness = execution_readiness_report(
+            report, settings, str(marker["sha256"]), getattr(arguments, "wave_index", 1), getattr(arguments, "authorization", None)
+        )
+        print(json.dumps(readiness, ensure_ascii=False, sort_keys=True, indent=2))
+    else:
+        print(json.dumps(report, ensure_ascii=False, sort_keys=True, indent=2))
     return 0
 
 
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
-    """定义只读默认值；保留执行参数仅为明确报错，不能触及密钥或网络。"""
+    """定义只读默认值和执行前核验参数；`--execute` 仍需后续明确生产指令。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-registry", type=Path, default=ROOT / "config/model_registry.yaml")
@@ -894,7 +982,10 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=ROOT / "cues/cue_library.jsonl")
     parser.add_argument("--success-marker", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
     parser.add_argument("--run-id")
-    parser.add_argument("--execute", action="store_true", help="当前无 API 阶段必定被合同门阻断")
+    parser.add_argument("--authorization", type=Path, help="本机未提交的执行授权 JSON")
+    parser.add_argument("--wave-index", type=int, default=1, help="八波计划中的目标波次（1--8）")
+    parser.add_argument("--validate-execution-plan", action="store_true", help="只校验授权、波次和预算，绝不联网")
+    parser.add_argument("--execute", action="store_true", help="生产调用仍须用户明确下达开始 API 的指令")
     parser.add_argument("--rerun-failed-packages", action="store_true")
     return parser.parse_args(argv)
 
