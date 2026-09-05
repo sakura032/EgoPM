@@ -141,6 +141,8 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
             raise ContractError(f"实时限流字段无效：{name}")
     if not isinstance(realtime_execution.get("progress_update_interval_seconds"), int) or realtime_execution["progress_update_interval_seconds"] <= 0:
         raise ContractError("实时进度刷新间隔无效")
+    if realtime_ledger.get("local_validation_diagnostic") != {"format": "code_path_v1", "raw_content": "forbidden"}:
+        raise ContractError("实时本地验证诊断策略未冻结为无正文 code/path 格式")
     counts = realtime_execution.get("wave_task_counts")
     if counts != [1, 10, 10, 10, 10, 10, 10, 14] or not isinstance(realtime_execution.get("logical_shards_per_task"), int) or realtime_execution["logical_shards_per_task"] != 10:
         raise ContractError("实时执行必须冻结原八波 task 范围与每 task 十个逻辑 shard")

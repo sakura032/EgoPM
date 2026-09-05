@@ -84,8 +84,8 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     assert registry["raw_response_policy"] == "forbidden"
     assert cue["model_id"] == "qwen3.7-flash"
     assert cue["prompt_version"] == "cue_extractor_v3_compact"
-    assert execution["cue_execution_policy_version"] == "v3.0.0"
-    assert execution["protocol_hash_payload_version"] == "v3.0.0"
+    assert execution["cue_execution_policy_version"] == "v3.2.0"
+    assert execution["protocol_hash_payload_version"] == "v3.2.0"
     assert execution["mode"] == "explicit_realtime_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2
@@ -125,6 +125,7 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
         "successful_local_validation_failure": "quarantine_no_auto_retry",
     }
     assert execution["realtime_ledger_policy"]["terminal_outcomes"] == ["validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"]
+    assert execution["realtime_ledger_policy"]["local_validation_diagnostic"] == {"format": "code_path_v1", "raw_content": "forbidden"}
     assert execution["realtime_execution_policy"]["execution_confirmation"] == "START_REALTIME_CUE_API"
     assert execution["realtime_execution_policy"]["wave_task_counts"] == [1, 10, 10, 10, 10, 10, 10, 14]
     assert execution["realtime_execution_policy"]["logical_shards_per_task"] == 10

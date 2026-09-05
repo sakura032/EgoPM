@@ -18,9 +18,9 @@ models:
     schema: cue_candidate.schema.json
     schema_version: v1.0.0
     execution:
-      cue_execution_policy_version: v3.0.0
+      cue_execution_policy_version: v3.2.0
       # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
-      protocol_hash_payload_version: v3.0.0
+      protocol_hash_payload_version: v3.2.0
       mode: explicit_realtime_execute_only
       shard_size_atoms: 500
       max_retries: 2
@@ -65,6 +65,8 @@ models:
         require_single_terminal_outcome_per_package: true
         prohibit_requeue_after_local_validation_quarantine: true
         prohibit_requeue_after_budget_stop: true
+        # 隔离诊断只保存固定 code 与字段路径；禁止错误值、原文和原始响应。
+        local_validation_diagnostic: {format: code_path_v1, raw_content: forbidden}
       realtime_execution_policy:
         authorization_version: v2.0.0
         authorization_required: true
