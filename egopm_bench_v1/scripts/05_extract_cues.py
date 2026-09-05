@@ -1148,6 +1148,74 @@ def realtime_package_state_path(run_root: Path, manifest: dict[str, Any]) -> Pat
     return run_root / "packages" / str(manifest["package_id"]) / "realtime_state.json"
 
 
+def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, settings: Settings) -> str | None:
+    """离线识别可恢复终态，确保本地隔离包绝不再次进入 transport。
+
+    输入是冻结实时清单、波次根目录和布局配置；输出是已验证成功、已本地隔离或无终态。
+    它位于第 05 阶段实时恢复边界：成功包仍需完整哈希标记，而隔离包需同时具备身份
+    一致的状态与无正文失败诊断。任何损坏或身份不一致均停止本轮而非猜测为可重发。
+    """
+
+    files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
+    if is_complete(manifest, files):
+        return "validated_success"
+    state_path = realtime_package_state_path(run_root, manifest)
+    if not state_path.is_file():
+        return None
+    state = read_json(state_path)
+    if state.get("status") != "local_validation_quarantine":
+        return None
+    expected = {
+        "run_id": manifest["run_id"], "transport": "realtime_chat_completions",
+        "realtime_shard_index": manifest["shard_index"], "package_id": manifest["package_id"],
+        "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+        "source_atoms_sha256": manifest["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+    }
+    if any(state.get(key) != item for key, item in expected.items()) or state.get("raw_response_saved") is True:
+        raise ContractError("实时本地隔离状态的身份或无正文约束不匹配；禁止自动重发")
+    diagnostic = state.get("local_validation_failure")
+    if (
+        not isinstance(diagnostic, dict) or set(diagnostic) != {"code", "path"}
+        or not isinstance(diagnostic["code"], str) or not re.fullmatch(r"[A-Z0-9_]{1,96}", diagnostic["code"])
+        or not isinstance(diagnostic["path"], str) or not re.fullmatch(r"/(?:[A-Za-z0-9_./-]+)?", diagnostic["path"])
+        or not files["failed"].is_file()
+    ):
+        raise ContractError("实时本地隔离状态缺少安全诊断或失败标记；禁止自动重发")
+    failed = read_json(files["failed"])
+    if (
+        failed.get("package_id") != manifest["package_id"]
+        or failed.get("transport") != "realtime_chat_completions"
+        or failed.get("outcome") != "local_validation_quarantine"
+        or failed.get("local_validation_failure") != diagnostic
+        or failed.get("raw_response_saved") is not False
+    ):
+        raise ContractError("实时本地隔离失败标记不匹配；禁止自动重发")
+    return "local_validation_quarantine"
+
+
+def require_accounted_realtime_terminal(manifest: dict[str, Any], status: str, events: dict[str, dict[str, Any]]) -> None:
+    """核验恢复终态已有唯一无正文账本事件，防止恢复时漏计费用或重复记账。
+
+    输入是终态 package 身份、其终态类别和按 request id 去重的累计账本；无返回值。
+    该检查位于第 05 阶段恢复调度前，要求已完成/隔离包在跳过网络前先证明其费用
+    已进入累计账本，避免把已计费的本地隔离误当作免费或重新追加同一账本事件。
+    """
+
+    event = events.get(str(manifest["realtime_request_id"]))
+    if event is None:
+        raise ContractError("实时恢复终态缺少累计无正文账本事件；禁止自动重发")
+    validate_realtime_ledger_event(event)
+    expected = {
+        "outcome": status, "package_id": manifest["package_id"],
+        "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+        "transport": "realtime_chat_completions", "source_atoms_sha256": manifest["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+    }
+    if any(event.get(key) != item for key, item in expected.items()):
+        raise ContractError("实时恢复终态与累计无正文账本不一致；禁止自动重发")
+
+
 def realtime_protocol_hash(settings: Settings, prompt_path: Path, inference_schema_path: Path) -> str:
     """以 transport 纳入哈希，阻断任何 Batch 清单、授权或完成标记被实时路径接纳。"""
 
@@ -1239,6 +1307,10 @@ def execute_realtime_package(
     files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
     if is_complete(manifest, files):
         return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
+    if realtime_recovery_terminal_status(manifest, run_root, settings) == "local_validation_quarantine":
+        # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
+        # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
+        return "recovered_quarantine", 0.0, {"outcome": "recovered_quarantine"}
     atoms = [atoms_by_id[item["atom_id"]] for item in manifest["atoms"]]
     body = build_request(prompt, schema, atoms, settings)
     token_reservation = settings.output_tokens_per_atom * len(atoms) + max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
@@ -1655,26 +1727,47 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         raise ContractError("所选实时波次没有冻结 package；未读取密钥或联网")
     preflight = {**realtime_shards_manifest(arguments.run_id, manifests, wave_root, settings), "wave_index": arguments.wave_index, "wave_task_indexes": task_indexes}
     require_completed_prior_waves(execution_root, arguments.wave_index, preflight, settings)
-    # 以每包输出上限和输入字节代理预留全额，防止在第一条请求前就超过用户授权上限。
-    predicted = 0.0
+    budget = initialise_cumulative_budget(execution_root, preflight, authorization, policy)
+    # 恢复前先离线扫描全部终态。隔离 package 已经发生服务端调用且可能已计费，必须
+    # 以状态、失败标记和累计账本三重一致性跳过，不能因缺少 SUCCESS 而被再次提交。
+    cumulative_events = cumulative_realtime_events(execution_root)
+    outcomes: dict[str, int] = {}
+    completed = 0
+    remaining_manifests: list[dict[str, Any]] = []
     for manifest in manifests:
+        recovered_status = realtime_recovery_terminal_status(manifest, wave_root, settings)
+        if recovered_status is None:
+            remaining_manifests.append(manifest)
+            continue
+        require_accounted_realtime_terminal(manifest, recovered_status, cumulative_events)
+        completed += 1
+        outcomes[recovered_status] = outcomes.get(recovered_status, 0) + 1
+    # 只为尚未请求的 package 预留预算；已在账本中的成功或隔离调用不能被重复预留，
+    # 否则一次安全恢复会被错误阻断，也会掩盖真实的剩余授权。
+    predicted = 0.0
+    for manifest in remaining_manifests:
         package_atoms = [atoms[item["atom_id"]] for item in manifest["atoms"]]
         input_proxy = max(1, request_utf8_bytes(prompt, schema, package_atoms, settings) // 4)
         output_upper = settings.output_tokens_per_atom * len(package_atoms)
         predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
         predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
-    budget = initialise_cumulative_budget(execution_root, preflight, authorization, policy)
     if predicted > budget.maximum_cny - budget.spent_cny():
         raise ContractError("当前波输出 token 上界已超过实时全局剩余授权预算；未读取密钥或联网")
     initialise_realtime_run(preflight, wave_root, settings, authorization)
+    # 全部 package 都是既有终态时无需读取密钥或构造 transport；仍须保留隔离状态，
+    # 使后续 Wave 的离线门继续拒绝含人工审计项的前序 Wave。
+    if not remaining_manifests:
+        final_status = "local_validation_quarantine" if outcomes.get("local_validation_quarantine") else "completed"
+        snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, preparation_started, 0, final_status, arguments.wave_index, task_indexes), preflight)
+        write_realtime_progress(wave_root, settings, snapshot)
+        atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})
+        return {"mode": "realtime_run", "network_called": False, "spent_cny": budget.spent_cny(), "outcomes": outcomes, "formal_cue_library_written": False}
     api_key = os.environ.get("DASHSCOPE_API_KEY")
     if not api_key:
         raise ContractError("缺少环境变量 DASHSCOPE_API_KEY；未发出实时请求")
     transport = RealtimeTransport(settings.endpoint, api_key)
     request_bucket, token_bucket = TokenBucket(policy.requests_per_minute), TokenBucket(policy.tokens_per_minute)
-    outcomes: dict[str, int] = {}
     started_at = time.monotonic()
-    completed = 0
     next_index = 0
     pending: dict[Future[tuple[str, float, dict[str, Any]]], dict[str, Any]] = {}
     stop_status: str | None = None
@@ -1683,8 +1776,8 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         """只提交一个尚未完成的包，令 in-flight 上限可由冻结配置强制。"""
 
         nonlocal next_index
-        while next_index < len(manifests):
-            manifest = manifests[next_index]
+        while next_index < len(remaining_manifests):
+            manifest = remaining_manifests[next_index]
             next_index += 1
             future = pool.submit(execute_realtime_package, manifest, atoms, prompt, schema, settings, policy, transport, wave_root, budget.maximum_cny - budget.spent_cny(), request_bucket, token_bucket, budget)
             pending[future] = manifest
@@ -1710,6 +1803,10 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
                 if status == "recovered_skip":
                     completed += 1
                     outcomes["validated_success"] = outcomes.get("validated_success", 0) + 1
+                elif status == "recovered_quarantine":
+                    # 防御性分支：若提交与执行之间已有隔离状态落盘，保持隔离并不追加账本。
+                    completed += 1
+                    outcomes["local_validation_quarantine"] = outcomes.get("local_validation_quarantine", 0) + 1
                 else:
                     validate_realtime_ledger_event(event)
                     append_ledger_event(wave_root / settings.layout["run_ledger_filename"], event)
@@ -1727,7 +1824,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
             print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
             last_progress = time.monotonic()
 
-    final_status = stop_status or "completed"
+    final_status = stop_status or ("local_validation_quarantine" if outcomes.get("local_validation_quarantine") else "completed")
     snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, 0, final_status, arguments.wave_index, task_indexes), preflight)
     write_realtime_progress(wave_root, settings, snapshot)
     atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})

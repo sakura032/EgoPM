@@ -101,6 +101,8 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     invalid = Invalid()
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, invalid, tmp_path / "realtime", 1.0, *buckets(value, policy))
     assert result[0] == "local_validation_quarantine" and invalid.calls == 1 and result[2]["retry_eligible"] is False
+    recovered = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, invalid, tmp_path / "realtime", 1.0, *buckets(value, policy))
+    assert recovered == ("recovered_quarantine", 0.0, {"outcome": "recovered_quarantine"}) and invalid.calls == 1
     class Costly:
         def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]: return response(costly=True)
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Costly(), tmp_path / "other", 0.01, *buckets(value, policy))
@@ -244,6 +246,44 @@ def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkey
     assert result["outcomes"] == {"validated_success": 12}
     assert (progress["wave_index"], progress["wave_task_indexes"], progress["total_packages"], progress["completed_packages"], progress["in_flight_packages"]) == (1, [0], 12, 12, 0)
     assert "source_text" not in json.dumps(progress, ensure_ascii=False)
+
+
+def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """恢复必须保留隔离计数、不重写账本，并只让尚未请求的包进入假执行器。"""
+    value = module(); settings, policy, first, rows = setup(value)
+    second = value.realtime_manifest(value.package_manifest([rows["src_a_001"]], "source", "protocol", "synthetic", 0, 1))
+    manifests = [first, second]
+    args = SimpleNamespace(run_root=tmp_path / "realtime", authorization=tmp_path / "authorization.json", run_id="synthetic", wave_index=1)
+    wave_root = args.run_root / "runs" / args.run_id / "wave_01"
+
+    class Invalid:
+        calls = 0
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            self.calls += 1
+            return response(False)
+
+    invalid = Invalid()
+    quarantined = value.execute_realtime_package(first, rows, "p", {"type": "object"}, settings, policy, invalid, wave_root, 10.0, *buckets(value, policy))
+    assert quarantined[0] == "local_validation_quarantine" and invalid.calls == 1
+    value.append_ledger_event(wave_root / settings.layout["run_ledger_filename"], quarantined[2])
+    submitted: list[str] = []
+
+    def fake_execute(item: dict[str, Any], *_args: Any, **_kwargs: Any) -> tuple[str, float, dict[str, Any]]:
+        submitted.append(str(item["package_id"]))
+        return "validated_success", 0.001, value.realtime_ledger_event(item, "validated_success", 0, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+
+    monkeypatch.setattr(value, "materialize_realtime_wave", lambda *_args: (manifests, rows))
+    monkeypatch.setattr(value, "load_realtime_authorization", lambda *_args: {"maximum_total_cny": 10.0})
+    monkeypatch.setattr(value, "execute_realtime_package", fake_execute)
+    monkeypatch.setattr(value, "RealtimeTransport", lambda *_args: object())
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic")
+    result = value.execute_realtime_run(args, settings, policy, {"sha256": "source"}, object(), "p", {"type": "object"}, "protocol")
+    progress = json.loads((wave_root / "progress.json").read_text(encoding="utf-8"))
+    events = list(value.iter_jsonl(wave_root / settings.layout["run_ledger_filename"]))
+    assert submitted == [second["package_id"]]
+    assert result["outcomes"] == {"local_validation_quarantine": 1, "validated_success": 1}
+    assert (progress["status"], progress["completed_packages"], progress["validated_success_packages"], progress["local_validation_quarantine_packages"]) == ("local_validation_quarantine", 2, 1, 1)
+    assert [event["realtime_request_id"] for event in events].count(first["realtime_request_id"]) == 1
 
 
 def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> None:
