@@ -3,8 +3,8 @@
 
 职责：验证冻结 Source、紧凑提示词和 Schema，并只在内存中生成五条 Atom package、Batch
 任务元数据与费用预检。输入是 Source SUCCESS、Source Atom、模型配置、提示词和 Schema；
-输出是只读预检报告及供合成测试使用的无正文解析函数。它位于 Source QA 后、Cue QA 前，
-当前合同明确禁止上传、下载、调用模型、写正式 Cue 或 SUCCESS。
+输出是只读预检报告，或在用户显式授权的生产入口中写入已验证 Cue 片段、无正文账本和收据。
+它位于 Source QA 后、Cue QA 前；默认模式绝不联网，正式 Cue 合并与 SUCCESS 仍由后续 QA 门控制。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import sys
+import time
 import uuid
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -469,6 +470,7 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
             raise ContractError("Batch custom_id 必须全局唯一")
         tasks.append({
             "run_id": selected[0]["run_id"] if selected else "", "batch_task_index": task_index,
+            "wave_index": wave_index_for_task(task_index, settings),
             "source_atoms_sha256": selected[0]["source_atoms_sha256"] if selected else "",
             "cue_execution_protocol_sha256": selected[0]["cue_execution_protocol_sha256"] if selected else "",
             "batch_input_sha256": hashlib.sha256(serialized).hexdigest(), "request_count": len(lines),
@@ -478,6 +480,15 @@ def build_batch_tasks(manifests: list[dict[str, Any]], atom_by_id: dict[str, dic
             "status": "planned_no_api", "request_lines": lines,
         })
     return tasks
+
+
+def wave_index_for_task(task_index: int, settings: Settings) -> int:
+    """把冻结连续 task 编号映射为八波编号，使任务清单可独立定位接收收据。"""
+
+    for wave_index in range(1, 9):
+        if task_index in wave_task_indexes(wave_index, settings):
+            return wave_index
+    raise ContractError("Batch task 编号不属于冻结的八波计划")
 
 
 def streaming_preflight_report(
@@ -593,7 +604,7 @@ def public_batch_task_manifest(task: dict[str, Any]) -> dict[str, Any]:
     """剥离临时请求正文后生成可保存的任务元数据，防止 Git 或账本留存原文。"""
 
     allowed = {
-        "run_id", "batch_task_index", "source_atoms_sha256", "cue_execution_protocol_sha256",
+        "run_id", "batch_task_index", "wave_index", "source_atoms_sha256", "cue_execution_protocol_sha256",
         "batch_input_sha256", "request_count", "custom_ids_sha256", "logical_shard_start",
         "logical_shard_end", "remote_file_id", "status",
     }
@@ -738,8 +749,11 @@ def parse_batch_result_line(result_line: dict[str, Any], manifest_by_custom_id: 
     if not isinstance(custom_id, str) or custom_id not in manifest_by_custom_id:
         raise ContractError("Batch 结果 custom_id 不能与本地清单双向匹配")
     manifest = manifest_by_custom_id[custom_id]
+    line_sha256 = canonical_sha256(result_line)
     if result_line.get("error") is not None:
-        return "line_failed_requeue", [], batch_ledger_event(manifest, task, "service_line_failure_requeueable", "remote_line_error", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端行级失败；可重新组批")
+        event = batch_ledger_event(manifest, task, "service_line_failure_requeueable", "remote_line_error", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端行级失败；可重新组批")
+        event.update({"result_line_sha256": line_sha256, "retry_eligible": True, "failure_origin": "service_line"})
+        return "line_failed_requeue", [], event
     try:
         response = result_line.get("response")
         if not isinstance(response, dict):
@@ -754,10 +768,14 @@ def parse_batch_result_line(result_line: dict[str, Any], manifest_by_custom_id: 
         atoms = [atom_by_id[item["atom_id"]] for item in manifest["atoms"]]
         cues = parse_inference_items(parsed, atoms, inference_validator, cue_validator, settings, manifest["run_id"])
         usage = normalise_usage(body)
-        return "validated", cues, batch_ledger_event(manifest, task, "validated_success", "validated", usage)
+        event = batch_ledger_event(manifest, task, "validated_success", "validated", usage)
+        event.update({"result_line_sha256": line_sha256, "retry_eligible": False, "failure_origin": None})
+        return "validated", cues, event
     except (ContractError, KeyError, IndexError, TypeError, json.JSONDecodeError):
         # 本地语义验证失败说明服务端已成功完成，自动重传会造成重复收费，因此只能隔离并人工决策。
-        return "quarantine", [], batch_ledger_event(manifest, task, "local_validation_quarantine", "local_validation_failed", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端成功但本地合同验证失败；禁止自动重试")
+        event = batch_ledger_event(manifest, task, "local_validation_quarantine", "local_validation_failed", {"prompt_tokens": None, "completion_tokens": None, "total_tokens": None}, "服务端成功但本地合同验证失败；禁止自动重试")
+        event.update({"result_line_sha256": line_sha256, "retry_eligible": False, "failure_origin": "local_validation"})
+        return "quarantine", [], event
 
 
 def validate_batch_ledger_events(events: list[dict[str, Any]], settings: Settings) -> None:
@@ -1144,8 +1162,216 @@ class BatchFileTransport:
         self.request_json("DELETE", f"/files/{file_id}")
 
 
+def execution_state_path(run_root: Path, wave_index: int, settings: Settings) -> Path:
+    """定位无正文执行状态；接收器只能消费提交器已原子写入的同一波次句柄。"""
+
+    return run_root / f"wave_{wave_index:02d}" / settings.execution["batch_execution_policy"]["execution_state_filename"]
+
+
+def rebuild_task_for_receipt(
+    state: dict[str, Any], arguments: argparse.Namespace, settings: Settings,
+    source_validator: jsonschema.Draft202012Validator, prompt: str, schema: dict[str, Any],
+    protocol_sha256: str,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]], dict[str, Any]]:
+    """从冻结 Source 重建提交时的 package 映射，以输入哈希和 custom_id 双向阻止漂移。"""
+
+    task_index = state.get("batch_task_index")
+    run_id = state.get("run_id")
+    if not isinstance(task_index, int) or not isinstance(run_id, str) or not run_id:
+        raise ContractError("执行状态缺少 batch_task_index 或 run_id")
+    manifests, request_by_id = materialize_task_from_source(
+        arguments.source_atoms, source_validator, str(state["source_atoms_sha256"]), task_index,
+        prompt, schema, settings, protocol_sha256, run_id,
+    )
+    atom_by_id: dict[str, dict[str, Any]] = {}
+    for manifest in manifests:
+        for item in manifest["atoms"]:
+            atom_by_id[item["atom_id"]] = item
+    # `materialize_task_from_source` 的清单只保留包内 atom_id，实际 Atom 需再做一次受限流式读取。
+    selected_ids = set(atom_by_id)
+    actual_atoms = {
+        atom["atom_id"]: atom for atom in iter_jsonl(arguments.source_atoms) if atom.get("atom_id") in selected_ids
+    }
+    if set(actual_atoms) != selected_ids:
+        raise ContractError("冻结 Source 无法重建接收所需 Atom")
+    tasks = build_batch_tasks(manifests, actual_atoms, prompt, schema, settings)
+    task = next((item for item in tasks if item["batch_task_index"] == task_index), None)
+    if task is None:
+        raise ContractError("冻结 Source 无法重建 Batch task")
+    if task["wave_index"] != state.get("wave_index"):
+        raise ContractError("执行状态 wave_index 与冻结任务计划不匹配")
+    if state.get("batch_input_sha256") != task["batch_input_sha256"]:
+        raise ContractError("执行状态 batch_input_sha256 与冻结重建请求不匹配")
+    expected_custom_ids = set(request_by_id)
+    if expected_custom_ids != {line["custom_id"] for line in task["request_lines"]}:
+        raise ContractError("冻结重建 custom_id 映射不一致")
+    task["remote_file_id"] = state.get("remote_file_id")
+    return manifests, actual_atoms, task
+
+
+def poll_batch_until_terminal(transport: BatchFileTransport, batch_id: str, settings: Settings, attempts: int) -> dict[str, Any]:
+    """按冻结退避策略轮询远端元数据；不读取结果正文且单次命令可安全恢复。"""
+
+    if not isinstance(attempts, int) or attempts < 1:
+        raise ContractError("poll_attempts 必须为正整数")
+    initial = int(settings.execution["batch_execution_policy"]["completion_poll_initial_seconds"])
+    maximum = int(settings.execution["batch_execution_policy"]["completion_poll_max_seconds"])
+    batch: dict[str, Any] = {}
+    for index in range(attempts):
+        batch = transport.get_batch(batch_id)
+        status = batch.get("status")
+        if status in {"completed", "failed", "expired", "cancelled"}:
+            return batch
+        if not isinstance(status, str):
+            raise ContractError("Batch 状态缺少 status")
+        if index + 1 < attempts:
+            # 延迟只发生在用户显式接收命令内；默认一次查询，避免后台等待或隐式联网循环。
+            time.sleep(min(maximum, initial * (2 ** index)))
+    return batch
+
+
+def receipt_path(run_root: Path, task_index: int, settings: Settings) -> Path:
+    """生成 task 级无正文收据路径；其命名受冻结 shard layout 控制。"""
+
+    return run_root / f"task_{task_index:03d}{settings.layout['batch_receipt_suffix']}"
+
+
+def save_public_task_manifest(task: dict[str, Any], manifests: list[dict[str, Any]], run_root: Path, settings: Settings) -> None:
+    """原子登记一个完成 task 的无正文映射，供 T4 将收据和每包账本逐一追溯。"""
+
+    path = run_root / settings.layout["batch_tasks_manifest"]
+    record = public_batch_task_manifest(task)
+    record["custom_id_to_package_id"] = {
+        manifest["batch_custom_id"]: manifest["package_id"] for manifest in manifests
+    }
+    record["status"] = "completed"
+    rows = read_jsonl(path) if path.is_file() else []
+    retained = [row for row in rows if row.get("batch_task_index") != task["batch_task_index"]]
+    if len(retained) != len(rows) and any(
+        row.get("batch_task_index") == task["batch_task_index"] and row != record for row in rows
+    ):
+        raise ContractError("既有 Batch task 清单与本次冻结重建结果冲突")
+    atomic_write_jsonl(path, retained + [record])
+
+
+def save_package_terminal(
+    manifest: dict[str, Any], cues: list[dict[str, Any]], event: dict[str, Any], run_root: Path, settings: Settings,
+) -> None:
+    """原子保存一个包的最终片段；只有验证成功包可获得 complete 标记。"""
+
+    files = package_paths(run_root, manifest, settings.layout)
+    atomic_write_jsonl(files["manifest"], [manifest])
+    atomic_write_jsonl(files["ledger"], [event])
+    if event["outcome"] == "validated_success":
+        atomic_write_jsonl(files["result"], cues)
+        atomic_write_json(files["complete"], {
+            "package_id": manifest["package_id"], "source_atoms_sha256": manifest["source_atoms_sha256"],
+            "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+            "input_manifest_sha256": sha256_file(files["manifest"]), "result_sha256": sha256_file(files["result"]),
+            "ledger_sha256": sha256_file(files["ledger"]),
+        })
+    else:
+        # 失败标记只记录终态及账本哈希，绝不写远端错误或响应正文；隔离项不可自动重跑。
+        atomic_write_json(files["failed"], {
+            "package_id": manifest["package_id"], "outcome": event["outcome"],
+            "ledger_sha256": sha256_file(files["ledger"]), "retry_eligible": event["retry_eligible"],
+        })
+
+
+def receive_authorized_wave(
+    arguments: argparse.Namespace, settings: Settings, marker: dict[str, Any],
+    source_validator: jsonschema.Draft202012Validator, prompt: str, schema: dict[str, Any], protocol_sha256: str,
+) -> dict[str, Any]:
+    """接收一个已提交 Batch 的流式结果，验证后仅写 Cue 片段、无正文账本和收据。"""
+
+    state_path = execution_state_path(arguments.run_root, arguments.wave_index, settings)
+    state = read_json(state_path)
+    required = {"run_id", "wave_index", "batch_task_index", "batch_id", "remote_file_id", "batch_input_sha256", "source_atoms_sha256", "cue_execution_protocol_sha256", "request_count", "status"}
+    if required.difference(state) or state["wave_index"] != arguments.wave_index:
+        raise ContractError("执行状态不完整或波次不匹配")
+    if state["source_atoms_sha256"] != marker["sha256"] or state["cue_execution_protocol_sha256"] != protocol_sha256:
+        raise ContractError("执行状态未绑定当前冻结 Source 或执行协议")
+    if state["status"] in {"received_completed", "received_failed"}:
+        raise ContractError("该 Batch 已完成接收；禁止重复写入终态片段")
+    api_key = os.environ.get("DASHSCOPE_API_KEY")
+    if not api_key:
+        raise ContractError("缺少环境变量 DASHSCOPE_API_KEY；未发出请求")
+    load_execution_authorization(arguments.authorization, settings, str(marker["sha256"]), protocol_sha256, arguments.wave_index, 0.0)
+    manifests, atom_by_id, task = rebuild_task_for_receipt(state, arguments, settings, source_validator, prompt, schema, protocol_sha256)
+    transport = BatchFileTransport(settings.endpoint, api_key)
+    batch = poll_batch_until_terminal(transport, str(state["batch_id"]), settings, arguments.poll_attempts)
+    if batch.get("id") != state["batch_id"] or batch.get("input_file_id") not in {None, state["remote_file_id"]}:
+        raise ContractError("远端 Batch 身份或输入文件句柄漂移")
+    remote_status = batch.get("status")
+    receipt = {
+        "run_id": state["run_id"], "wave_index": state["wave_index"], "batch_task_index": state["batch_task_index"],
+        "batch_id": state["batch_id"], "remote_file_id": state["remote_file_id"],
+        "output_file_id": batch.get("output_file_id"), "error_file_id": batch.get("error_file_id"),
+        "batch_input_sha256": state["batch_input_sha256"], "source_atoms_sha256": state["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": state["cue_execution_protocol_sha256"], "status": remote_status,
+        "request_count": state["request_count"], "received_at": utc_now(), "raw_response_saved": False,
+    }
+    if remote_status not in {"completed", "failed", "expired", "cancelled"}:
+        receipt.update({"received_line_count": 0, "validated_count": 0, "service_line_failure_count": 0,
+                        "local_validation_quarantine_count": 0, "remote_result_line_sha256": None, "remote_error_line_sha256": None})
+        atomic_write_json(receipt_path(state_path.parent, int(state["batch_task_index"]), settings), receipt)
+        return {"status": "pending", "batch_id": state["batch_id"], "network_called": True}
+    if remote_status != "completed":
+        receipt.update({"received_line_count": 0, "validated_count": 0, "service_line_failure_count": 0,
+                        "local_validation_quarantine_count": 0, "remote_result_line_sha256": None, "remote_error_line_sha256": None})
+        atomic_write_json(receipt_path(state_path.parent, int(state["batch_task_index"]), settings), receipt)
+        state.update({"status": "received_failed", "received_at": utc_now(), "remote_status": remote_status})
+        atomic_write_json(state_path, state)
+        return {"status": "remote_batch_failed", "batch_id": state["batch_id"], "network_called": True}
+    inference_validator = load_validator(arguments.inference_schema)
+    cue_validator = load_validator(arguments.cue_schema)
+    by_custom_id = {manifest["batch_custom_id"]: manifest for manifest in manifests}
+    received: dict[str, tuple[str, list[dict[str, Any]], dict[str, Any]]] = {}
+    result_hashes: list[str] = []
+    error_hashes: list[str] = []
+    for file_key, hash_sink in (("output_file_id", result_hashes), ("error_file_id", error_hashes)):
+        file_id = batch.get(file_key)
+        if file_id is None:
+            continue
+        if not isinstance(file_id, str) or not file_id:
+            raise ContractError("远端结果文件 ID 无效")
+        for line in transport.stream_jsonl_file(file_id):
+            custom_id = line.get("custom_id")
+            if not isinstance(custom_id, str) or custom_id in received:
+                raise ContractError("远端结果 custom_id 重复或无效")
+            state_name, cues, event = parse_batch_result_line(line, by_custom_id, atom_by_id, task, inference_validator, cue_validator, settings)
+            event.update({"wave_index": state["wave_index"], "batch_id": state["batch_id"], "result_file_id": batch.get("output_file_id"), "error_file_id": batch.get("error_file_id")})
+            received[custom_id] = (state_name, cues, event)
+            hash_sink.append(event["result_line_sha256"])
+    if set(received) != set(by_custom_id):
+        raise ContractError("远端结果与冻结 custom_id 清单不构成一对一对应")
+    events = [received[manifest["batch_custom_id"]][2] for manifest in manifests]
+    validate_batch_ledger_events(events, settings)
+    if len(events) != int(state["request_count"]):
+        raise ContractError("接收终态数量与冻结请求数不一致")
+    for manifest in manifests:
+        state_name, cues, event = received[manifest["batch_custom_id"]]
+        # package_id 已由全局 shard/package 编号固定；放在 batch 根目录使跨 wave 恢复和 T4
+        # 汇总校验只需一处查找，wave 子目录仅保存远端 task 句柄与收据。
+        save_package_terminal(manifest, cues, event, state_path.parent.parent, settings)
+    receipt.update({
+        "received_line_count": len(received), "validated_count": sum(event["outcome"] == "validated_success" for event in events),
+        "service_line_failure_count": sum(event["outcome"] == "service_line_failure_requeueable" for event in events),
+        "local_validation_quarantine_count": sum(event["outcome"] == "local_validation_quarantine" for event in events),
+        "remote_result_line_sha256": canonical_sha256(result_hashes) if batch.get("output_file_id") is not None else None,
+        "remote_error_line_sha256": canonical_sha256(error_hashes) if batch.get("error_file_id") is not None else None,
+    })
+    save_public_task_manifest(task, manifests, state_path.parent.parent, settings)
+    atomic_write_json(receipt_path(state_path.parent, int(state["batch_task_index"]), settings), receipt)
+    state.update({"status": "received_completed", "received_at": utc_now(), "remote_status": remote_status})
+    atomic_write_json(state_path, state)
+    return {"status": "received_completed", "batch_id": state["batch_id"], "network_called": True,
+            "validated_count": receipt["validated_count"], "service_line_failure_count": receipt["service_line_failure_count"],
+            "local_validation_quarantine_count": receipt["local_validation_quarantine_count"]}
+
+
 def run(arguments: argparse.Namespace) -> int:
-    """装配第 05 阶段；默认预检或只读执行就绪核验均不得调用网络。"""
+    """装配第 05 阶段；默认预检只读，提交和接收均须独立显式授权。"""
 
     if arguments.rerun_failed_packages:
         raise ContractError("失败 package 重跑必须在独立授权与 T4 审阅后启用")
@@ -1161,6 +1387,16 @@ def run(arguments: argparse.Namespace) -> int:
     # 预检不写可恢复工件，故使用稳定名称即可；正式 run_id 只能在未来获单独授权的执行阶段引入。
     run_id = arguments.run_id or "preflight_no_api"
     protocol_sha256 = protocol_hash(settings, arguments.prompt, arguments.inference_schema)
+    if getattr(arguments, "receive", False):
+        if getattr(arguments, "confirmation", "") != "RECEIVE_BATCH_RESULTS_API":
+            raise ContractError("结果接收需要显式 confirmation=RECEIVE_BATCH_RESULTS_API")
+        if getattr(arguments, "authorization", None) is None:
+            raise ContractError("结果接收必须提供本机执行授权文件")
+        result = receive_authorized_wave(
+            arguments, settings, marker, source_validator, prompt, schema, protocol_sha256
+        )
+        print(json.dumps({"mode": "batch_wave_receive", **result}, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     if arguments.execute:
         if getattr(arguments, "confirmation", "") != "START_WAVE_1_API":
             raise ContractError("生产调用需要显式 confirmation=START_WAVE_1_API")
@@ -1213,8 +1449,10 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--authorization", type=Path, help="本机未提交的执行授权 JSON")
     parser.add_argument("--wave-index", type=int, default=1, help="八波计划中的目标波次（1--8）")
     parser.add_argument("--validate-execution-plan", action="store_true", help="只校验授权、波次和预算，绝不联网")
-    parser.add_argument("--confirmation", default="", help="必须精确为 START_WAVE_1_API 才允许提交首波")
+    parser.add_argument("--confirmation", default="", help="提交或接收的显式 API 确认短语")
     parser.add_argument("--execute", action="store_true", help="提交首波 Batch；需授权文件和显式 confirmation")
+    parser.add_argument("--receive", action="store_true", help="接收已提交 Batch 的结果；需独立确认和授权")
+    parser.add_argument("--poll-attempts", type=int, default=1, help="接收命令内的最多轮询次数；默认一次")
     parser.add_argument("--rerun-failed-packages", action="store_true")
     return parser.parse_args(argv)
 

@@ -385,6 +385,126 @@ def test_batch_transport_uses_fake_http_and_never_persists_remote_text(tmp_path:
     assert all("synthetic-key" not in url for _, url in seen)
 
 
+def test_receive_completed_batch_streams_without_raw_response_persistence(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """接收成功 Batch 只写验证后的 Cue 片段与无正文收据，且 custom_id 必须完整匹配。"""
+
+    module = load_script()
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic-key")
+    atoms = [source_atom(1)]
+    source_path, source_marker = write_source_fixture(module, tmp_path, atoms)
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
+    prompt = (ROOT / "prompts/cue_extractor_v3_compact.md").read_text(encoding="utf-8")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    protocol = "protocol"
+    manifests = module.build_packages(atoms, module.sha256_file(source_path), prompt, schema, settings, protocol, "wave_01")
+    task = module.build_batch_tasks(manifests, {atoms[0]["atom_id"]: atoms[0]}, prompt, schema, settings)[0]
+    run_root = tmp_path / "batch"
+    state_path = run_root / "wave_01" / "execution_state.json"
+    module.atomic_write_json(state_path, {
+        "run_id": "wave_01", "wave_index": 1, "batch_task_index": 0, "batch_id": "batch_synthetic",
+        "remote_file_id": "file_input", "batch_input_sha256": task["batch_input_sha256"],
+        "source_atoms_sha256": module.sha256_file(source_path), "cue_execution_protocol_sha256": protocol,
+        "request_count": 1, "status": "submitted", "remote_cleanup_status": "pending_t4_cue_qa",
+    })
+    authorization = tmp_path / "authorization.json"
+    module.atomic_write_json(authorization, {
+        "authorization_version": "v1.0.0", "approved": True, "approved_by": "synthetic", "approved_at": "2026-09-05T00:00:00Z",
+        "maximum_total_cny": 40.0, "allowed_wave_indexes": [1], "source_atoms_sha256": module.sha256_file(source_path),
+        "cue_execution_protocol_sha256": protocol, "accept_remote_text_retention_until_t4_cue_qa": True,
+        "accept_quarantine_manual_review_only": True,
+    })
+    result_line = {"custom_id": manifests[0]["batch_custom_id"], "response": {"body": {
+        "choices": [{"message": {"content": json.dumps(inference_response(1))}}],
+        "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+    }}}
+
+    class FakeTransport:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_batch(self, _batch_id: str) -> dict[str, Any]:
+            return {"id": "batch_synthetic", "input_file_id": "file_input", "status": "completed", "output_file_id": "file_output", "error_file_id": None}
+
+        def stream_jsonl_file(self, _file_id: str):
+            yield result_line
+
+    monkeypatch.setattr(module, "BatchFileTransport", FakeTransport)
+    arguments = module.argparse.Namespace(
+        model_registry=ROOT / "config/model_registry.yaml", source_atoms=source_path, source_success=source_marker,
+        source_schema=ROOT / "schemas/source_video_atom.schema.json", cue_schema=ROOT / "schemas/cue_candidate.schema.json",
+        inference_schema=ROOT / "schemas/cue_inference_batch_compact_v1.schema.json", prompt=ROOT / "prompts/cue_extractor_v3_compact.md",
+        run_root=run_root, output=tmp_path / "cue_library.jsonl", success_marker=tmp_path / "CUE_LIBRARY_SUCCESS.json",
+        run_id=None, authorization=authorization, wave_index=1, validate_execution_plan=False,
+        confirmation="RECEIVE_BATCH_RESULTS_API", execute=False, receive=True, poll_attempts=1, rerun_failed_packages=False,
+    )
+    monkeypatch.setattr(module, "protocol_hash", lambda *_args: protocol)
+    assert module.run(arguments) == 0
+    receipt = module.read_json(run_root / "wave_01" / "task_000.batch_receipt.json")
+    assert receipt["validated_count"] == 1 and receipt["raw_response_saved"] is False
+    ledger = next((run_root / "packages").rglob("*.ledger.jsonl"))
+    ledger_text = ledger.read_text(encoding="utf-8")
+    assert "private" not in ledger_text and "starts cooking" not in ledger_text
+    assert module.read_json(state_path)["status"] == "received_completed"
+    assert not (tmp_path / "cue_library.jsonl").exists() and not (tmp_path / "CUE_LIBRARY_SUCCESS.json").exists()
+
+
+def test_receive_rejects_drift_and_quarantines_local_validation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """custom_id 漂移必须在写前失败；本地语义失败只隔离，绝不自动重传。"""
+
+    module = load_script()
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic-key")
+    atoms = [source_atom(1)]
+    source_path, source_marker = write_source_fixture(module, tmp_path, atoms)
+    monkeypatch.setattr(module, "ROOT", tmp_path)
+    settings = module.settings_from_registry(ROOT / "config/model_registry.yaml")
+    prompt = (ROOT / "prompts/cue_extractor_v3_compact.md").read_text(encoding="utf-8")
+    schema = module.read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+    protocol = "protocol"
+    manifests = module.build_packages(atoms, module.sha256_file(source_path), prompt, schema, settings, protocol, "wave_01")
+    task = module.build_batch_tasks(manifests, {atoms[0]["atom_id"]: atoms[0]}, prompt, schema, settings)[0]
+    run_root = tmp_path / "batch"
+    state_path = run_root / "wave_01" / "execution_state.json"
+    module.atomic_write_json(state_path, {"run_id": "wave_01", "wave_index": 1, "batch_task_index": 0, "batch_id": "batch_synthetic", "remote_file_id": "file_input", "batch_input_sha256": task["batch_input_sha256"], "source_atoms_sha256": module.sha256_file(source_path), "cue_execution_protocol_sha256": protocol, "request_count": 1, "status": "submitted"})
+    authorization = tmp_path / "authorization.json"
+    module.atomic_write_json(authorization, {"authorization_version": "v1.0.0", "approved": True, "approved_by": "synthetic", "approved_at": "2026-09-05T00:00:00Z", "maximum_total_cny": 40.0, "allowed_wave_indexes": [1], "source_atoms_sha256": module.sha256_file(source_path), "cue_execution_protocol_sha256": protocol, "accept_remote_text_retention_until_t4_cue_qa": True, "accept_quarantine_manual_review_only": True})
+    bad_response = {"custom_id": manifests[0]["batch_custom_id"], "response": {"body": {"choices": [{"message": {"content": json.dumps({"items": []})}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}}}
+
+    class FakeTransport:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_batch(self, _batch_id: str) -> dict[str, Any]:
+            return {"id": "batch_synthetic", "input_file_id": "file_input", "status": "completed", "output_file_id": "file_output"}
+
+        def stream_jsonl_file(self, _file_id: str):
+            yield bad_response
+
+    monkeypatch.setattr(module, "BatchFileTransport", FakeTransport)
+    monkeypatch.setattr(module, "protocol_hash", lambda *_args: protocol)
+    arguments = module.argparse.Namespace(model_registry=ROOT / "config/model_registry.yaml", source_atoms=source_path, source_success=source_marker, source_schema=ROOT / "schemas/source_video_atom.schema.json", cue_schema=ROOT / "schemas/cue_candidate.schema.json", inference_schema=ROOT / "schemas/cue_inference_batch_compact_v1.schema.json", prompt=ROOT / "prompts/cue_extractor_v3_compact.md", run_root=run_root, output=tmp_path / "cue_library.jsonl", success_marker=tmp_path / "CUE_LIBRARY_SUCCESS.json", run_id=None, authorization=authorization, wave_index=1, validate_execution_plan=False, confirmation="RECEIVE_BATCH_RESULTS_API", execute=False, receive=True, poll_attempts=1, rerun_failed_packages=False)
+    assert module.run(arguments) == 0
+    failed = next((run_root / "packages").rglob("*.failed.json"))
+    assert module.read_json(failed)["retry_eligible"] is False
+    assert not list((run_root / "packages").rglob("*.result.jsonl"))
+
+    module.atomic_write_json(state_path, {**module.read_json(state_path), "status": "submitted", "batch_input_sha256": "drift"})
+    with pytest.raises(module.ContractError, match="batch_input_sha256"):
+        module.run(arguments)
+
+    class FailedTransport:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def get_batch(self, _batch_id: str) -> dict[str, Any]:
+            return {"id": "batch_synthetic", "input_file_id": "file_input", "status": "failed", "output_file_id": None, "error_file_id": None}
+
+    module.atomic_write_json(state_path, {**module.read_json(state_path), "status": "submitted", "batch_input_sha256": task["batch_input_sha256"]})
+    monkeypatch.setattr(module, "BatchFileTransport", FailedTransport)
+    assert module.run(arguments) == 0
+    assert module.read_json(state_path)["status"] == "received_failed"
+
+
 def cue_for(atom: dict[str, Any]) -> dict[str, Any]:
     """构造第 06/07 既有回归使用的合成 accepted Cue。"""
 

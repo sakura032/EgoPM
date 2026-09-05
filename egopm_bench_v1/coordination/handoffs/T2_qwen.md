@@ -1,5 +1,42 @@
 # T2 交接：CR-2026-009 的 Cue v2.2 Batch File 无 API 生产者
 
+## 2026-09-05：Batch 结果接收闭环补充
+
+本次仅实现和测试第 05 阶段的结果接收路径；未读取或设置 `DASHSCOPE_API_KEY`，未联网、未
+提交 Batch、未读取任何远端结果，未写 `cue_library.jsonl` 或 `CUE_LIBRARY_SUCCESS.json`。
+当前模型为 `qwen3.7-flash`，执行协议为 `v2.2.1`，协议 SHA256 为
+`c2a5db76c6e74cd09942aea020caa6c09ffcfcb9ce57f8a4e87dec8ec6421198`。
+实现提交为 `824dd1f541e63578d296fd044468f18a496390a1`。
+
+- `scripts/05_extract_cues.py` 新增 `--receive` 入口。它要求独立的
+  `confirmation=RECEIVE_BATCH_RESULTS_API`、本机授权文件和运行时环境变量；默认预检仍完全
+  离线。接收器按冻结退避策略轮询 Batch 状态，在内存中流式读取 output/error JSONL，绝不把
+  原始请求、响应或错误正文落盘。
+- 接收前从冻结 Source 重建同一 task，严格验证 Source SHA、协议 SHA、Batch 输入 SHA 与
+  `custom_id` 双向一对一映射。哈希或 ID 漂移会在写任何 Cue 片段前终止。
+- 已验证项按全局 `cues/batch/packages/` 的固定 package 路径原子写入清单、Cue 片段、无正文
+  ledger 与完成哈希；远端行级失败写可重组失败标记；服务端成功但本地 Schema/血缘校验失败写
+  quarantine 标记，`retry_eligible=false`，禁止自动重发。
+- 每个完成 task 在 `cues/batch/batch_tasks_manifest.jsonl` 原子登记无正文
+  `custom_id_to_package_id` 映射及 `wave_index`；收据固定写在
+  `cues/batch/wave_XX/task_XXX.batch_receipt.json`。ledger 额外记录远端 ID、结果行 SHA256、
+  `retry_eligible` 与 `failure_origin`，不含正文。
+- 接收器不合并 `cue_library.jsonl`，不写 Cue SUCCESS，也不删除远端文件；T4 Cue QA 仍是
+  远端清理和最终合并的前置门。
+
+本次验证：
+
+```powershell
+python -m pytest -q egopm_bench_v1/tests/test_qwen_contracts.py egopm_bench_v1/tests/test_validators.py --basetemp .pytest_cache/t2-cross
+# 34 passed
+
+python -m pytest -q --basetemp .pytest_cache/t2-batch-full
+# 52 passed
+
+git diff --check
+# 通过
+```
+
 ## 当前结论
 
 本交接对应 T2 已提交的实现。第 05 阶段已改为紧凑协议的本地 Batch File 计划器：默认仅
