@@ -84,6 +84,7 @@ def write_valid_batch_manifest(qa, config, marker: dict) -> None:
     custom_id = "v22_s00000_p000_1234abcd"
     row = {
         "run_id": "run_synthetic_v22",
+        "wave_index": 1,
         "batch_task_index": 0,
         "source_atoms_sha256": marker["source_atoms_sha256"],
         "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
@@ -111,10 +112,46 @@ def write_valid_batch_manifest(qa, config, marker: dict) -> None:
                 "remote_file_id": "file-synthetic-input",
                 "remote_cleanup_status": "pending_t4_cue_qa",
                 "outcome": "validated_success",
+                "batch_id": "batch-synthetic",
+                "result_file_id": "file-synthetic-output",
+                "error_file_id": None,
+                "result_line_sha256": "b" * 64,
+                "retry_eligible": False,
+                "failure_origin": None,
             },
             ensure_ascii=False,
         )
         + "\n",
+        encoding="utf-8",
+    )
+    receipt = path.parent / "wave_01" / "task_000.batch_receipt.json"
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    receipt.write_text(
+        json.dumps(
+            {
+                "run_id": "run_synthetic_v22",
+                "wave_index": 1,
+                "batch_task_index": 0,
+                "batch_id": "batch-synthetic",
+                "remote_file_id": "file-synthetic-input",
+                "output_file_id": "file-synthetic-output",
+                "error_file_id": None,
+                "batch_input_sha256": "a" * 64,
+                "source_atoms_sha256": marker["source_atoms_sha256"],
+                "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
+                "status": "completed",
+                "request_count": 1,
+                "received_line_count": 1,
+                "validated_count": 1,
+                "service_line_failure_count": 0,
+                "local_validation_quarantine_count": 0,
+                "remote_result_line_sha256": "c" * 64,
+                "remote_error_line_sha256": None,
+                "received_at": "2026-09-05T00:00:00+00:00",
+                "raw_response_saved": False,
+            },
+            ensure_ascii=False,
+        ),
         encoding="utf-8",
     )
     marker.update(
@@ -388,6 +425,57 @@ def test_cue_v22_rejects_quarantine_followed_by_requeue(tmp_path: Path) -> None:
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
     issue_types = {issue["issue_type"] for issue in collector.issues}
     assert {"cue_batch_quarantine_requeued", "cue_batch_ledger_terminal_duplicate"}.issubset(issue_types)
+
+
+def test_cue_v221_rejects_receiver_receipt_or_retry_semantic_tampering(tmp_path: Path) -> None:
+    """接收端只能保留行哈希；服务端行失败才可重试，不能伪装本地隔离为可重排。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    receipt = qa.batch_receipt_path(config, 1, 0)
+    receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+    receipt_data["raw_response_saved"] = True
+    receipt_data["received_line_count"] = 0
+    receipt.write_text(json.dumps(receipt_data), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert {"cue_batch_receipt_raw_response_policy", "cue_batch_receipt_counts"}.issubset(issue_types)
+
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    ledger = qa.batch_tasks_manifest_path(config, marker).parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
+    event = json.loads(ledger.read_text(encoding="utf-8"))
+    event.update(
+        {
+            "outcome": "local_validation_quarantine",
+            "retry_eligible": True,
+            "failure_origin": "service_line",
+        }
+    )
+    ledger.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    assert any(issue["issue_type"] == "cue_batch_ledger_requeue_semantics" for issue in collector.issues)
+
+
+def test_cue_v221_rejects_missing_remote_result_hash_or_forbidden_receipt_body(tmp_path: Path) -> None:
+    """远端文件存在就必须有流式行哈希，receipt 也不得成为保存模型正文的旁路。"""
+
+    qa = load_validator()
+    config = qa.load_run_config(copy_config_tree(tmp_path))
+    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
+    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
+    receipt = qa.batch_receipt_path(config, 1, 0)
+    receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
+    receipt_data["remote_result_line_sha256"] = None
+    receipt_data["error"] = "不得持久化的合成错误正文"
+    receipt.write_text(json.dumps(receipt_data, ensure_ascii=False), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert {"cue_batch_receipt_remote_hash", "cue_batch_receipt_raw_content"}.issubset(issue_types)
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:

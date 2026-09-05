@@ -141,6 +141,7 @@ CUE_V2_USAGE_SUMMARY_FIELDS = {
 BATCH_TASKS_MANIFEST_NAME = "batch_tasks_manifest.jsonl"
 BATCH_TASK_REQUIRED_FIELDS = {
     "run_id",
+    "wave_index",
     "batch_task_index",
     "source_atoms_sha256",
     "cue_execution_protocol_sha256",
@@ -152,6 +153,39 @@ BATCH_TASK_REQUIRED_FIELDS = {
     "remote_file_id",
     "status",
     "custom_id_to_package_id",
+}
+# Batch 返回正文只能在内存中逐行验证。receipt 与 ledger 因而只记录可复算的 ID、
+# 计数和行哈希：它们既能把服务端结果绑定到提交任务，又不会把 SRT 文本、模型内容或
+# 错误详情作为本地审计数据保存下来。
+BATCH_RECEIPT_REQUIRED_FIELDS = {
+    "run_id",
+    "wave_index",
+    "batch_task_index",
+    "batch_id",
+    "remote_file_id",
+    "output_file_id",
+    "error_file_id",
+    "batch_input_sha256",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "status",
+    "request_count",
+    "received_line_count",
+    "validated_count",
+    "service_line_failure_count",
+    "local_validation_quarantine_count",
+    "remote_result_line_sha256",
+    "remote_error_line_sha256",
+    "received_at",
+    "raw_response_saved",
+}
+BATCH_RECEIVER_LEDGER_FIELDS = {
+    "batch_id",
+    "result_file_id",
+    "error_file_id",
+    "result_line_sha256",
+    "retry_eligible",
+    "failure_origin",
 }
 BATCH_RAW_CONTENT_FIELDS = {
     "body",
@@ -166,6 +200,7 @@ BATCH_RAW_CONTENT_FIELDS = {
     "visible_text",
 }
 BATCH_CUSTOM_ID = re.compile(r"^v22_s\d{5}_p\d{3}_[0-9a-f]{8}$")
+SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 TERMINAL_STATES = {"completed", "cancelled", "expired"}
 STATE_TRANSITIONS = {
     None: {None, "active_unreminded"},
@@ -464,6 +499,93 @@ def has_forbidden_batch_content(value: Any) -> bool:
     return False
 
 
+def batch_receipt_path(config: RunConfig, wave_index: int, task_index: int) -> Path:
+    """根据冻结运行布局定位 task receipt，拒绝让清单把 QA 引向任意本地文件。"""
+
+    # receipt 所在 wave 与 task 索引共同构成提交后的稳定地址。若以生产者自报的路径
+    # 为准，另一轮的 receipt 可被替换进来，使 Batch ID 和输入哈希的检查失去意义。
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    layout = registry["models"]["cue_extraction"]["execution"]["shard_layout"]
+    suffix = str(layout["batch_receipt_suffix"])
+    return config.benchmark_root / str(layout["root"]) / f"wave_{wave_index:02d}" / f"task_{task_index:03d}{suffix}"
+
+
+def is_optional_remote_file_id(value: Any) -> bool:
+    """远端文件 ID 可为空，但非空时必须是无空白的标识符。"""
+
+    return value is None or (isinstance(value, str) and bool(value.strip()))
+
+
+def is_optional_sha256(value: Any) -> bool:
+    """未生成对应远端文件时允许空哈希，生成后必须留下完整行流哈希。"""
+
+    return value is None or (isinstance(value, str) and SHA256_HEX.fullmatch(value) is not None)
+
+
+def validate_batch_task_receipts(
+    config: RunConfig,
+    marker: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """验证 Batch 接收 receipt 的远端血缘、计数与“仅流式、不存正文”边界。"""
+
+    manifest_path = batch_tasks_manifest_path(config, marker)
+    tasks = read_jsonl(manifest_path, collector, "cue_batch_manifest", owner)
+    valid = True
+    for line_number, task in enumerate(tasks, start=1):
+        label = f"task:{line_number}"
+        required_task = {"run_id", "wave_index", "batch_task_index"}
+        if required_task.difference(task):
+            # task manifest 的字段门会同时报错；这里提前跳过避免不可信索引被用于拼路径。
+            valid = False
+            continue
+        wave_index = task["wave_index"]
+        task_index = task["batch_task_index"]
+        if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (wave_index, task_index)):
+            collector.add("BLOCKER", "cue_batch_receipt_path", label, "非负整数 wave/task 索引", repr((wave_index, task_index)), owner)
+            valid = False
+            continue
+        receipt_path = batch_receipt_path(config, wave_index, task_index)
+        receipt = load_json(receipt_path, collector, "cue_batch_receipt", owner)
+        if receipt is None:
+            valid = False
+            continue
+        if has_forbidden_batch_content(receipt):
+            collector.add("BLOCKER", "cue_batch_receipt_raw_content", str(receipt_path), "仅无正文 receipt 元数据", "发现请求、响应、错误或可见文本字段", owner)
+            valid = False
+        missing = sorted(BATCH_RECEIPT_REQUIRED_FIELDS.difference(receipt))
+        if missing:
+            collector.add("BLOCKER", "cue_batch_receipt_fields", str(receipt_path), "完整的 Batch 接收 receipt", f"缺少 {missing}", owner)
+            valid = False
+            continue
+        for field_name in ("run_id", "wave_index", "batch_task_index", "remote_file_id", "batch_input_sha256", "source_atoms_sha256", "cue_execution_protocol_sha256", "request_count"):
+            if receipt[field_name] != task.get(field_name):
+                collector.add("BLOCKER", "cue_batch_receipt_lineage", f"{label}:{field_name}", repr(task.get(field_name)), repr(receipt[field_name]), owner)
+                valid = False
+        if not isinstance(receipt["batch_id"], str) or not receipt["batch_id"].strip() or receipt["status"] != "completed":
+            collector.add("BLOCKER", "cue_batch_receipt_status", label, "已完成且具有 batch_id 的 task receipt", repr({"batch_id": receipt["batch_id"], "status": receipt["status"]}), owner)
+            valid = False
+        if receipt["raw_response_saved"] is not False:
+            collector.add("BLOCKER", "cue_batch_receipt_raw_response_policy", label, "raw_response_saved=false", repr(receipt["raw_response_saved"]), owner)
+            valid = False
+        for file_field, hash_field in (("output_file_id", "remote_result_line_sha256"), ("error_file_id", "remote_error_line_sha256")):
+            file_id, line_hash = receipt[file_field], receipt[hash_field]
+            if not is_optional_remote_file_id(file_id) or not is_optional_sha256(line_hash) or (file_id is None) != (line_hash is None):
+                collector.add("BLOCKER", "cue_batch_receipt_remote_hash", f"{label}:{file_field}", "远端文件 ID 与对应 64 位行流 SHA256 同时存在或同时为空", repr({file_field: file_id, hash_field: line_hash}), owner)
+                valid = False
+        count_fields = ("request_count", "received_line_count", "validated_count", "service_line_failure_count", "local_validation_quarantine_count")
+        if not all(isinstance(receipt[field], int) and not isinstance(receipt[field], bool) and receipt[field] >= 0 for field in count_fields):
+            collector.add("BLOCKER", "cue_batch_receipt_counts", label, "全部接收计数均为非负整数", repr({field: receipt[field] for field in count_fields}), owner)
+            valid = False
+            continue
+        terminal_count = receipt["validated_count"] + receipt["service_line_failure_count"] + receipt["local_validation_quarantine_count"]
+        if receipt["received_line_count"] != receipt["request_count"] or terminal_count != receipt["request_count"]:
+            collector.add("BLOCKER", "cue_batch_receipt_counts", label, "received_line_count 与三类终态计数均覆盖 request_count", repr({field: receipt[field] for field in count_fields}), owner)
+            valid = False
+    return valid
+
+
 def expand_compact_cue_for_qa(
     compact: dict[str, Any],
     atom: dict[str, Any],
@@ -586,14 +708,18 @@ def validate_batch_task_manifest(
             collector.add("BLOCKER", "cue_batch_task_fields", label, "完整的无正文 Batch task 元数据", f"缺少 {missing}", owner)
             valid = False
             continue
+        wave_index = task["wave_index"]
         task_index = task["batch_task_index"]
         request_count = task["request_count"]
         shard_start = task["logical_shard_start"]
         shard_end = task["logical_shard_end"]
-        if not all(isinstance(item, int) and not isinstance(item, bool) for item in (task_index, request_count, shard_start, shard_end)):
-            collector.add("BLOCKER", "cue_batch_task_value", label, "任务索引、请求数和 shard 边界均为整数", repr(task), owner)
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in (wave_index, task_index, request_count, shard_start, shard_end)):
+            collector.add("BLOCKER", "cue_batch_task_value", label, "波次、任务索引、请求数和 shard 边界均为整数", repr(task), owner)
             valid = False
             continue
+        if wave_index < 1:
+            collector.add("BLOCKER", "cue_batch_wave_index", label, "从 1 开始的 wave_index", repr(wave_index), owner)
+            valid = False
         if task_index < 0 or task_index in task_indexes:
             collector.add("BLOCKER", "cue_batch_task_index", label, "唯一的非负 batch_task_index", repr(task_index), owner)
             valid = False
@@ -619,7 +745,7 @@ def validate_batch_task_manifest(
             # 且已产生可追踪远端句柄后出现；否则无法审计服务端临时文件的清理责任。
             collector.add("BLOCKER", "cue_batch_remote_file_id", label, "非空远端输入 file ID", repr(task["remote_file_id"]), owner)
             valid = False
-        if not isinstance(task["batch_input_sha256"], str) or not re.fullmatch(r"[0-9a-f]{64}", task["batch_input_sha256"]):
+        if not isinstance(task["batch_input_sha256"], str) or SHA256_HEX.fullmatch(task["batch_input_sha256"]) is None:
             collector.add("BLOCKER", "cue_batch_input_hash", label, "64 位 SHA256", repr(task["batch_input_sha256"]), owner)
             valid = False
         mappings = task["custom_id_to_package_id"]
@@ -699,7 +825,7 @@ def validate_batch_package_ledgers(
         "remote_cleanup_status",
         "outcome",
         "package_id",
-    }
+    } | BATCH_RECEIVER_LEDGER_FIELDS
     allowed_outcomes = set(ledger_policy["terminal_outcomes"])
     terminal_by_custom: dict[str, str] = {}
     terminal_by_package: dict[str, set[str]] = defaultdict(set)
@@ -736,6 +862,27 @@ def validate_batch_package_ledgers(
                 collector.add("BLOCKER", "cue_batch_ledger_outcome", label, repr(sorted(allowed_outcomes)), repr(outcome), owner)
                 valid = False
                 continue
+            # 只有服务端逐行失败才代表“尚未得到模型输出”，因此才可进入受控 requeue。
+            # 本地验证隔离已消费结果且可能已计费；将其重排会掩盖 QA 缺陷并重复付费。
+            semantic_expected = {
+                "validated_success": (False, None, "result_file_id"),
+                "service_line_failure_requeueable": (True, "service_line", "error_file_id"),
+                "local_validation_quarantine": (False, "local_validation", "result_file_id"),
+            }
+            expected_retry, expected_origin, required_file = semantic_expected[outcome]
+            if event["retry_eligible"] is not expected_retry or event["failure_origin"] != expected_origin:
+                collector.add("BLOCKER", "cue_batch_ledger_requeue_semantics", label, f"{outcome} 的 retry_eligible={expected_retry!r}、failure_origin={expected_origin!r}", repr({"retry_eligible": event["retry_eligible"], "failure_origin": event["failure_origin"]}), owner)
+                valid = False
+            for file_field in ("result_file_id", "error_file_id"):
+                if not is_optional_remote_file_id(event[file_field]):
+                    collector.add("BLOCKER", "cue_batch_ledger_remote_file", f"{label}:{file_field}", "非空远端文件 ID 或 null", repr(event[file_field]), owner)
+                    valid = False
+            if not isinstance(event["result_line_sha256"], str) or SHA256_HEX.fullmatch(event["result_line_sha256"]) is None:
+                collector.add("BLOCKER", "cue_batch_ledger_result_hash", label, "流式接收行的 64 位 SHA256", repr(event["result_line_sha256"]), owner)
+                valid = False
+            if not isinstance(event["batch_id"], str) or not event["batch_id"].strip() or not isinstance(event[required_file], str) or not event[required_file].strip():
+                collector.add("BLOCKER", "cue_batch_ledger_result_lineage", label, f"{outcome} 对应的 batch_id 与 {required_file}", repr({"batch_id": event["batch_id"], required_file: event[required_file]}), owner)
+                valid = False
             if custom_id in terminal_by_custom:
                 collector.add("BLOCKER", "cue_batch_ledger_terminal_duplicate", label, "每个 custom_id 恰有一个终态", repr(custom_id), owner)
                 valid = False
@@ -833,6 +980,8 @@ def validate_cue_v2_execution_lineage(
             valid = False
     if valid:
         valid = validate_batch_task_manifest(config, contract, marker, collector, owner)
+    if valid:
+        valid = validate_batch_task_receipts(config, marker, collector, owner)
     if valid:
         valid = validate_batch_package_ledgers(config, contract, marker, collector, owner)
     return valid
