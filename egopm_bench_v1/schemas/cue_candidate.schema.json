@@ -1,10 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://egopm-bench.local/schema/v1.0.0/cue_candidate.schema.json",
+  "$id": "https://egopm-bench.local/schema/v1.1.0/cue_candidate.schema.json",
   "title": "EgoPM-Bench v1 Cue Candidate",
   "type": "object",
   "additionalProperties": false,
-  "required": ["cue_id", "atom_id", "split", "entities", "scene_type", "activity_type", "cue_type", "normalized_predicate", "supporting_text_span", "source_text", "confidence", "ambiguity_reason", "model_id", "prompt_version", "schema_version", "run_id", "validation_status"],
+  "required": ["cue_id", "atom_id", "split", "entities", "scene_type", "activity_type", "cue_type", "normalized_predicate", "supporting_text_span", "supporting_text_field", "source_text", "confidence", "ambiguity_reason", "model_id", "prompt_version", "schema_version", "run_id", "validation_status"],
   "properties": {
     "cue_id": {"type": "string", "pattern": "^cue_[A-Za-z0-9_]+$"},
     "atom_id": {"type": "string", "pattern": "^src_[A-Za-z0-9_]+$"},
@@ -15,12 +15,13 @@
     "cue_type": {"enum": ["time", "person", "place", "object", "activity", "state_change"]},
     "normalized_predicate": {"$ref": "#/$defs/predicate"},
     "supporting_text_span": {"type": "string", "minLength": 1},
+    "supporting_text_field": {"enum": ["transcript", "dense_caption", "visible_text"]},
     "source_text": {"type": "string", "minLength": 1},
     "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     "ambiguity_reason": {"type": ["string", "null"]},
     "model_id": {"type": "string", "minLength": 1},
     "prompt_version": {"type": "string", "minLength": 1},
-    "schema_version": {"const": "v1.0.0"},
+    "schema_version": {"const": "v1.1.0"},
     "run_id": {"type": "string", "minLength": 1},
     "validation_status": {"enum": ["accepted", "rejected", "needs_review"]},
     "validation_errors": {"type": "array", "items": {"type": "string"}}

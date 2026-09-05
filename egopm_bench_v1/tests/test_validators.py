@@ -67,15 +67,21 @@ def write_valid_marker(qa, config, stage: str, artifact_key: str, marker_key: st
 
 
 def write_cue_v2_contract_artifacts(config: object) -> None:
-    """在临时 benchmark 根建立 v2.2 紧凑工件替身，不依赖生产提示词。"""
+    """在临时 benchmark 根建立 v3.5 位置式紧凑工件替身，不依赖生产提示词。"""
 
     benchmark_root = config.benchmark_root
-    prompt = benchmark_root / "prompts" / "cue_extractor_v3_compact.md"
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    cue = registry["models"]["cue_extraction"]
+    execution = cue["execution"]
+    prompt = benchmark_root / "prompts" / f"{cue['prompt_version']}.md"
     schema = benchmark_root / "schemas" / "cue_inference_batch_compact_v1.schema.json"
     prompt.parent.mkdir(parents=True, exist_ok=True)
     schema.parent.mkdir(parents=True, exist_ok=True)
-    prompt.write_text("合成 v2.2 紧凑提示词。\n", encoding="utf-8")
-    schema.write_text('{"$id":"synthetic-v2.2","type":"object"}\n', encoding="utf-8")
+    prompt.write_text("合成 v3.5 位置式紧凑提示词。\n", encoding="utf-8")
+    schema.write_text(json.dumps({
+        "$id": "synthetic-v3.5", "type": "object", "required": ["items"],
+        "properties": {"items": {"type": "array"}},
+    }, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def write_valid_realtime_artifacts(qa, config, marker: dict) -> None:
@@ -219,7 +225,7 @@ def test_stage_version_map_rejects_wrong_cue_schema_version(tmp_path: Path) -> N
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     cue_marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    cue_marker["schema_versions"] = {"cue_candidate": "v1.1.0"}
+    cue_marker["schema_versions"] = {"cue_candidate": "v1.0.0"}
     config.marker("cue_library").write_text(json.dumps(cue_marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
@@ -313,9 +319,11 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
     atom = {
         "atom_id": "src_SYNTH_DAY1_000001",
         "split": "train",
+        "transcript": "A person starts preparing food in a kitchen.",
+        "dense_caption": "A person starts preparing food in a kitchen.",
         "visible_text": "A person starts preparing food in a kitchen.",
     }
-    compact = {"n": 0, "p": [["A", "^", "preparing food"]], "x": "preparing food", "c": 80, "v": "A"}
+    compact = {"n": 0, "p": [["A", "^", "preparing food"]], "f": "V", "start": 9, "end": 23, "c": 80, "v": "A"}
     expanded = qa.expand_compact_cue_for_qa(compact, atom, contract, "run_synthetic_v22", config)
     collector = qa.IssueCollector()
     qa.validate_schema([expanded], ROOT / "schemas" / "cue_candidate.schema.json", "cue", "T2 cue", collector)
@@ -328,6 +336,162 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
         assert "字段集合" in str(error)
     else:
         raise AssertionError("未知短码不得被静默展开")
+
+
+def test_cue_evidence_normalization_accepts_format_only_variants() -> None:
+    """归一化仍识别纯格式差异，而 v3.5 最终 span 保留程序切出的原文。"""
+
+    qa = load_validator()
+    atom_id = "src_SYNTH_DAY1_000001"
+    visible_text = "Take 2\u3000L bottles—NOW！\u200b"
+    cue = fixture("cue_candidate.valid.json")
+    cue.update(
+        {
+            "atom_id": atom_id,
+            "source_text": visible_text,
+            "supporting_text_field": "visible_text",
+            "supporting_text_span": "Take 2\u3000L bottles—NOW！",
+        }
+    )
+    collector = qa.IssueCollector()
+    qa.validate_cues([cue], {atom_id: {"atom_id": atom_id, "split": "train", "visible_text": visible_text}}, collector)
+    assert not collector.blockers
+
+
+def test_cue_evidence_normalization_rejects_rewrite_numeric_and_reordering() -> None:
+    """格式归一化不能把实质改写、单位变化或非连续重排误判为原字幕片段。"""
+
+    qa = load_validator()
+    atom_id = "src_SYNTH_DAY1_000001"
+    visible_text = "Pack 2 kg rice before leaving home."
+    base = fixture("cue_candidate.valid.json")
+    base.update({"atom_id": atom_id, "source_text": visible_text, "supporting_text_field": "visible_text"})
+    atoms = {atom_id: {"atom_id": atom_id, "split": "train", "visible_text": visible_text}}
+    for span in ("pack two kg rice", "pack 2 g rice", "rice pack 2 kg"):
+        cue = copy.deepcopy(base)
+        cue["supporting_text_span"] = span
+        collector = qa.IssueCollector()
+        qa.validate_cues([cue], atoms, collector)
+        assert any(issue["issue_type"] == "cue_supporting_span_not_program_slice" for issue in collector.issues)
+
+
+def test_cue_validator_accepts_declared_same_atom_transcript_evidence() -> None:
+    """Cue 可以声明同 atom 的 transcript 证据，但 source_text 始终原样回填 visible_text。"""
+
+    qa = load_validator()
+    atom_id = "src_SYNTH_DAY1_000001"
+    visible_text = "Visible evidence: place the cup on the table."
+    cue = fixture("cue_candidate.valid.json")
+    cue.update(
+        {
+            "atom_id": atom_id,
+            "source_text": visible_text,
+            "supporting_text_field": "transcript",
+            "supporting_text_span": "Transcript-only evidence",
+        }
+    )
+    atom = {
+        "atom_id": atom_id,
+        "split": "train",
+        "visible_text": visible_text,
+        "transcript": "Transcript-only evidence: place the cup on the table.",
+        "dense_caption": "Dense-only evidence: cup appears on a table.",
+    }
+    collector = qa.IssueCollector()
+    qa.validate_cues([cue], {atom_id: atom}, collector)
+    assert not collector.blockers
+
+
+def test_cue_validator_rejects_unknown_unavailable_and_cross_field_evidence() -> None:
+    """未知或空证据字段、以及把另一字段内容冒充为声明字段都必须失败关闭。"""
+
+    qa = load_validator()
+    atom_id = "src_SYNTH_DAY1_000001"
+    atom = {
+        "atom_id": atom_id,
+        "split": "train",
+        "transcript": "Transcript-only: put the keys in the drawer.",
+        "dense_caption": None,
+        "visible_text": "Visible-only: close the drawer.",
+    }
+    base = fixture("cue_candidate.valid.json")
+    base.update({"atom_id": atom_id, "source_text": atom["visible_text"]})
+    cases = {
+        "unknown": {"supporting_text_field": "other", "supporting_text_span": "close the drawer"},
+        "unavailable": {"supporting_text_field": "dense_caption", "supporting_text_span": "close the drawer"},
+        "cross_field": {"supporting_text_field": "visible_text", "supporting_text_span": "put the keys in the drawer"},
+    }
+    expected = {
+        "unknown": "cue_supporting_field_invalid",
+        "unavailable": "cue_supporting_field_missing",
+        "cross_field": "cue_supporting_span_not_program_slice",
+    }
+    for name, updates in cases.items():
+        cue = copy.deepcopy(base)
+        cue.update(updates)
+        collector = qa.IssueCollector()
+        qa.validate_cues([cue], {atom_id: atom}, collector)
+        assert any(issue["issue_type"] == expected[name] for issue in collector.issues)
+
+
+def test_cue_validator_rejects_cross_atom_evidence() -> None:
+    """Cue 不能把另一 atom 的同名字段文本作为当前 atom 的证据。"""
+
+    qa = load_validator()
+    first_id = "src_SYNTH_DAY1_000001"
+    second_id = "src_SYNTH_DAY1_000002"
+    first = {
+        "atom_id": first_id,
+        "split": "train",
+        "transcript": "First atom: open the cupboard.",
+        "dense_caption": "First atom: a cupboard is opened.",
+        "visible_text": "First atom: open the cupboard.",
+    }
+    second = {
+        "atom_id": second_id,
+        "split": "train",
+        "transcript": "Second atom: put the keys in the drawer.",
+        "dense_caption": "Second atom: keys are placed in a drawer.",
+        "visible_text": "Second atom: put the keys in the drawer.",
+    }
+    cue = fixture("cue_candidate.valid.json")
+    cue.update(
+        {
+            "atom_id": first_id,
+            "source_text": first["visible_text"],
+            "supporting_text_field": "transcript",
+            "supporting_text_span": "put the keys in the drawer",
+        }
+    )
+    collector = qa.IssueCollector()
+    qa.validate_cues([cue], {first_id: first, second_id: second}, collector)
+    assert any(issue["issue_type"] == "cue_supporting_span_not_program_slice" for issue in collector.issues)
+
+
+def test_item_audit_queue_blocks_success_and_rejects_raw_or_second_repair(tmp_path: Path) -> None:
+    """逐项失败可留无正文审计，但不得穿透正式 SUCCESS 或重复修复。"""
+
+    qa = load_validator()
+    state_path = tmp_path / "realtime_state.json"
+    state_path.write_text("{}", encoding="utf-8")
+    queue = state_path.with_name("item_audit_queue.jsonl")
+    state = {"unresolved_item_count": 1, "item_outcomes": {"validated_success": 4, "audit": 1}}
+    row = {
+        "atom_id": "src_SYNTH_DAY1_000001", "item_index": 1, "code": "SCHEMA",
+        "path": "/items/1", "attempt": 2,
+        "request_identity": "rt_repair_pkg_s00000_p000_1_aaaaaaaaaa",
+        "package_id": "pkg_s00000_p000", "raw_response_saved": False,
+    }
+    queue.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.validate_realtime_item_audit_queue(state, "pkg_s00000_p000", state_path, collector, "T4")
+    assert any(issue["issue_type"] == "cue_realtime_item_audit_unresolved" for issue in collector.issues)
+    row["attempt"] = 3
+    row["response"] = "禁止保存的正文"
+    queue.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.validate_realtime_item_audit_queue(state, "pkg_s00000_p000", state_path, collector, "T4")
+    assert any(issue["issue_type"] == "cue_realtime_item_queue_raw_content" for issue in collector.issues)
 
 
 def test_cue_v30_rejects_tampered_package_mapping_and_raw_content(tmp_path: Path) -> None:

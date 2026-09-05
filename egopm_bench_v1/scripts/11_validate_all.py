@@ -60,7 +60,7 @@ STAGE_ARTIFACT_VERSIONS: dict[str, dict[str, Any]] = {
     "cue": {
         "contract_version": "v1.1.0",
         "config_version": "v1.1.0",
-        "schema_versions": {"cue_candidate": "v1.0.0"},
+        "schema_versions": {"cue_candidate": "v1.1.0"},
     },
     "candidate": {
         "contract_version": "v1.1.0",
@@ -584,6 +584,7 @@ def cue_v2_execution_contract(
     return {
         "model_id": cue["model_id"],
         "prompt_version": cue["prompt_version"],
+        "final_cue_schema_version": cue["schema_version"],
         "transport": transport,
         "cue_execution_policy_version": execution["cue_execution_policy_version"],
         "protocol_hash_payload_version": execution["protocol_hash_payload_version"],
@@ -711,7 +712,12 @@ def expand_compact_cue_for_qa(
     run_id: str,
     config: RunConfig,
 ) -> dict[str, Any]:
-    """独立展开一条 v2.2 短码 Cue，供 QA 测试证明紧凑协议仍能得到最终 Schema。"""
+    """独立展开一条位置式紧凑 Cue，供 QA 复算最终 Schema 的原文证据。
+
+    输入是模型给出的单字段码和 Unicode code-point 左闭右开区间；输出是程序从
+    同一 Atom 声明字段切出的最终 Cue。它位于第 11 步 T4 独立 QA，绝不信任模型
+    回传的证据文本，也不拼接 transcript、dense_caption 与 visible_text。
+    """
 
     # 必须读取与当前 SUCCESS 同一份临时/正式配置：直接引用工作树全局 registry 会让
     # 测试在复制配置被篡改时仍错误通过，并破坏 T4 独立复算冻结短码表的意义。
@@ -737,12 +743,30 @@ def expand_compact_cue_for_qa(
             raise ValueError("紧凑谓词含未知短码或空 value")
         clauses.append({"slot": type_codes[slot_code], "operator": operator_codes[operator_code], "value": value})
     cue_code = predicates[0][0]
-    supporting_span = compact["x"]
-    source_text = atom["visible_text"]
-    if not isinstance(supporting_span, str) or not supporting_span or supporting_span not in source_text:
-        # 这是幻觉防线：只保存最终 Cue 后不能再依赖原始模型响应重查，因此接收时必须
-        # 拒绝跨 Atom 或臆造的支撑文本。
-        raise ValueError("紧凑 Cue 的支撑片段不是本 Atom 原文连续子串")
+    supporting_field_codes = compact_policy.get("supporting_text_field_codes")
+    if not isinstance(supporting_field_codes, dict):
+        raise ValueError("紧凑 Cue 协议缺少 supporting_text_field 短码表")
+    supporting_field_code = compact["f"]
+    if not isinstance(supporting_field_code, str):
+        raise ValueError("紧凑 Cue 的 supporting_text_field 短码必须为字符串")
+    supporting_field = supporting_field_codes.get(supporting_field_code)
+    if supporting_field not in {"transcript", "dense_caption", "visible_text"}:
+        raise ValueError("紧凑 Cue 含未知 supporting_text_field 短码")
+    source_text = atom.get("visible_text")
+    if not isinstance(source_text, str) or not cue_evidence_normalized_text(source_text):
+        raise ValueError("紧凑 Cue 所属 Atom 的 visible_text 必须为非空字符串")
+    supporting_source = atom.get(supporting_field)
+    if not isinstance(supporting_source, str) or not cue_evidence_normalized_text(supporting_source):
+        raise ValueError("紧凑 Cue 指定的证据字段必须为归一化后非空字符串")
+    start, end = compact["start"], compact["end"]
+    if (not isinstance(start, int) or isinstance(start, bool) or not isinstance(end, int)
+            or isinstance(end, bool) or not 0 <= start < end <= len(supporting_source)):
+        raise ValueError("紧凑 Cue 的证据 Unicode 偏移越界")
+    # span 只能由程序切片得到，确保最终保存的每一个字符均可回溯到声明字段的连续区间。
+    supporting_span = supporting_source[start:end]
+    supporting_normalized = cue_evidence_normalized_text(supporting_span)
+    if not supporting_normalized or supporting_normalized not in cue_evidence_normalized_text(supporting_source):
+        raise ValueError("紧凑 Cue 的程序切片未形成声明字段中的有效连续证据")
     confidence = compact["c"]
     if not isinstance(confidence, int) or isinstance(confidence, bool) or not 0 <= confidence <= compact_policy["confidence_scale"]:
         raise ValueError("紧凑 Cue 的置信度必须是 0..100 整数")
@@ -766,12 +790,13 @@ def expand_compact_cue_for_qa(
         "cue_type": type_codes[cue_code],
         "normalized_predicate": {"all_of": clauses},
         "supporting_text_span": supporting_span,
+        "supporting_text_field": supporting_field,
         "source_text": source_text,
         "confidence": confidence / compact_policy["confidence_scale"],
         "ambiguity_reason": ambiguity,
         "model_id": contract["model_id"],
         "prompt_version": contract["prompt_version"],
-        "schema_version": "v1.0.0",
+        "schema_version": contract["final_cue_schema_version"],
         "run_id": run_id,
         "validation_status": status_codes[compact["v"]],
     }
@@ -1353,7 +1378,11 @@ def validate_realtime_package_artifacts(
     valid = True
     state = load_json(state_path, collector, "cue_realtime_package_state", owner)
     complete = load_json(complete_path, collector, "cue_realtime_complete", owner)
-    if state is None or complete is None:
+    if state is None:
+        return False
+    # 即使有未解决项而尚未生成 complete，T4 也应明确报告队列门，而非只报缺文件。
+    valid = validate_realtime_item_audit_queue(state, package_id, state_path, collector, owner) and valid
+    if complete is None:
         return False
     for value, label, required in ((state, str(state_path), REALTIME_PACKAGE_STATE_REQUIRED_FIELDS), (complete, str(complete_path), REALTIME_COMPLETE_REQUIRED_FIELDS)):
         if has_forbidden_realtime_content(value):
@@ -1403,6 +1432,64 @@ def validate_realtime_package_artifacts(
     if not isinstance(event["attempt"], int) or isinstance(event["attempt"], bool) or event["attempt"] < 1 or not isinstance(event["usage"], dict):
         collector.add("BLOCKER", "cue_realtime_ledger_usage", str(ledger_path), "正整数 attempt 与无正文 usage 对象", repr(event), owner)
         valid = False
+    return valid
+
+
+def validate_realtime_item_audit_queue(
+    state: dict[str, Any], package_id: str, state_path: Path, collector: IssueCollector, owner: str,
+) -> bool:
+    """独立验证逐项失败队列，并在最终 Cue SUCCESS 前失败关闭。
+
+    输入是一个 package 的无正文状态及同目录 `item_audit_queue.jsonl`；输出是该
+    package 是否已经没有未解决项。它位于第 11 步：队列允许第 05 步继续调度别的
+    package，却绝不等同于成功 Cue，因而不能穿透正式 Cue library 的 SUCCESS 门。
+    """
+
+    queue_path = state_path.with_name("item_audit_queue.jsonl")
+    unresolved = state.get("unresolved_item_count", 0)
+    outcomes = state.get("item_outcomes", {})
+    valid = True
+    if not isinstance(unresolved, int) or isinstance(unresolved, bool) or unresolved < 0:
+        collector.add("BLOCKER", "cue_realtime_item_state", str(state_path), "unresolved_item_count 为非负整数", repr(unresolved), owner)
+        return False
+    if not isinstance(outcomes, dict) or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in outcomes.values()):
+        collector.add("BLOCKER", "cue_realtime_item_state", str(state_path), "item_outcomes 为无正文非负计数对象", repr(outcomes), owner)
+        return False
+    if not queue_path.exists():
+        if unresolved:
+            collector.add("BLOCKER", "cue_realtime_item_queue_missing", str(queue_path), "未解决项必须有无正文审计队列", str(unresolved), owner)
+            return False
+        return True
+    rows = read_jsonl(queue_path, collector, "cue_realtime_item_audit_queue", owner)
+    seen: set[tuple[str, int]] = set()
+    required = {"atom_id", "item_index", "code", "path", "attempt", "request_identity", "package_id", "raw_response_saved"}
+    for row in rows:
+        if has_forbidden_realtime_content(row):
+            collector.add("BLOCKER", "cue_realtime_item_queue_raw_content", str(queue_path), "失败队列绝不含正文", "发现正文键", owner); valid = False
+            continue
+        if set(row) != required:
+            collector.add("BLOCKER", "cue_realtime_item_queue_fields", str(queue_path), "固定的无正文失败项字段", repr(sorted(set(row))), owner); valid = False
+            continue
+        atom_id, item_index = row["atom_id"], row["item_index"]
+        identity = row["request_identity"]
+        if (not isinstance(atom_id, str) or not atom_id.startswith("src_") or not isinstance(item_index, int)
+                or isinstance(item_index, bool) or item_index < 0 or not isinstance(row["code"], str)
+                or re.fullmatch(r"[A-Z0-9_]{1,96}", row["code"]) is None or not isinstance(row["path"], str)
+                or re.fullmatch(r"/(?:[A-Za-z0-9_./-]+)?", row["path"]) is None or row["package_id"] != package_id
+                or row["raw_response_saved"] is not False):
+            collector.add("BLOCKER", "cue_realtime_item_queue_value", str(queue_path), "安全失败码、路径、Atom 身份与无正文标志", repr(row), owner); valid = False
+        if not isinstance(row["attempt"], int) or isinstance(row["attempt"], bool) or row["attempt"] not in {1, 2}:
+            collector.add("BLOCKER", "cue_realtime_item_repair_limit", str(queue_path), "每项初始失败加至多一次修复，即 attempt 为 1 或 2", repr(row.get("attempt")), owner); valid = False
+        if not isinstance(identity, str) or (row["attempt"] == 2 and not re.fullmatch(rf"rt_repair_{re.escape(package_id)}_\d+_[0-9a-f]{{10}}", identity)):
+            collector.add("BLOCKER", "cue_realtime_item_repair_identity", str(queue_path), "修复请求仅指向本 package 的单 Atom 身份", repr(identity), owner); valid = False
+        key = (atom_id, item_index)
+        if key in seen:
+            collector.add("BLOCKER", "cue_realtime_item_queue_unique", str(queue_path), "每个 Atom/item_index 只保留一个最终队列项", repr(key), owner); valid = False
+        seen.add(key)
+    if unresolved != len(rows):
+        collector.add("BLOCKER", "cue_realtime_item_queue_count", str(queue_path), "unresolved_item_count 与队列行数一致", f"{unresolved} != {len(rows)}", owner); valid = False
+    if rows or unresolved:
+        collector.add("BLOCKER", "cue_realtime_item_audit_unresolved", str(queue_path), "正式 Cue SUCCESS 前审计队列必须清零", f"未解决 {max(unresolved, len(rows))} 项", owner); valid = False
     return valid
 
 
@@ -1685,6 +1772,26 @@ def normalized_text(value: str) -> str:
     return " ".join(unicodedata.normalize("NFKC", value).casefold().split())
 
 
+def cue_evidence_normalized_text(value: str) -> str:
+    """将 Cue 证据按冻结的无语义格式规则归一化，用于连续子串核验。
+
+    输入：一段 `visible_text`、`source_text` 或 `supporting_text_span` 原始字符串。
+    输出：NFKC 与 casefold 后移除 Unicode 空白、标点 P* 和格式控制 Cf 的字符串。
+    流水线位置：第 5 步实时接收的镜像 QA 与第 11 步最终 Cue 可追溯性验证。
+    """
+
+    # 仅移除合同明确认定不改变语义的格式差异；字母、数字、单位、符号和字符顺序一律
+    # 保留，因此拼写改写、数值/单位漂移、跨字段取证及非连续重排仍会被严格拒绝。
+    normalized = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(
+        character
+        for character in normalized
+        if not character.isspace()
+        and not unicodedata.category(character).startswith("P")
+        and unicodedata.category(character) != "Cf"
+    )
+
+
 def char_3grams(value: str) -> set[str]:
     compact = normalized_text(value)
     if len(compact) < 3:
@@ -1900,11 +2007,72 @@ def validate_cues(records: list[dict[str, Any]], atoms: dict[str, dict[str, Any]
             continue
         if cue.get("split") != atom.get("split"):
             collector.add("BLOCKER", "cue_split", cue_id, f"split={atom.get('split')}", repr(cue.get("split")), owner)
-        source_text = normalized_text(" ".join(str(atom.get(field) or "") for field in ("transcript", "dense_caption", "visible_text")))
-        for field_name in ("source_text", "supporting_text_span"):
-            claimed = normalized_text(str(cue.get(field_name, "")))
-            if claimed and claimed not in source_text:
-                collector.add("BLOCKER", "cue_source_trace", cue_id, f"{field_name} 可在 atom 原文中找到", repr(cue.get(field_name)), owner)
+        visible_text = atom.get("visible_text")
+        if not isinstance(visible_text, str) or not cue_evidence_normalized_text(visible_text):
+            # 即使 Source schema 理应已拦截空文本，Cue QA 仍须独立失败关闭，不能把空
+            # evidence 当作任意字符串的子串，从而放过错误字段来源或空支撑。
+            collector.add("BLOCKER", "cue_atom_visible_text_missing", cue_id, "所属 atom 的 visible_text 为归一化后非空字符串", repr(visible_text), owner)
+            continue
+        claimed_source = cue.get("source_text")
+        if not isinstance(claimed_source, str) or not cue_evidence_normalized_text(claimed_source):
+            collector.add("BLOCKER", "cue_source_text_missing", cue_id, "source_text 为归一化后非空字符串", repr(claimed_source), owner)
+        elif claimed_source != visible_text:
+            # 最终 Cue 的 source_text 是对 atom.visible_text 的原样快照，而非任一 SRT
+            # 字段；这条精确相等门阻止从 transcript 或 dense_caption 借来不属于 atom
+            # 可见证据的文字，即便那些文字恰好也能支撑谓词。
+            collector.add("BLOCKER", "cue_source_text_mismatch", cue_id, "source_text 与 atom.visible_text 完全一致", repr(claimed_source), owner)
+        supporting_span = cue.get("supporting_text_span")
+        supporting_normalized = (
+            cue_evidence_normalized_text(supporting_span) if isinstance(supporting_span, str) else ""
+        )
+        supporting_field = cue.get("supporting_text_field")
+        if supporting_field not in {"transcript", "dense_caption", "visible_text"}:
+            # Schema 会拒绝未知字段值；此处仍保持独立的失败关闭，避免 T4 在读取手工篡改
+            # 的 JSONL 或尚未运行 Schema 门时把证据误投影到任何一个可用字段。
+            collector.add(
+                "BLOCKER",
+                "cue_supporting_field_invalid",
+                cue_id,
+                "supporting_text_field 为 transcript、dense_caption 或 visible_text",
+                repr(supporting_field),
+                owner,
+            )
+            continue
+        supporting_source = atom.get(supporting_field)
+        supporting_source_normalized = (
+            cue_evidence_normalized_text(supporting_source) if isinstance(supporting_source, str) else ""
+        )
+        if not supporting_source_normalized:
+            collector.add(
+                "BLOCKER",
+                "cue_supporting_field_missing",
+                cue_id,
+                f"atom.{supporting_field} 为归一化后非空字符串",
+                repr(supporting_source),
+                owner,
+            )
+        if not supporting_normalized:
+            collector.add("BLOCKER", "cue_supporting_span_missing", cue_id, "supporting_text_span 为归一化后非空字符串", repr(supporting_span), owner)
+        elif isinstance(supporting_span, str) and supporting_source is not None and supporting_span not in supporting_source:
+            # v3.5 不接收模型复写的 x，而由程序用 f/start/end 从原字段切片。因此最终
+            # span 必须逐字等于该字段的一个原始连续片段；仅归一化命中不足以证明它是切片。
+            collector.add(
+                "BLOCKER",
+                "cue_supporting_span_not_program_slice",
+                cue_id,
+                f"supporting_text_span 是同一 atom.{supporting_field} 的原始连续子串",
+                repr(supporting_span),
+                owner,
+            )
+        elif supporting_source_normalized and supporting_normalized not in supporting_source_normalized:
+            collector.add(
+                "BLOCKER",
+                "cue_supporting_span_trace",
+                cue_id,
+                f"supporting_text_span 归一化后是同一 atom.{supporting_field} 的连续子串",
+                repr(supporting_span),
+                owner,
+            )
 
 
 def validate_seeds(

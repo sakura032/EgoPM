@@ -80,12 +80,13 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     registry = yaml.safe_load((CONFIG_DIR / "model_registry.yaml").read_text(encoding="utf-8"))
     cue = registry["models"]["cue_extraction"]
     execution = cue["execution"]
-    assert registry["registry_version"] == "v1.5.0"
+    assert registry["registry_version"] == "v1.6.0"
     assert registry["raw_response_policy"] == "forbidden"
     assert cue["model_id"] == "qwen3.7-flash"
-    assert cue["prompt_version"] == "cue_extractor_v3_compact"
-    assert execution["cue_execution_policy_version"] == "v3.3.0"
-    assert execution["protocol_hash_payload_version"] == "v3.3.0"
+    assert cue["prompt_version"] == "cue_extractor_v3_5_compact"
+    assert cue["schema_version"] == "v1.1.0"
+    assert execution["cue_execution_policy_version"] == "v3.5.0"
+    assert execution["protocol_hash_payload_version"] == "v3.5.0"
     assert execution["mode"] == "explicit_realtime_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2
@@ -97,20 +98,21 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
         "output_tokens_per_atom": 96,
         "output_max_tokens_formula": "output_tokens_per_atom_times_package_atom_count",
         "inference_schema": "cue_inference_batch_compact_v1.schema.json",
-        "inference_schema_version": "v1.0.0",
+        "inference_schema_version": "v1.1.0",
         "response_top_level_field": "items",
         "response_correlation_field": "n",
     }
     assert execution["controlled_field_policy"] == {
-        "model_input_fields": ["item_index", "text"],
-        "model_output_fields": ["n", "p", "x", "c", "v", "e", "s", "a", "r"],
-        "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"],
+        "model_input_fields": ["item_index", "transcript", "dense_caption", "visible_text"],
+        "model_output_fields": ["n", "f", "start", "end", "p", "c", "v", "e", "s", "a", "r"],
+        "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "supporting_text_field", "model_id", "prompt_version", "schema_version", "run_id"],
         "raw_model_response_storage": "forbidden",
     }
     assert execution["compact_inference_policy"] == {
         "cue_type_codes": {"T": "time", "P": "person", "L": "place", "O": "object", "A": "activity", "S": "state_change"},
+        "supporting_text_field_codes": {"T": "transcript", "D": "dense_caption", "V": "visible_text"},
         "operator_codes": {"=": "eq", "!": "not_eq", "+": "present", "-": "absent", "^": "starts", "$": "ends", "~": "contains"},
-        "required_fields": ["n", "p", "x", "c", "v"],
+        "required_fields": ["n", "f", "start", "end", "p", "c", "v"],
         "optional_defaults": {"e": [], "s": None, "a": None, "r": None},
         "confidence_scale": 100,
     }
@@ -166,7 +168,7 @@ def test_compact_cue_inference_schema_excludes_controlled_fields_and_stays_small
     controlled = {"cue_id", "atom_id", "split", "source_text", "model_id", "prompt_version", "schema_version", "run_id"}
     assert item["additionalProperties"] is False
     assert controlled.isdisjoint(item["properties"])
-    assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1000
+    assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1100
     jsonschema.Draft202012Validator(schema).validate({
-        "items": [{"n": 0, "p": [["O", "+", "手机"]], "x": "拿着手机", "c": 90, "v": "A"}]
+        "items": [{"n": 0, "f": "V", "start": 0, "end": 4, "p": [["O", "+", "手机"]], "c": 90, "v": "A"}]
     })

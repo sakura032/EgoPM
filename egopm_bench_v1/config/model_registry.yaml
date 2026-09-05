@@ -1,6 +1,6 @@
 contract_version: v1.1.0
 config_version: v1.1.0
-registry_version: v1.5.0
+registry_version: v1.6.0
 credential_environment_variable: DASHSCOPE_API_KEY
 credential_policy: environment_only
 raw_response_policy: forbidden
@@ -14,13 +14,13 @@ models:
     thinking_enabled: false
     reasoning_effort: none
     temperature: 0
-    prompt_version: cue_extractor_v3_compact
+    prompt_version: cue_extractor_v3_5_compact
     schema: cue_candidate.schema.json
-    schema_version: v1.0.0
+    schema_version: v1.1.0
     execution:
-      cue_execution_policy_version: v3.3.0
+      cue_execution_policy_version: v3.5.0
       # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
-      protocol_hash_payload_version: v3.3.0
+      protocol_hash_payload_version: v3.5.0
       mode: explicit_realtime_execute_only
       shard_size_atoms: 500
       max_retries: 2
@@ -32,18 +32,19 @@ models:
         output_tokens_per_atom: 96
         output_max_tokens_formula: output_tokens_per_atom_times_package_atom_count
         inference_schema: cue_inference_batch_compact_v1.schema.json
-        inference_schema_version: v1.0.0
+        inference_schema_version: v1.1.0
         response_top_level_field: items
         response_correlation_field: n
       controlled_field_policy:
-        model_input_fields: [item_index, text]
-        model_output_fields: [n, p, x, c, v, e, s, a, r]
-        program_backfilled_fields: [cue_id, atom_id, split, source_text, model_id, prompt_version, schema_version, run_id]
+        model_input_fields: [item_index, transcript, dense_caption, visible_text]
+        model_output_fields: [n, f, start, end, p, c, v, e, s, a, r]
+        program_backfilled_fields: [cue_id, atom_id, split, source_text, supporting_text_field, model_id, prompt_version, schema_version, run_id]
         raw_model_response_storage: forbidden
       compact_inference_policy:
         cue_type_codes: {T: time, P: person, L: place, O: object, A: activity, S: state_change}
+        supporting_text_field_codes: {T: transcript, D: dense_caption, V: visible_text}
         operator_codes: {"=": eq, "!": not_eq, "+": present, "-": absent, "^": starts, "$": ends, "~": contains}
-        required_fields: [n, p, x, c, v]
+        required_fields: [n, f, start, end, p, c, v]
         optional_defaults: {e: [], s: null, a: null, r: null}
         confidence_scale: 100
       realtime_api_policy:
@@ -76,6 +77,8 @@ models:
         max_local_validation_quarantine_per_run: 0
         failure_retry_requires_same_protocol: true
         explicit_rerun_failed_packages_only: true
+        per_item_repair_attempts: 1
+        unresolved_item_audit_queue: required_before_cue_library_success
         # 实时只替换传输层，继续采用已获教师同意的 1 + 6×10 + 14 task 八波范围。
         wave_task_counts: [1, 10, 10, 10, 10, 10, 10, 14]
         logical_shards_per_task: 10

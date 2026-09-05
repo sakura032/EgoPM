@@ -18,6 +18,7 @@ import re
 import sys
 import threading
 import time
+import unicodedata
 import uuid
 from urllib import error as urlerror
 from urllib import request as urlrequest
@@ -34,7 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = "v1.1.0"
 CONFIG_VERSION = "v1.1.0"
 SOURCE_SCHEMA_VERSION = "v1.1.0"
-CUE_SCHEMA_VERSION = "v1.0.0"
+CUE_SCHEMA_VERSION = "v1.1.0"
 
 
 class ContractError(RuntimeError):
@@ -80,6 +81,40 @@ def validate_final_cue(validator: jsonschema.Draft202012Validator, cue: dict[str
         raise LocalValidationError(f"FINAL_CUE_SCHEMA_{keyword.upper()}", safe_json_path(error.absolute_path))
 
 
+def normalise_supporting_text_for_substring(value: str) -> str:
+    """将证据 span 归一为可比较的字符序列，只消除 Unicode 显示格式差异。
+
+    输入是程序按模型位置从 `f` 声明的同一 Atom 证据字段切出的片段或该完整字段；输出是 NFKC、casefold 后移除
+    空白、所有 Unicode 标点和格式控制字符的剩余字符序列。它位于第 05 阶段本地合同
+    验证，只容忍全半角、大小写、排版符号及零宽字符差异；其他字符及原有顺序完整保留，
+    因而不会接纳释义、同义替换、实质增删或重排。
+    """
+
+    # 先执行 NFKC 才能让全半角和兼容字符落入同一编码表示；随后 casefold 处理大小写。
+    # 不做分词、词干化或语义映射，避免把语言内容变化伪装成字幕证据。
+    folded = unicodedata.normalize("NFKC", value).casefold()
+    return "".join(
+        character for character in folded
+        if not character.isspace()
+        and not unicodedata.category(character).startswith("P")
+        and unicodedata.category(character) != "Cf"
+    )
+
+
+def supporting_text_field_for_code(code: str, item_index: int, field_codes: dict[str, Any]) -> str:
+    """把紧凑字段码映射为最终证据字段名，并拒绝未知码。
+
+    输入是模型项的 `f` 及其局部下标；输出为 `transcript`、`dense_caption` 或
+    `visible_text`。它位于第 05 阶段的展开边界：字段码必须显式决定证据来源，禁止
+    通过拼接多字段或在多个字段中择一命中来掩盖来源，因此 T4 可逐 Cue 复核血缘。
+    """
+
+    field = field_codes.get(code)
+    if field is None:
+        raise LocalValidationError("UNKNOWN_SUPPORTING_TEXT_FIELD_CODE", f"/items/{item_index}/f")
+    return field
+
+
 @dataclass(frozen=True)
 class RealtimePolicy:
     """实时传输的冻结参数；它与已取消的 Batch 协议绝不共享状态目录。"""
@@ -121,9 +156,10 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
     realtime_ledger = execution.get("realtime_ledger_policy")
     package = execution.get("package_policy")
     compact = execution.get("compact_inference_policy")
+    controlled = execution.get("controlled_field_policy")
     pricing = execution.get("pricing_snapshot")
     layout = execution.get("shard_layout")
-    required_groups = (realtime, realtime_execution, realtime_ledger, package, compact, pricing, layout)
+    required_groups = (realtime, realtime_execution, realtime_ledger, package, compact, controlled, pricing, layout)
     if not all(isinstance(group, dict) for group in required_groups):
         raise ContractError("实时执行缺少独立 policy、账本、价格、分片或紧凑推理配置")
     if execution.get("mode") != "explicit_realtime_execute_only" or execution.get("transport") != "realtime_chat_completions":
@@ -132,6 +168,16 @@ def realtime_policy_from_registry(path: Path) -> tuple[Settings, RealtimePolicy]
         raise ContractError("实时协议必须冻结 qwen3.7-flash、关闭 thinking 且 temperature=0")
     if package.get("maximum_atoms") != 5 or package.get("output_tokens_per_atom") != 96:
         raise ContractError("实时协议必须保留最多五条 Atom 与每 Atom 96 token 输出上限")
+    if compact.get("supporting_text_field_codes") != {"T": "transcript", "D": "dense_caption", "V": "visible_text"}:
+        raise ContractError("实时协议必须冻结 T/D/V 到单一证据字段的映射")
+    if compact.get("required_fields") != ["n", "f", "start", "end", "p", "c", "v"]:
+        raise ContractError("实时协议必须要求模型回传证据字段及其 Unicode 位置")
+    if controlled.get("model_input_fields") != ["item_index", "transcript", "dense_caption", "visible_text"]:
+        raise ContractError("实时协议必须逐字段传入三类可追溯证据")
+    if controlled.get("model_output_fields") != ["n", "f", "start", "end", "p", "c", "v", "e", "s", "a", "r"]:
+        raise ContractError("实时协议必须冻结紧凑证据字段码与位置")
+    if "supporting_text_field" not in controlled.get("program_backfilled_fields", []):
+        raise ContractError("实时协议必须将 supporting_text_field 列为程序回填字段")
     if execution.get("max_retries") != 2:
         raise ContractError("实时协议最大重试次数必须冻结为 2")
     if not isinstance(realtime.get("retryable_http_statuses"), list) or not all(isinstance(v, int) for v in realtime["retryable_http_statuses"]):
@@ -530,9 +576,19 @@ def protocol_hash(settings: Settings, prompt_path: Path, inference_schema_path: 
 
 
 def build_request(prompt: str, schema: dict[str, Any], atoms: list[dict[str, Any]], settings: Settings) -> dict[str, Any]:
-    """构造 Batch 行内的 chat body；模型只能看到局部索引和文本。"""
+    """构造 Batch 行内的 chat body；模型仅见局部索引与三个可追溯证据字段。"""
 
-    items = [{"item_index": index, "text": atom["visible_text"]} for index, atom in enumerate(atoms)]
+    # 三字段分别传入且保留空值，令模型的 `f` 可明确声明其选择；不得拼接成一个文本，
+    # 否则跨字段连续匹配会无法被下游审计识别。
+    items = [
+        {
+            "item_index": index,
+            "transcript": atom.get("transcript"),
+            "dense_caption": atom.get("dense_caption"),
+            "visible_text": atom["visible_text"],
+        }
+        for index, atom in enumerate(atoms)
+    ]
     return {
         "model": settings.model_id, "temperature": settings.temperature,
         "enable_thinking": settings.thinking_enabled, "max_tokens": settings.output_tokens_per_atom * len(atoms),
@@ -835,7 +891,7 @@ def pending_packages(manifests: list[dict[str, Any]], run_root: Path, layout: di
 
 
 def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]], inference_validator: jsonschema.Draft202012Validator, cue_validator: jsonschema.Draft202012Validator, settings: Settings, run_id: str) -> list[dict[str, Any]]:
-    """严格展开紧凑项并回填受控字段；未知短码或跨 Atom 证据一律拒绝。"""
+    """严格展开紧凑项并回填受控字段；未知短码、跨字段或跨 Atom 证据一律拒绝。"""
 
     validate_inference_response(inference_validator, response)
     items = response["items"]
@@ -863,9 +919,29 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
             if not isinstance(slot, str) or not isinstance(operator, str):
                 raise LocalValidationError("UNKNOWN_PREDICATE_CODE", f"/items/{item['n']}/p")
             clauses.append({"slot": slot, "operator": operator, "value": compact_clause[2]})
-        # 连续原文和主槽位门在展开前检查，避免正确 JSON 被错误 Atom 或错误语义接纳。
-        if item["x"] not in atom["visible_text"]:
-            raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/x")
+        # `f` 是每条 Cue 可审计的唯一证据来源。绝不把三字段拼接或轮流试配，否则模型
+        # 可以借另一个字段命中却把来源标为当前字段，破坏 Source-to-Cue 血缘。
+        supporting_text_field = supporting_text_field_for_code(
+            item["f"], item["n"], settings.compact_policy["supporting_text_field_codes"],
+        )
+        supporting_text = atom.get(supporting_text_field)
+        if not isinstance(supporting_text, str) or not supporting_text:
+            raise LocalValidationError("SUPPORTING_TEXT_FIELD_UNAVAILABLE", f"/items/{item['n']}/f")
+        # 位置使用 Python 字符串的 Unicode code-point 偏移，左闭右开。程序自行切出原文，
+        # 从根源上避免模型逐字复写时的全半角、标点或大小写假阴性，同时不允许模型构造改写文本。
+        start = item["start"]
+        end = item["end"]
+        if end <= start or end > len(supporting_text):
+            raise LocalValidationError("SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE", f"/items/{item['n']}/end")
+        supporting_text_span = supporting_text[start:end]
+        # 两端只在上面选定的单一字段内使用同一纯格式归一化后连续包含。先拒绝归一化
+        # 为空的程序切片，避免只有标点、空白或零宽字符的区间成为任意字段的证据。
+        normalised_span = normalise_supporting_text_for_substring(supporting_text_span)
+        normalised_source = normalise_supporting_text_for_substring(supporting_text)
+        if not normalised_span:
+            raise LocalValidationError("SUPPORTING_TEXT_EMPTY_AFTER_NORMALIZATION", f"/items/{item['n']}/start")
+        if normalised_span not in normalised_source:
+            raise LocalValidationError("SUPPORTING_TEXT_NOT_SUBSTRING", f"/items/{item['n']}/start")
         status = {"A": "accepted", "R": "rejected", "N": "needs_review"}.get(item["v"])
         if status is None:
             raise LocalValidationError("UNKNOWN_VALIDATION_STATUS_CODE", f"/items/{item['n']}/v")
@@ -873,7 +949,8 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
             "cue_id": f"cue_{atom['atom_id'].removeprefix('src_')}", "atom_id": atom["atom_id"],
             "split": atom["split"], "entities": entities,
             "scene_type": item.get("s", defaults["s"]), "activity_type": item.get("a", defaults["a"]),
-            "cue_type": cue_type, "normalized_predicate": {"all_of": clauses}, "supporting_text_span": item["x"],
+            "cue_type": cue_type, "normalized_predicate": {"all_of": clauses}, "supporting_text_span": supporting_text_span,
+            "supporting_text_field": supporting_text_field,
             "source_text": atom["visible_text"], "confidence": item["c"] / settings.compact_policy["confidence_scale"],
             "ambiguity_reason": item.get("r", defaults["r"]), "model_id": settings.model_id,
             "prompt_version": settings.prompt_version, "schema_version": settings.final_cue_schema_version,
@@ -883,6 +960,65 @@ def parse_inference_items(response: dict[str, Any], atoms: list[dict[str, Any]],
         if cue["validation_status"] == "accepted":
             cues.append(cue)
     return cues
+
+
+def parse_realtime_items_independently(
+    response: dict[str, Any], atoms: list[dict[str, Any]], inference_schema: dict[str, Any],
+    cue_validator: jsonschema.Draft202012Validator, settings: Settings, run_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """逐项展开一次实时响应，令一个坏项不会丢弃同包其余 Atom 的有效结果。
+
+    输入是仅驻留内存的模型对象和本 package 的 Atom；输出为可立即写入的 Cue 与不含
+    正文的失败条目。它位于第 05 阶段的逐项恢复边界：不合格项只暴露 Atom 身份、局部
+    下标、固定错误码及 JSON 路径，绝不将响应片段或字幕写进失败账本。
+    """
+
+    raw_items = response.get("items") if isinstance(response, dict) else None
+    if not isinstance(raw_items, list):
+        return [], [{"atom_id": atom["atom_id"], "item_index": index, "code": "RESPONSE_ITEMS_MISSING", "path": "/items"}
+                    for index, atom in enumerate(atoms)]
+    # 顶层数组的每个对象以同一冻结定义验证；避免一个对象的 Schema 错误把其他对象
+    # 的确定性位置证据一并隔离。此处不使用模型回传 n 定位 Atom，以数组位置为准。
+    item_validator = jsonschema.Draft202012Validator({"$defs": inference_schema["$defs"], "$ref": "#/$defs/i"})
+    cues: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for index, atom in enumerate(atoms):
+        item = raw_items[index] if index < len(raw_items) else None
+        if not isinstance(item, dict):
+            failures.append({"atom_id": atom["atom_id"], "item_index": index, "code": "RESPONSE_ITEM_MISSING", "path": f"/items/{index}"})
+            continue
+        schema_error = next(iter(item_validator.iter_errors(item)), None)
+        if schema_error is not None:
+            keyword = str(schema_error.validator).upper() if isinstance(schema_error.validator, str) else "UNKNOWN"
+            failures.append({"atom_id": atom["atom_id"], "item_index": index, "code": f"INFERENCE_SCHEMA_{keyword}", "path": safe_json_path(["items", index, *schema_error.absolute_path])})
+            continue
+        if item.get("n") != index:
+            failures.append({"atom_id": atom["atom_id"], "item_index": index, "code": "RESPONSE_ITEM_INDEX", "path": f"/items/{index}/n"})
+            continue
+        try:
+            # 复用唯一的最终 Cue 展开路径，防止逐项恢复意外放松 cue_type、字段或位置门。
+            cues.extend(parse_inference_items({"items": [dict(item, n=0)]}, [atom], jsonschema.Draft202012Validator({"type": "object"}), cue_validator, settings, run_id))
+        except LocalValidationError as error:
+            failures.append({"atom_id": atom["atom_id"], "item_index": index, "code": error.code, "path": re.sub(r"^/items/0", f"/items/{index}", error.path)})
+    if len(raw_items) > len(atoms):
+        # 多出的对象不能关联到 Atom；每个真实 Atom 均已逐项处理，故不以虚假 atom_id
+        # 落盘，而将所有已处理项加入审计队列以阻断错误 package 的完成标记。
+        for index, atom in enumerate(atoms):
+            failures.append({"atom_id": atom["atom_id"], "item_index": index, "code": "RESPONSE_ITEM_COUNT", "path": "/items"})
+    return cues, failures
+
+
+def safe_item_failures(manifest: dict[str, Any], failures: list[dict[str, Any]], request_identity: str, attempt: int) -> list[dict[str, Any]]:
+    """将逐项失败投影为可持久化无正文审计记录，并绑定请求身份和次数。"""
+
+    records: list[dict[str, Any]] = []
+    for failure in failures:
+        records.append({
+            "atom_id": failure["atom_id"], "item_index": failure["item_index"], "code": failure["code"], "path": failure["path"],
+            "attempt": attempt, "request_identity": request_identity, "package_id": manifest["package_id"],
+            "raw_response_saved": False,
+        })
+    return records
 
 
 def preflight_report(manifests: list[dict[str, Any]], atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str) -> dict[str, Any]:
@@ -1163,7 +1299,7 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
     if not state_path.is_file():
         return None
     state = read_json(state_path)
-    if state.get("status") != "local_validation_quarantine":
+    if state.get("status") not in {"local_validation_quarantine", "needs_item_audit"}:
         return None
     expected = {
         "run_id": manifest["run_id"], "transport": "realtime_chat_completions",
@@ -1174,6 +1310,11 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
     }
     if any(state.get(key) != item for key, item in expected.items()) or state.get("raw_response_saved") is True:
         raise ContractError("实时本地隔离状态的身份或无正文约束不匹配；禁止自动重发")
+    if state.get("status") == "needs_item_audit":
+        queue = state_path.parent / "item_audit_queue.jsonl"
+        if not queue.is_file() or not isinstance(state.get("unresolved_item_count"), int) or state["unresolved_item_count"] <= 0:
+            raise ContractError("实时逐项审计状态缺少无正文队列；禁止自动重发")
+        return "needs_item_audit"
     diagnostic = state.get("local_validation_failure")
     if (
         not isinstance(diagnostic, dict) or set(diagnostic) != {"code", "path"}
@@ -1275,7 +1416,7 @@ def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
         raise ContractError("实时账本缺少冻结字段或传输标识不符")
     if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
         raise ContractError("实时账本不得混入 Batch 身份字段")
-    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped"}:
+    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped", "needs_item_audit"}:
         raise ContractError("实时账本具有未知终态")
     diagnostic = event.get("service_error")
     if diagnostic is not None and (not isinstance(diagnostic, dict) or set(diagnostic) != {"http_status", "service_code", "service_message"}):
@@ -1295,7 +1436,7 @@ def execute_realtime_package(
     policy: RealtimePolicy, transport: RealtimeTransport, run_root: Path, budget_remaining_cny: float,
     request_bucket: TokenBucket, token_bucket: TokenBucket, budget_tracker: BudgetTracker | None = None,
 ) -> tuple[str, float, dict[str, Any]]:
-    """执行一个实时包并安全终结；成功、服务失败、隔离与预算熔断互斥。
+    """执行一个实时包并安全终结；逐项恢复不让单项失败阻断后续 package。
 
     每次网络尝试前写入无正文状态；服务端临时故障最多重试两次，本地合同失败一律隔离。
     返回终态、实际核算费用及无正文账本行，调用方负责跨包累计和原子保存。
@@ -1307,10 +1448,11 @@ def execute_realtime_package(
     files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
     if is_complete(manifest, files):
         return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
-    if realtime_recovery_terminal_status(manifest, run_root, settings) == "local_validation_quarantine":
+    recovered_terminal = realtime_recovery_terminal_status(manifest, run_root, settings)
+    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit"}:
         # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
         # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
-        return "recovered_quarantine", 0.0, {"outcome": "recovered_quarantine"}
+        return "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit", 0.0, {"outcome": "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit"}
     atoms = [atoms_by_id[item["atom_id"]] for item in manifest["atoms"]]
     body = build_request(prompt, schema, atoms, settings)
     token_reservation = settings.output_tokens_per_atom * len(atoms) + max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
@@ -1349,7 +1491,10 @@ def execute_realtime_package(
                 raise LocalValidationError("JSON_PARSE", "/") from error
             if not isinstance(parsed, dict):
                 raise LocalValidationError("RESPONSE_ROOT_NOT_OBJECT", "/")
-            cues = parse_inference_items(parsed, atoms, load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"), load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"])
+            inference_schema = read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
+            cues, failures = parse_realtime_items_independently(
+                parsed, atoms, inference_schema, load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"],
+            )
             usage = normalise_usage(response)
             charged = realtime_usage_cost(usage, policy)
             within_budget = charged <= budget_remaining_cny
@@ -1360,10 +1505,49 @@ def execute_realtime_package(
                 atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts})
                 return "budget_stopped", charged, event
             event = realtime_ledger_event(manifest, "validated_success", attempts, usage)
-            # 只有完整的本地验证通过才写结果；严格原子顺序令恢复时不会将半个 package 视为完成。
+            # 合格项先原子落盘：随后任一项的修复或审计都不能使同包另外四项的已验证
+            # 原文字段 span 消失。结果文件永远只含通过最终 Cue Schema 的程序展开结果。
             atomic_write_jsonl(files["manifest"], [manifest])
             atomic_write_jsonl(files["result"], cues)
             atomic_write_jsonl(files["ledger"], [event])
+            if failures:
+                queue_path = state_path.parent / "item_audit_queue.jsonl"
+                # 每个失败 Atom 只有一次、只含该 Atom 的 repair 请求；请求身份不含字幕或
+                # 原始模型内容，且落盘前已绑定 package、下标和初始请求身份。
+                repaired_cues: list[dict[str, Any]] = []
+                unresolved: list[dict[str, Any]] = []
+                for failure in failures:
+                    item_index = int(failure["item_index"])
+                    repair_identity = f"rt_repair_{manifest['package_id']}_{item_index}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': item_index, 'request_sha256': manifest['request_sha256']})[:10]}"
+                    repair_atom = atoms[item_index]
+                    repair_body = build_request(prompt + "\n仅修复这一个 items[0]；必须返回 n=0。", schema, [repair_atom], settings)
+                    try:
+                        repair_response = transport.complete(repair_body, policy)
+                        repair_content = repair_response.get("choices", [{}])[0].get("message", {}).get("content")
+                        if not isinstance(repair_content, str):
+                            raise LocalValidationError("RESPONSE_STRUCTURE", "/choices/0/message/content")
+                        repair_parsed = json.loads(repair_content)
+                        if not isinstance(repair_parsed, dict):
+                            raise LocalValidationError("RESPONSE_ROOT_NOT_OBJECT", "/")
+                        repaired, repair_failures = parse_realtime_items_independently(
+                            repair_parsed, [repair_atom], inference_schema, load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"],
+                        )
+                        repaired_cues.extend(repaired)
+                        if repair_failures:
+                            unresolved.extend(safe_item_failures(manifest, [{**entry, "item_index": item_index, "atom_id": repair_atom["atom_id"]} for entry in repair_failures], repair_identity, 2))
+                    except (RealtimeServiceError, LocalValidationError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+                        unresolved.extend(safe_item_failures(manifest, [failure], repair_identity, 2))
+                if repaired_cues:
+                    atomic_write_jsonl(files["result"], cues + repaired_cues)
+                if unresolved:
+                    atomic_write_jsonl(queue_path, unresolved)
+                    atomic_write_json(state_path, {**read_json(state_path), "status": "needs_item_audit", "retry_count": attempts,
+                        "item_outcomes": {"accepted_or_rejected": len(cues) + len(repaired_cues), "unresolved": len(unresolved)},
+                        "unresolved_item_count": len(unresolved), "raw_response_saved": False})
+                    event["item_failures"] = unresolved
+                    event["outcome"] = "needs_item_audit"
+                    atomic_write_jsonl(files["ledger"], [event])
+                    return "needs_item_audit", charged, event
             atomic_write_json(state_path, {**read_json(state_path), "status": "validated_success", "retry_count": attempts})
             atomic_write_json(files["complete"], {
                 "run_id": manifest["run_id"], "package_id": manifest["package_id"], "transport": "realtime_chat_completions",
@@ -1542,6 +1726,7 @@ def progress_snapshot(total: int, completed: int, outcomes: dict[str, int], budg
         "status": status, "wave_index": wave_index, "wave_task_indexes": task_indexes, "total_packages": total, "completed_packages": completed,
         "validated_success_packages": outcomes.get("validated_success", 0),
         "local_validation_quarantine_packages": outcomes.get("local_validation_quarantine", 0),
+        "needs_item_audit_packages": outcomes.get("needs_item_audit", 0),
         "service_transport_exhausted_packages": outcomes.get("service_transport_exhausted", 0),
         "budget_stopped_packages": outcomes.get("budget_stopped", 0), "in_flight_packages": in_flight,
         "authorized_budget_cny": budget.maximum_cny, "spent_cny": budget.spent_cny(),
@@ -1592,7 +1777,7 @@ def require_completed_prior_waves(run_root: Path, wave_index: int, preflight: di
         if (
             progress.get("status") != "completed" or completed != total or in_flight != 0
             or progress.get("validated_success_packages") != total
-            or any(progress.get(field) != 0 for field in ("local_validation_quarantine_packages", "service_transport_exhausted_packages", "budget_stopped_packages"))
+            or any(progress.get(field) != 0 for field in ("local_validation_quarantine_packages", "needs_item_audit_packages", "service_transport_exhausted_packages", "budget_stopped_packages"))
         ):
             raise ContractError(f"前序 Wave {prior_wave} 尚未完整成功；未读取密钥或联网")
 
@@ -1757,7 +1942,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     # 全部 package 都是既有终态时无需读取密钥或构造 transport；仍须保留隔离状态，
     # 使后续 Wave 的离线门继续拒绝含人工审计项的前序 Wave。
     if not remaining_manifests:
-        final_status = "local_validation_quarantine" if outcomes.get("local_validation_quarantine") else "completed"
+        final_status = "local_validation_quarantine" if outcomes.get("local_validation_quarantine") else ("needs_item_audit" if outcomes.get("needs_item_audit") else "completed")
         snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, preparation_started, 0, final_status, arguments.wave_index, task_indexes), preflight)
         write_realtime_progress(wave_root, settings, snapshot)
         atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})
@@ -1807,6 +1992,9 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
                     # 防御性分支：若提交与执行之间已有隔离状态落盘，保持隔离并不追加账本。
                     completed += 1
                     outcomes["local_validation_quarantine"] = outcomes.get("local_validation_quarantine", 0) + 1
+                elif status == "needs_item_audit":
+                    completed += 1
+                    outcomes["needs_item_audit"] = outcomes.get("needs_item_audit", 0) + 1
                 else:
                     validate_realtime_ledger_event(event)
                     append_ledger_event(wave_root / settings.layout["run_ledger_filename"], event)
@@ -1824,7 +2012,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
             print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
             last_progress = time.monotonic()
 
-    final_status = stop_status or ("local_validation_quarantine" if outcomes.get("local_validation_quarantine") else "completed")
+    final_status = stop_status or ("local_validation_quarantine" if outcomes.get("local_validation_quarantine") else ("needs_item_audit" if outcomes.get("needs_item_audit") else "completed"))
     snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, 0, final_status, arguments.wave_index, task_indexes), preflight)
     write_realtime_progress(wave_root, settings, snapshot)
     atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})

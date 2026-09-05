@@ -34,7 +34,12 @@ def module() -> Any:
 
 def atom(index: int) -> dict[str, Any]:
     """构造最小合成 Source Atom，仅用于第 05 阶段单元测试。"""
-    return {"atom_id": f"src_a_{index:03d}", "split": "train", "visible_text": f"第{index}条文本", "video_id": "v", "source_srt_path": "source/x.srt", "start_ms": 0, "end_ms": 1, "source_segment_ids": ["s"]}
+    return {
+        "atom_id": f"src_a_{index:03d}", "split": "train",
+        "transcript": f"转录第{index}条文本", "dense_caption": f"描述第{index}条文本",
+        "visible_text": f"第{index}条文本", "video_id": "v", "source_srt_path": "source/x.srt",
+        "start_ms": 0, "end_ms": 1, "source_segment_ids": ["s"],
+    }
 
 
 def setup(value: Any) -> tuple[Any, Any, dict[str, Any], dict[str, dict[str, Any]]]:
@@ -48,7 +53,7 @@ def setup(value: Any) -> tuple[Any, Any, dict[str, Any], dict[str, dict[str, Any
 
 def response(valid: bool = True, costly: bool = False) -> dict[str, Any]:
     """生成内存中的紧凑模型响应；不保存服务端原始文本。"""
-    payload = {"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A"}]} if valid else {"items": []}
+    payload = {"items": [{"n": 0, "f": "V", "start": 0, "end": 5, "p": [["A", "=", "活动"]], "c": 80, "v": "A"}]} if valid else {"items": []}
     amount = 1_000_000 if costly else 10
     return {"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}], "usage": {"prompt_tokens": amount, "completion_tokens": amount, "total_tokens": amount * 2}}
 
@@ -100,9 +105,9 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
         def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]: self.calls += 1; return response(False)
     invalid = Invalid()
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, invalid, tmp_path / "realtime", 1.0, *buckets(value, policy))
-    assert result[0] == "local_validation_quarantine" and invalid.calls == 1 and result[2]["retry_eligible"] is False
+    assert result[0] == "needs_item_audit" and invalid.calls == 2 and result[2]["retry_eligible"] is False
     recovered = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, invalid, tmp_path / "realtime", 1.0, *buckets(value, policy))
-    assert recovered == ("recovered_quarantine", 0.0, {"outcome": "recovered_quarantine"}) and invalid.calls == 1
+    assert recovered == ("recovered_item_audit", 0.0, {"outcome": "recovered_item_audit"}) and invalid.calls == 2
     class Costly:
         def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]: return response(costly=True)
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Costly(), tmp_path / "other", 0.01, *buckets(value, policy))
@@ -115,7 +120,7 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     ("payload", "expected_code", "expected_path"),
     [
         ("{", "JSON_PARSE", "/"),
-        (json.dumps({"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "不存在", "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_NOT_SUBSTRING", "/items/0/x"),
+        (json.dumps({"items": [{"n": 0, "p": [["A", "=", "活动"]], "f": "V", "start": 0, "end": 999, "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE", "/items/0/end"),
     ],
 )
 def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
@@ -129,9 +134,15 @@ def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, 
     root = tmp_path / "realtime"
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Invalid(), root, 1.0, *buckets(value, policy))
     state = json.loads((root / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8"))
-    assert result[0] == "local_validation_quarantine"
-    assert result[2]["local_validation_failure"] == {"code": expected_code, "path": expected_path}
-    assert state["local_validation_failure"] == {"code": expected_code, "path": expected_path}
+    expected_status = "local_validation_quarantine" if payload == "{" else "needs_item_audit"
+    assert result[0] == expected_status
+    if payload == "{":
+        assert result[2]["local_validation_failure"] == {"code": expected_code, "path": expected_path}
+        assert state["local_validation_failure"] == {"code": expected_code, "path": expected_path}
+    else:
+        queue = list(value.iter_jsonl(root / "packages" / manifest["package_id"] / "item_audit_queue.jsonl"))
+        assert queue == [{"atom_id": "src_a_001", "item_index": 0, "code": expected_code, "path": expected_path,
+                          "attempt": 2, "request_identity": queue[0]["request_identity"], "package_id": manifest["package_id"], "raw_response_saved": False}]
     persisted = json.dumps(state, ensure_ascii=False)
     assert "choices" not in persisted and "message" not in persisted
     if payload != "{":
@@ -172,9 +183,79 @@ def test_server_compatible_inference_schema_keeps_entity_deduplication_locally()
     assert "uniqueItems" not in json.dumps(schema, ensure_ascii=False)
     inference_validator = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
     cue_validator = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
-    duplicate = {"items": [{"n": 0, "p": [["A", "=", "活动"]], "x": "第1条文本", "c": 80, "v": "A", "e": ["物品", "物品"]}]}
+    duplicate = {"items": [{"n": 0, "p": [["A", "=", "活动"]], "f": "V", "start": 0, "end": 5, "c": 80, "v": "A", "e": ["物品", "物品"]}]}
     with pytest.raises(value.LocalValidationError, match="ENTITY_DUPLICATE"):
         value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
+
+
+def test_position_evidence_uses_declared_single_field_and_keeps_original_span() -> None:
+    """位置证据只能在 f 指定字段切片，保存内容必须是程序从原字段取回的原文。"""
+    value = module(); settings, _policy, _manifest, rows = setup(value)
+    source = rows["src_a_001"]; source.update({"transcript": "转录原文", "dense_caption": "描述原文", "visible_text": "可见原文"})
+    iv = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"); cv = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
+    cues = value.parse_inference_items({"items": [{"n": 0, "f": "D", "start": 0, "end": 4, "p": [["A", "=", "活动"]], "c": 80, "v": "A"}]}, [source], iv, cv, settings, "synthetic")
+    assert cues[0]["supporting_text_field"] == "dense_caption" and cues[0]["supporting_text_span"] == "描述原文"
+
+
+@pytest.mark.parametrize(("start", "end", "expected"), [(0, 0, "INFERENCE_SCHEMA_MINIMUM"), (0, 99, "SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE")])
+def test_position_evidence_rejects_invalid_unicode_codepoint_offsets(start: int, end: int, expected: str) -> None:
+    """偏移必须是同一字段的左闭右开 Unicode code-point 范围，不能借其他字段或越界。"""
+    value = module(); settings, _policy, _manifest, rows = setup(value)
+    iv = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"); cv = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
+    payload = {"items": [{"n": 0, "f": "V", "start": start, "end": end, "p": [["A", "=", "活动"]], "c": 80, "v": "A"}]}
+    with pytest.raises(value.LocalValidationError, match=expected):
+        value.parse_inference_items(payload, [rows["src_a_001"]], iv, cv, settings, "synthetic")
+
+
+def test_request_keeps_three_evidence_fields_separate() -> None:
+    """请求正文必须逐字段保留证据，禁止在进入模型前拼成不可审计的 text。"""
+    value = module(); settings, _policy, _manifest, rows = setup(value)
+    source = rows["src_a_001"]
+    source.update({"transcript": "转录", "dense_caption": "描述", "visible_text": "可见"})
+    request = value.build_request("提示词", {"type": "object"}, [source], settings)
+    items = json.loads(request["messages"][1]["content"])["items"]
+    assert items == [{"item_index": 0, "transcript": "转录", "dense_caption": "描述", "visible_text": "可见"}]
+
+
+def test_item_failure_keeps_sibling_cue_and_enters_one_repair_audit_queue(tmp_path: Path) -> None:
+    """五项包中的一项失败不得抹去同包有效 Cue；修复仅发送失败 Atom 一次后进入审计。"""
+    value = module(); settings, policy, _manifest, rows = setup(value)
+    second_atom = atom(2); rows[second_atom["atom_id"]] = second_atom
+    manifest = value.realtime_manifest(value.package_manifest([rows["src_a_001"], second_atom], "source", "protocol", "synthetic", 0, 0))
+
+    class OneGoodOneBad:
+        calls = 0
+        def complete(self, body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            self.calls += 1
+            submitted = json.loads(body["messages"][1]["content"])["items"]
+            if len(submitted) == 2:
+                payload = {"items": [
+                    {"n": 0, "f": "V", "start": 0, "end": 5, "p": [["A", "=", "活动"]], "c": 80, "v": "A"},
+                    {"n": 1, "f": "V", "start": 0, "end": 999, "p": [["A", "=", "活动"]], "c": 80, "v": "A"},
+                ]}
+            else:
+                payload = {"items": [{"n": 0, "f": "V", "start": 0, "end": 999, "p": [["A", "=", "活动"]], "c": 80, "v": "A"}]}
+            return {"choices": [{"message": {"content": json.dumps(payload, ensure_ascii=False)}}], "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}}
+
+    root = tmp_path / "realtime"; transport = OneGoodOneBad()
+    result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, transport, root, 1.0, *buckets(value, policy))
+    package_dir = root / "packages" / manifest["package_id"]
+    saved = list(value.iter_jsonl(package_dir / f"{manifest['package_id']}.result.jsonl"))
+    queued = list(value.iter_jsonl(package_dir / "item_audit_queue.jsonl"))
+    assert result[0] == "needs_item_audit" and transport.calls == 2
+    assert [cue["atom_id"] for cue in saved] == ["src_a_001"]
+    assert queued[0]["atom_id"] == second_atom["atom_id"] and queued[0]["attempt"] == 2
+    assert queued[0]["request_identity"].startswith(f"rt_repair_{manifest['package_id']}_1_")
+    assert "choices" not in (package_dir / "realtime_state.json").read_text(encoding="utf-8")
+
+
+def test_position_protocol_rejects_model_text_field() -> None:
+    """模型不得回传 x；Schema 要求只保留字段码与 Unicode code-point 位置。"""
+    value = module(); settings, _policy, _manifest, rows = setup(value)
+    iv = value.load_validator(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"); cv = value.load_validator(ROOT / "schemas/cue_candidate.schema.json")
+    payload = {"items": [{"n": 0, "f": "V", "start": 0, "end": 5, "p": [["A", "=", "活动"]], "c": 80, "v": "A", "x": "第1条文本"}]}
+    with pytest.raises(value.LocalValidationError, match="INFERENCE_SCHEMA_ADDITIONALPROPERTIES"):
+        value.parse_inference_items(payload, [rows["src_a_001"]], iv, cv, settings, "synthetic")
 
 
 def test_materialize_realtime_wave_stops_after_selected_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -264,7 +345,7 @@ def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_
 
     invalid = Invalid()
     quarantined = value.execute_realtime_package(first, rows, "p", {"type": "object"}, settings, policy, invalid, wave_root, 10.0, *buckets(value, policy))
-    assert quarantined[0] == "local_validation_quarantine" and invalid.calls == 1
+    assert quarantined[0] == "needs_item_audit" and invalid.calls == 2
     value.append_ledger_event(wave_root / settings.layout["run_ledger_filename"], quarantined[2])
     submitted: list[str] = []
 
@@ -281,8 +362,8 @@ def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_
     progress = json.loads((wave_root / "progress.json").read_text(encoding="utf-8"))
     events = list(value.iter_jsonl(wave_root / settings.layout["run_ledger_filename"]))
     assert submitted == [second["package_id"]]
-    assert result["outcomes"] == {"local_validation_quarantine": 1, "validated_success": 1}
-    assert (progress["status"], progress["completed_packages"], progress["validated_success_packages"], progress["local_validation_quarantine_packages"]) == ("local_validation_quarantine", 2, 1, 1)
+    assert result["outcomes"] == {"needs_item_audit": 1, "validated_success": 1}
+    assert (progress["status"], progress["completed_packages"], progress["validated_success_packages"], progress["needs_item_audit_packages"]) == ("needs_item_audit", 2, 1, 1)
     assert [event["realtime_request_id"] for event in events].count(first["realtime_request_id"]) == 1
 
 
@@ -307,7 +388,7 @@ def test_later_wave_requires_each_prior_wave_to_complete(tmp_path: Path) -> None
     success = {
         "status": "completed", "run_id": "shared", "source_atoms_sha256": "source", "cue_execution_protocol_sha256": "protocol",
         "wave_index": 1, "total_packages": 3, "completed_packages": 3, "in_flight_packages": 0,
-        "validated_success_packages": 3, "local_validation_quarantine_packages": 0,
+            "validated_success_packages": 3, "local_validation_quarantine_packages": 0, "needs_item_audit_packages": 0,
         "service_transport_exhausted_packages": 0, "budget_stopped_packages": 0,
     }
     value.atomic_write_json(tmp_path / "wave_01" / "progress.json", success)
