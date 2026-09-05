@@ -78,93 +78,61 @@ def write_cue_v2_contract_artifacts(config: object) -> None:
     schema.write_text('{"$id":"synthetic-v2.2","type":"object"}\n', encoding="utf-8")
 
 
-def write_valid_batch_manifest(qa, config, marker: dict) -> None:
-    """写入无正文 Batch task 清单，模拟已完成任务的最小可审计血缘。"""
+def write_valid_realtime_artifacts(qa, config, marker: dict) -> None:
+    """写入完全合成的实时无正文状态，证明 T4 不依赖已取消的 Batch 工件。"""
 
-    custom_id = "v22_s00000_p000_1234abcd"
-    row = {
-        "run_id": "run_synthetic_v22",
-        "wave_index": 1,
-        "batch_task_index": 0,
-        "source_atoms_sha256": marker["source_atoms_sha256"],
-        "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
-        "batch_input_sha256": "a" * 64,
-        "request_count": 1,
-        "custom_ids_sha256": qa.canonical_sha256([custom_id]),
-        "logical_shard_start": 0,
-        "logical_shard_end": 0,
-        "remote_file_id": "file-synthetic-input",
-        "status": "completed",
-        "custom_id_to_package_id": {custom_id: "pkg_s00000_p000"},
+    root = qa.realtime_root(config)
+    package_id = "pkg_s00000_p000"
+    request_sha = "a" * 64
+    package_dir = root / "packages" / package_id
+    package_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "run_id": "run_synthetic_v30", "transport": "realtime_chat_completions", "realtime_shard_index": 0,
+        "package_id": package_id, "source_atoms_sha256": marker["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"], "request_sha256": request_sha,
+        "attempt": 1, "retry_count": 0, "status": "validated_success",
     }
-    path = qa.batch_tasks_manifest_path(config, marker)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
-    ledger = path.parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
-    ledger.parent.mkdir(parents=True, exist_ok=True)
-    ledger.write_text(
-        json.dumps(
-            {
-                "package_id": "pkg_s00000_p000",
-                "batch_task_index": 0,
-                "batch_custom_id": custom_id,
-                "batch_input_sha256": "a" * 64,
-                "remote_file_id": "file-synthetic-input",
-                "remote_cleanup_status": "pending_t4_cue_qa",
-                "outcome": "validated_success",
-                "batch_id": "batch-synthetic",
-                "result_file_id": "file-synthetic-output",
-                "error_file_id": None,
-                "result_line_sha256": "b" * 64,
-                "retry_eligible": False,
-                "failure_origin": None,
-            },
-            ensure_ascii=False,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    receipt = path.parent / "wave_01" / "task_000.batch_receipt.json"
-    receipt.parent.mkdir(parents=True, exist_ok=True)
-    receipt.write_text(
-        json.dumps(
-            {
-                "run_id": "run_synthetic_v22",
-                "wave_index": 1,
-                "batch_task_index": 0,
-                "batch_id": "batch-synthetic",
-                "remote_file_id": "file-synthetic-input",
-                "output_file_id": "file-synthetic-output",
-                "error_file_id": None,
-                "batch_input_sha256": "a" * 64,
-                "source_atoms_sha256": marker["source_atoms_sha256"],
-                "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
-                "status": "completed",
-                "request_count": 1,
-                "received_line_count": 1,
-                "validated_count": 1,
-                "service_line_failure_count": 0,
-                "local_validation_quarantine_count": 0,
-                "remote_result_line_sha256": "c" * 64,
-                "remote_error_line_sha256": None,
-                "received_at": "2026-09-05T00:00:00+00:00",
-                "raw_response_saved": False,
-            },
-            ensure_ascii=False,
-        ),
-        encoding="utf-8",
-    )
-    marker.update(
-        {
-            "batch_transport": "batch_file",
-            "batch_task_count": 1,
-            "batch_tasks_manifest_sha256": qa.sha256_file(path),
-            "batch_input_total_request_count": 1,
-            "batch_local_raw_response_storage": "forbidden",
-            "remote_cleanup_required": True,
-            "remote_cleanup_status": "pending_t4_cue_qa",
-        }
-    )
+    state_path = package_dir / "realtime_state.json"
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+    ledger = {
+        "realtime_shard_index": 0, "package_id": package_id, "request_sha256": request_sha,
+        "attempt": 1, "outcome": "validated_success", "usage": {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18},
+        "retry_eligible": False, "failure_origin": None, "transport": "realtime_chat_completions",
+        "source_atoms_sha256": marker["source_atoms_sha256"], "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
+    }
+    ledger_path = package_dir / f"{package_id}.ledger.jsonl"
+    ledger_path.write_text(json.dumps(ledger, ensure_ascii=False) + "\n", encoding="utf-8")
+    result_path = package_dir / f"{package_id}.result.jsonl"
+    result_path.write_text('{"synthetic":true}\n', encoding="utf-8")
+    complete = dict(state)
+    complete.update({"result_sha256": qa.sha256_file(result_path), "ledger_sha256": qa.sha256_file(ledger_path), "state_sha256": qa.sha256_file(state_path)})
+    complete_path = package_dir / f"{package_id}.complete.json"
+    complete_path.write_text(json.dumps(complete, ensure_ascii=False), encoding="utf-8")
+    row = {
+        "run_id": "run_synthetic_v30", "transport": "realtime_chat_completions", "realtime_shard_index": 0,
+        "source_atoms_sha256": marker["source_atoms_sha256"], "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"],
+        "package_count": 1, "package_ids_sha256": qa.canonical_sha256([package_id]),
+        "package_id_to_request_sha256": {package_id: request_sha}, "status": "completed", "completion_sha256": qa.sha256_file(complete_path),
+    }
+    manifest = qa.realtime_shards_manifest_path(config)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    manifest.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
+    run_state = {
+        "run_id": "run_synthetic_v30", "transport": "realtime_chat_completions", "source_atoms_sha256": marker["source_atoms_sha256"],
+        "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"], "status": "completed", "authorized_budget_cny": 40.0,
+        "estimated_cost_cny": 0.01, "usage_summary": marker["usage_summary"],
+    }
+    run_state_path = root / "realtime_run_state.json"
+    run_state_path.write_text(json.dumps(run_state, ensure_ascii=False), encoding="utf-8")
+    run_ledger = dict(ledger)
+    run_ledger["run_id"] = "run_synthetic_v30"
+    run_ledger_path = root / "realtime_run_ledger.jsonl"
+    run_ledger_path.write_text(json.dumps(run_ledger, ensure_ascii=False) + "\n", encoding="utf-8")
+    marker.update({
+        "realtime_transport": "realtime_chat_completions", "realtime_shard_count": 1,
+        "realtime_shards_manifest_sha256": qa.sha256_file(manifest), "realtime_run_state_sha256": qa.sha256_file(run_state_path),
+        "realtime_run_ledger_sha256": qa.sha256_file(run_ledger_path), "realtime_local_raw_response_storage": "forbidden",
+    })
 
 
 def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
@@ -196,7 +164,7 @@ def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
         "retry_count": 0,
         "rate_limit_wait_seconds": 0.0,
     }
-    write_valid_batch_manifest(qa, config, marker)
+    write_valid_realtime_artifacts(qa, config, marker)
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
     return marker
 
@@ -271,7 +239,7 @@ def test_cue_v2_success_rejects_missing_or_tampered_execution_lineage(tmp_path: 
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    assert "cue_execution_lineage_fields" in {issue["issue_type"] for issue in collector.issues}
+    assert "cue_realtime_lineage_fields" in {issue["issue_type"] for issue in collector.issues}
 
 
 def test_cue_v2_success_rejects_wrong_hash_version_and_usage_totals(tmp_path: Path) -> None:
@@ -301,7 +269,7 @@ def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) 
     write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
     registry_path = config.config_dir / "model_registry.yaml"
     registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
-    registry["models"]["cue_extraction"]["execution"]["batch_file_policy"]["max_requests_per_file"] = 49999
+    registry["models"]["cue_extraction"]["execution"]["realtime_api_policy"]["requests_per_minute"] = 299
     registry_path.write_text(yaml.safe_dump(registry, allow_unicode=True, sort_keys=False), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
@@ -312,14 +280,14 @@ def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) 
     )
 
 
-def update_batch_manifest(qa, config, marker: dict, mutate) -> None:
-    """修改临时无正文 task 清单并同步其哈希，以测试内容门而非只测试文件哈希。"""
+def update_realtime_manifest(qa, config, marker: dict, mutate) -> None:
+    """修改临时实时清单并同步哈希，保证测试覆盖内容门而非仅文件摘要。"""
 
-    path = qa.batch_tasks_manifest_path(config, marker)
+    path = qa.realtime_shards_manifest_path(config)
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     mutate(rows)
     path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
-    marker["batch_tasks_manifest_sha256"] = qa.sha256_file(path)
+    marker["realtime_shards_manifest_sha256"] = qa.sha256_file(path)
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
 
 
@@ -351,131 +319,92 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
         raise AssertionError("未知短码不得被静默展开")
 
 
-def test_cue_v22_rejects_tampered_custom_id_and_raw_content_metadata(tmp_path: Path) -> None:
-    """task 映射必须双向唯一且不含正文，防止 Batch 结果错配或原文越过保留边界。"""
+def test_cue_v30_rejects_tampered_package_mapping_and_raw_content(tmp_path: Path) -> None:
+    """实时 package 映射必须唯一且无正文，防止取消 Batch 或文本混入实时结果。"""
 
     qa = load_validator()
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
 
-    def duplicate_custom_id(rows: list[dict]) -> None:
-        existing_package = next(iter(rows[0]["custom_id_to_package_id"].values()))
-        rows[0]["custom_id_to_package_id"]["v22_s00000_p001_1234abcd"] = existing_package
-        rows[0]["request_count"] = 2
-        rows[0]["custom_ids_sha256"] = qa.canonical_sha256(list(rows[0]["custom_id_to_package_id"]))
-        marker["batch_input_total_request_count"] = 2
-        marker["usage_summary"]["package_count"] = 2
+    def duplicate_package(rows: list[dict]) -> None:
+        rows[0]["package_id_to_request_sha256"]["pkg_s00000_p000"] = "b" * 64
 
-    update_batch_manifest(qa, config, marker, duplicate_custom_id)
+    update_realtime_manifest(qa, config, marker, duplicate_package)
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    assert any(issue["issue_type"] == "cue_batch_custom_id_bijection" for issue in collector.issues)
+    assert any(issue["issue_type"] == "cue_realtime_package_lineage" for issue in collector.issues)
 
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
 
     def insert_forbidden_body(rows: list[dict]) -> None:
         rows[0]["response"] = "不得保存的合成正文"
 
-    update_batch_manifest(qa, config, marker, insert_forbidden_body)
+    update_realtime_manifest(qa, config, marker, insert_forbidden_body)
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    assert any(issue["issue_type"] == "cue_batch_raw_content" for issue in collector.issues)
+    assert any(issue["issue_type"] == "cue_realtime_raw_content" for issue in collector.issues)
 
 
-def test_cue_v22_rejects_cleanup_or_batch_price_and_output_policy_drift(tmp_path: Path) -> None:
-    """远端清理、Batch 单价和 96 token 上限同属执行合同，任何漂移都必须阻断。"""
+def test_cue_v30_rejects_realtime_price_rate_and_output_policy_drift(tmp_path: Path) -> None:
+    """实时单价、限流和输出上限同属执行合同，任何漂移都必须阻断旧运行恢复。"""
 
     qa = load_validator()
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    marker["remote_cleanup_status"] = "not_required"
+    marker["realtime_transport"] = "batch_file"
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    assert any(issue["issue_type"] == "cue_batch_remote_cleanup" for issue in collector.issues)
+    assert any(issue["issue_type"] == "cue_realtime_transport" for issue in collector.issues)
 
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
     registry_path = config.config_dir / "model_registry.yaml"
     registry = yaml.safe_load(registry_path.read_text(encoding="utf-8"))
     execution = registry["models"]["cue_extraction"]["execution"]
     execution["package_policy"]["output_tokens_per_atom"] = 97
-    execution["pricing_snapshot"]["input_price_cny_per_million_tokens"] = 0.2
+    execution["pricing_snapshot"]["input_price_cny_per_million_tokens"] = 0.19
     registry_path.write_text(yaml.safe_dump(registry, allow_unicode=True, sort_keys=False), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
     assert any(issue["issue_type"] == "cue_execution_lineage_mismatch" for issue in collector.issues)
 
 
-def test_cue_v22_rejects_quarantine_followed_by_requeue(tmp_path: Path) -> None:
-    """服务端成功但本地验证失败已产生费用；同 package 隔离后自动重排队必须阻断。"""
+def test_cue_v30_rejects_non_success_or_requeued_package(tmp_path: Path) -> None:
+    """本地隔离或预算停止不得自动重排，最终 SUCCESS 仅接受唯一 validated_success。"""
 
     qa = load_validator()
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    ledger = qa.batch_tasks_manifest_path(config, marker).parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
+    ledger = qa.realtime_root(config) / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
     events = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
     events[0]["outcome"] = "local_validation_quarantine"
-    retried = dict(events[0])
-    retried["outcome"] = "validated_success"
-    ledger.write_text("".join(json.dumps(event, ensure_ascii=False) + "\n" for event in [events[0], retried]), encoding="utf-8")
+    events[0]["retry_eligible"] = True
+    events[0]["failure_origin"] = "transport"
+    ledger.write_text(json.dumps(events[0], ensure_ascii=False) + "\n", encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    issue_types = {issue["issue_type"] for issue in collector.issues}
-    assert {"cue_batch_quarantine_requeued", "cue_batch_ledger_terminal_duplicate"}.issubset(issue_types)
+    assert any(issue["issue_type"] == "cue_realtime_ledger_terminal" for issue in collector.issues)
 
 
-def test_cue_v221_rejects_receiver_receipt_or_retry_semantic_tampering(tmp_path: Path) -> None:
-    """接收端只能保留行哈希；服务端行失败才可重试，不能伪装本地隔离为可重排。"""
+def test_cue_v30_rejects_budget_overrun_and_batch_artifact_mix(tmp_path: Path) -> None:
+    """预算熔断必须真实生效，实时 run-state 也不得借 Batch 字段/正文绕过审计。"""
 
     qa = load_validator()
     config = qa.load_run_config(copy_config_tree(tmp_path))
     source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
     marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    receipt = qa.batch_receipt_path(config, 1, 0)
-    receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
-    receipt_data["raw_response_saved"] = True
-    receipt_data["received_line_count"] = 0
-    receipt.write_text(json.dumps(receipt_data), encoding="utf-8")
+    state = qa.realtime_root(config) / "realtime_run_state.json"
+    state_data = json.loads(state.read_text(encoding="utf-8"))
+    state_data["estimated_cost_cny"] = 99.0
+    state.write_text(json.dumps(state_data), encoding="utf-8")
+    marker["realtime_run_state_sha256"] = qa.sha256_file(state)
+    config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
     collector = qa.IssueCollector()
     assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    issue_types = {issue["issue_type"] for issue in collector.issues}
-    assert {"cue_batch_receipt_raw_response_policy", "cue_batch_receipt_counts"}.issubset(issue_types)
-
-    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    ledger = qa.batch_tasks_manifest_path(config, marker).parent / "packages" / "pkg_s00000_p000" / "pkg_s00000_p000.ledger.jsonl"
-    event = json.loads(ledger.read_text(encoding="utf-8"))
-    event.update(
-        {
-            "outcome": "local_validation_quarantine",
-            "retry_eligible": True,
-            "failure_origin": "service_line",
-        }
-    )
-    ledger.write_text(json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8")
-    collector = qa.IssueCollector()
-    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    assert any(issue["issue_type"] == "cue_batch_ledger_requeue_semantics" for issue in collector.issues)
-
-
-def test_cue_v221_rejects_missing_remote_result_hash_or_forbidden_receipt_body(tmp_path: Path) -> None:
-    """远端文件存在就必须有流式行哈希，receipt 也不得成为保存模型正文的旁路。"""
-
-    qa = load_validator()
-    config = qa.load_run_config(copy_config_tree(tmp_path))
-    source_marker = write_valid_marker(qa, config, "source", "source_atoms", "source_atoms", {})
-    marker = write_valid_cue_v2_marker(qa, config, source_marker["sha256"])
-    receipt = qa.batch_receipt_path(config, 1, 0)
-    receipt_data = json.loads(receipt.read_text(encoding="utf-8"))
-    receipt_data["remote_result_line_sha256"] = None
-    receipt_data["error"] = "不得持久化的合成错误正文"
-    receipt.write_text(json.dumps(receipt_data, ensure_ascii=False), encoding="utf-8")
-    collector = qa.IssueCollector()
-    assert not qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
-    issue_types = {issue["issue_type"] for issue in collector.issues}
-    assert {"cue_batch_receipt_remote_hash", "cue_batch_receipt_raw_content"}.issubset(issue_types)
+    assert any(issue["issue_type"] == "cue_realtime_budget_fuse" for issue in collector.issues)
 
 
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:

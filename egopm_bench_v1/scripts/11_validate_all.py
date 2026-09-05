@@ -135,6 +135,86 @@ CUE_V2_USAGE_SUMMARY_FIELDS = {
     "retry_count",
     "rate_limit_wait_seconds",
 }
+# v3 实时路径不沿用 Batch task/file 术语。最终标记必须把运行状态、分片清单和
+# 无正文运行账本绑定在同一 Source/协议哈希上，防止已取消的 Batch 产物被误当作实时
+# 结果，或把另一轮实时运行的片段混入当前 Cue library。
+CUE_V30_MARKER_FIELDS = {
+    "source_atoms_sha256",
+    "model_id",
+    "prompt_version",
+    "cue_execution_policy_version",
+    "protocol_hash_payload_version",
+    "cue_execution_protocol_sha256",
+    "cue_prompt_sha256",
+    "cue_inference_schema",
+    "cue_inference_schema_version",
+    "cue_inference_schema_sha256",
+    "usage_summary",
+    "realtime_transport",
+    "realtime_shard_count",
+    "realtime_shards_manifest_sha256",
+    "realtime_run_state_sha256",
+    "realtime_run_ledger_sha256",
+    "realtime_local_raw_response_storage",
+}
+REALTIME_SHARD_REQUIRED_FIELDS = {
+    "run_id",
+    "transport",
+    "realtime_shard_index",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "package_count",
+    "package_ids_sha256",
+    "package_id_to_request_sha256",
+    "status",
+    "completion_sha256",
+}
+REALTIME_PACKAGE_STATE_REQUIRED_FIELDS = {
+    "run_id",
+    "transport",
+    "realtime_shard_index",
+    "package_id",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "request_sha256",
+    "attempt",
+    "retry_count",
+    "status",
+}
+REALTIME_COMPLETE_REQUIRED_FIELDS = {
+    "run_id",
+    "transport",
+    "realtime_shard_index",
+    "package_id",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "request_sha256",
+    "status",
+    "result_sha256",
+    "ledger_sha256",
+    "state_sha256",
+}
+REALTIME_RUN_STATE_REQUIRED_FIELDS = {
+    "run_id",
+    "transport",
+    "source_atoms_sha256",
+    "cue_execution_protocol_sha256",
+    "status",
+    "authorized_budget_cny",
+    "estimated_cost_cny",
+    "usage_summary",
+}
+REALTIME_RAW_CONTENT_EXTRA_FIELDS = {
+    "batch_custom_id",
+    "batch_id",
+    "batch_input_sha256",
+    "batch_task_index",
+    "input_atom_ids",
+    "input_manifest",
+    "remote_file_id",
+    "raw_response_path",
+    "validation_errors",
+}
 # v2.2 的 Batch 汇总清单是可审计的无正文元数据，不是上传的请求 JSONL。固定文件名
 # 让 QA 能在不保留 `visible_text`、请求 body 或模型 response/error 的情况下，重算任务
 # 数、输入哈希和 custom_id 到本地 package 的双向映射。
@@ -199,6 +279,7 @@ BATCH_RAW_CONTENT_FIELDS = {
     "text",
     "visible_text",
 }
+REALTIME_RAW_CONTENT_FIELDS = BATCH_RAW_CONTENT_FIELDS | REALTIME_RAW_CONTENT_EXTRA_FIELDS
 BATCH_CUSTOM_ID = re.compile(r"^v22_s\d{5}_p\d{3}_[0-9a-f]{8}$")
 SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 TERMINAL_STATES = {"completed", "cancelled", "expired"}
@@ -399,8 +480,6 @@ def cue_v2_execution_contract(
     execution_required = {
         "cue_execution_policy_version",
         "protocol_hash_payload_version",
-        "batch_file_policy",
-        "batch_ledger_policy",
         "compact_inference_policy",
         "controlled_field_policy",
         "pricing_snapshot",
@@ -409,6 +488,21 @@ def cue_v2_execution_contract(
         "token_accounting",
         "transport",
     }
+    transport = execution.get("transport")
+    if transport == "batch_file":
+        execution_required |= {"batch_file_policy", "batch_ledger_policy"}
+    elif transport == "realtime_chat_completions":
+        execution_required |= {"realtime_api_policy", "realtime_ledger_policy", "realtime_execution_policy"}
+    else:
+        collector.add(
+            "BLOCKER",
+            "cue_execution_transport",
+            "cue",
+            "batch_file 或 realtime_chat_completions",
+            repr(transport),
+            owner,
+        )
+        return None
     package_required = {
         "maximum_atoms",
         "maximum_request_utf8_bytes",
@@ -467,6 +561,7 @@ def cue_v2_execution_contract(
     return {
         "model_id": cue["model_id"],
         "prompt_version": cue["prompt_version"],
+        "transport": transport,
         "cue_execution_policy_version": execution["cue_execution_policy_version"],
         "protocol_hash_payload_version": execution["protocol_hash_payload_version"],
         "cue_prompt_sha256": prompt_sha256,
@@ -907,23 +1002,297 @@ def validate_batch_package_ledgers(
     return valid
 
 
-def validate_cue_v2_execution_lineage(
+def realtime_layout(config: RunConfig) -> dict[str, Any]:
+    """读取实时运行的固定布局，拒绝以 Batch 根目录或生产者自报路径恢复。"""
+
+    registry = yaml.safe_load((config.config_dir / "model_registry.yaml").read_text(encoding="utf-8"))
+    execution = registry["models"]["cue_extraction"]["execution"]
+    layout = execution["shard_layout"]
+    if execution.get("transport") != "realtime_chat_completions" or str(layout.get("root")) != "cues/realtime":
+        raise ValueError("冻结实时协议未声明 cues/realtime 运行根")
+    required = {"realtime_shards_manifest", "run_ledger_filename", "run_state_filename", "package_directory", "ledger_suffix", "completion_suffix"}
+    if required.difference(layout):
+        raise ValueError(f"冻结实时布局缺少 {sorted(required.difference(layout))}")
+    return layout
+
+
+def realtime_root(config: RunConfig) -> Path:
+    """返回合同唯一允许的实时产物根，隔离已经取消的 cues/batch 运行。"""
+
+    layout = realtime_layout(config)
+    return config.benchmark_root / str(layout["root"])
+
+
+def realtime_shards_manifest_path(config: RunConfig) -> Path:
+    """定位实时分片清单；SUCCESS 不得指定任意其他运行的清单路径。"""
+
+    layout = realtime_layout(config)
+    return realtime_root(config) / str(layout["realtime_shards_manifest"])
+
+
+def has_forbidden_realtime_content(value: Any) -> bool:
+    """递归拒绝实时元数据中的请求、响应、错误和 Atom 正文，防止账本成为泄露旁路。"""
+
+    if isinstance(value, dict):
+        for key, item in value.items():
+            # 生产者可用 null 显式证明未写原始响应路径；任何非空路径则意味着正文可能
+            # 被保留，必须拒绝。其余 Batch 标识或正文键一律不允许出现在实时元数据。
+            if key == "raw_response_path" and item is None:
+                continue
+            if key in REALTIME_RAW_CONTENT_FIELDS or has_forbidden_realtime_content(item):
+                return True
+        return False
+    if isinstance(value, list):
+        return any(has_forbidden_realtime_content(item) for item in value)
+    return False
+
+
+def validate_realtime_execution_lineage(
     config: RunConfig,
     marker: dict[str, Any],
     collector: IssueCollector,
     owner: str,
 ) -> bool:
-    """独立验证最终 Cue SUCCESS 的 v2 执行血缘和无正文账本汇总。"""
+    """独立验证实时 Cue 的运行状态、分片终态、账本与预算熔断边界。"""
 
-    missing = sorted(CUE_V22_MARKER_FIELDS.difference(marker))
+    missing = sorted(CUE_V30_MARKER_FIELDS.difference(marker))
     if missing:
-        collector.add("BLOCKER", "cue_execution_lineage_fields", "cue", "包含全部 v2 执行血缘字段", f"缺少 {missing}", owner)
+        collector.add("BLOCKER", "cue_realtime_lineage_fields", "cue", "完整实时执行血缘字段", f"缺少 {missing}", owner)
         return False
     contract = cue_v2_execution_contract(config, collector, owner)
     if contract is None:
         return False
     valid = True
     for field_name, expected in contract.items():
+        if field_name == "transport":
+            continue
+        if marker.get(field_name) != expected:
+            collector.add("BLOCKER", "cue_execution_lineage_mismatch", f"cue:{field_name}", repr(expected), repr(marker.get(field_name)), owner)
+            valid = False
+    if marker["realtime_transport"] != contract["transport"]:
+        collector.add("BLOCKER", "cue_realtime_transport", "cue", repr(contract["transport"]), repr(marker["realtime_transport"]), owner)
+        valid = False
+    source_marker = load_json(config.marker("source_atoms"), collector, "success_marker", "T1 source")
+    source_hash = source_marker.get("sha256") if source_marker else None
+    if marker["source_atoms_sha256"] != source_hash:
+        collector.add("BLOCKER", "cue_execution_source_hash", "cue", repr(source_hash), repr(marker["source_atoms_sha256"]), owner)
+        valid = False
+    if marker["realtime_local_raw_response_storage"] != "forbidden":
+        collector.add("BLOCKER", "cue_realtime_raw_response_policy", "cue", "forbidden", repr(marker["realtime_local_raw_response_storage"]), owner)
+        valid = False
+    usage = marker.get("usage_summary")
+    if not isinstance(usage, dict):
+        collector.add("BLOCKER", "cue_usage_summary_shape", "cue", "对象类型的无正文 usage 汇总", type(usage).__name__, owner)
+        return False
+    missing_usage = sorted(CUE_V2_USAGE_SUMMARY_FIELDS.difference(usage))
+    if missing_usage:
+        collector.add("BLOCKER", "cue_usage_summary_fields", "cue", "完整 usage 汇总", f"缺少 {missing_usage}", owner)
+        return False
+    for name in CUE_V2_USAGE_SUMMARY_FIELDS - {"rate_limit_wait_seconds"}:
+        if not isinstance(usage[name], int) or isinstance(usage[name], bool) or usage[name] < 0:
+            collector.add("BLOCKER", "cue_usage_summary_value", f"cue:{name}", "非负整数", repr(usage[name]), owner)
+            valid = False
+    if not isinstance(usage["rate_limit_wait_seconds"], (int, float)) or isinstance(usage["rate_limit_wait_seconds"], bool) or usage["rate_limit_wait_seconds"] < 0:
+        collector.add("BLOCKER", "cue_usage_summary_value", "cue:rate_limit_wait_seconds", "非负数值", repr(usage["rate_limit_wait_seconds"]), owner)
+        valid = False
+    if usage["prompt_tokens"] + usage["completion_tokens"] != usage["total_tokens"]:
+        collector.add("BLOCKER", "cue_usage_summary_tokens", "cue", "prompt_tokens + completion_tokens = total_tokens", repr(usage), owner)
+        valid = False
+    if not valid:
+        return False
+    return validate_realtime_artifacts(config, marker, contract, collector, owner)
+
+
+def validate_realtime_artifacts(
+    config: RunConfig,
+    marker: dict[str, Any],
+    contract: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """验证固定实时根下的无正文 run-state、manifest、package ledger 与完成哈希。"""
+
+    layout = realtime_layout(config)
+    root = realtime_root(config)
+    manifest_path = realtime_shards_manifest_path(config)
+    run_state_path = root / str(layout["run_state_filename"])
+    run_ledger_path = root / str(layout["run_ledger_filename"])
+    valid = True
+    for path, field in ((manifest_path, "realtime_shards_manifest_sha256"), (run_state_path, "realtime_run_state_sha256"), (run_ledger_path, "realtime_run_ledger_sha256")):
+        if not path.is_file():
+            collector.add("BLOCKER", "cue_realtime_artifact_missing", str(path), "存在固定实时审计工件", "不存在", owner)
+            valid = False
+        elif sha256_file(path) != marker[field]:
+            collector.add("BLOCKER", "cue_realtime_artifact_hash", str(path), repr(marker[field]), sha256_file(path), owner)
+            valid = False
+    if not valid:
+        return False
+    run_state = load_json(run_state_path, collector, "cue_realtime_run_state", owner)
+    if run_state is None:
+        return False
+    if has_forbidden_realtime_content(run_state):
+        collector.add("BLOCKER", "cue_realtime_raw_content", str(run_state_path), "无请求/响应/错误正文", "发现正文键", owner)
+        valid = False
+    missing = sorted(REALTIME_RUN_STATE_REQUIRED_FIELDS.difference(run_state))
+    if missing:
+        collector.add("BLOCKER", "cue_realtime_run_state_fields", str(run_state_path), "完整实时运行状态", f"缺少 {missing}", owner)
+        return False
+    for field, expected in (("transport", contract["transport"]), ("source_atoms_sha256", marker["source_atoms_sha256"]), ("cue_execution_protocol_sha256", marker["cue_execution_protocol_sha256"])):
+        if run_state[field] != expected:
+            collector.add("BLOCKER", "cue_realtime_run_state_lineage", f"{run_state_path}:{field}", repr(expected), repr(run_state[field]), owner)
+            valid = False
+    if run_state["status"] != "completed":
+        collector.add("BLOCKER", "cue_realtime_run_state_status", str(run_state_path), "completed", repr(run_state["status"]), owner)
+        valid = False
+    for field in ("authorized_budget_cny", "estimated_cost_cny"):
+        if not isinstance(run_state[field], (int, float)) or isinstance(run_state[field], bool) or run_state[field] < 0:
+            collector.add("BLOCKER", "cue_realtime_budget_value", f"{run_state_path}:{field}", "非负数值", repr(run_state[field]), owner)
+            valid = False
+    if isinstance(run_state.get("authorized_budget_cny"), (int, float)) and isinstance(run_state.get("estimated_cost_cny"), (int, float)) and run_state["estimated_cost_cny"] > run_state["authorized_budget_cny"]:
+        collector.add("BLOCKER", "cue_realtime_budget_fuse", str(run_state_path), "estimated_cost_cny 不超过授权预算", repr(run_state), owner)
+        valid = False
+    rows = read_jsonl(manifest_path, collector, "cue_realtime_manifest", owner)
+    if marker["realtime_shard_count"] != len(rows):
+        collector.add("BLOCKER", "cue_realtime_shard_count", "cue", str(len(rows)), repr(marker["realtime_shard_count"]), owner)
+        valid = False
+    package_root = root / str(layout["package_directory"])
+    seen_packages: set[str] = set()
+    for line, shard in enumerate(rows, start=1):
+        label = f"realtime_shard:{line}"
+        if has_forbidden_realtime_content(shard):
+            collector.add("BLOCKER", "cue_realtime_raw_content", label, "无请求/响应/错误正文", "发现正文键", owner)
+            valid = False
+        missing = sorted(REALTIME_SHARD_REQUIRED_FIELDS.difference(shard))
+        if missing:
+            collector.add("BLOCKER", "cue_realtime_manifest_fields", label, "完整实时分片元数据", f"缺少 {missing}", owner)
+            valid = False
+            continue
+        if shard["transport"] != contract["transport"] or shard["source_atoms_sha256"] != marker["source_atoms_sha256"] or shard["cue_execution_protocol_sha256"] != marker["cue_execution_protocol_sha256"]:
+            collector.add("BLOCKER", "cue_realtime_manifest_lineage", label, "同一 transport/Source/协议", repr(shard), owner)
+            valid = False
+        mapping = shard["package_id_to_request_sha256"]
+        if not isinstance(mapping, dict) or shard["package_count"] != len(mapping) or not mapping:
+            collector.add("BLOCKER", "cue_realtime_manifest_package_count", label, "package_count 与非空映射一致", repr(mapping), owner)
+            valid = False
+            continue
+        package_ids = list(mapping)
+        if shard["package_ids_sha256"] != canonical_sha256(package_ids):
+            collector.add("BLOCKER", "cue_realtime_package_ids_hash", label, repr(canonical_sha256(package_ids)), repr(shard["package_ids_sha256"]), owner)
+            valid = False
+        if shard["status"] != "completed" or not isinstance(shard["completion_sha256"], str) or SHA256_HEX.fullmatch(shard["completion_sha256"]) is None:
+            collector.add("BLOCKER", "cue_realtime_shard_terminal", label, "completed 且有完成哈希", repr(shard), owner)
+            valid = False
+        for package_id, request_sha in mapping.items():
+            if package_id in seen_packages or not isinstance(request_sha, str) or SHA256_HEX.fullmatch(request_sha) is None:
+                collector.add("BLOCKER", "cue_realtime_package_bijection", label, "全局唯一 package_id 与 64 位请求摘要", repr({package_id: request_sha}), owner)
+                valid = False
+            seen_packages.add(package_id)
+            state_path = package_root / package_id / "realtime_state.json"
+            ledger_path = package_root / package_id / f"{package_id}{layout['ledger_suffix']}"
+            complete_path = package_root / package_id / f"{package_id}{layout['completion_suffix']}"
+            valid = validate_realtime_package_artifacts(state_path, ledger_path, complete_path, shard, package_id, request_sha, marker, contract, collector, owner) and valid
+    # run ledger 必须只包含已清单登记的 package；它记录费用熔断与重试摘要，不能另建
+    # 一个未审计 package 的终态。逐行使用同一禁止正文门，确保失败摘要不夹带服务端正文。
+    for event in read_jsonl(run_ledger_path, collector, "cue_realtime_run_ledger", owner):
+        if has_forbidden_realtime_content(event):
+            collector.add("BLOCKER", "cue_realtime_raw_content", str(run_ledger_path), "无请求/响应/错误正文", "发现正文键", owner)
+            valid = False
+        if event.get("transport") != contract["transport"] or event.get("source_atoms_sha256") != marker["source_atoms_sha256"] or event.get("cue_execution_protocol_sha256") != marker["cue_execution_protocol_sha256"]:
+            collector.add("BLOCKER", "cue_realtime_run_ledger_lineage", str(run_ledger_path), "同一 transport/Source/协议", repr(event), owner)
+            valid = False
+        if event.get("package_id") not in seen_packages:
+            collector.add("BLOCKER", "cue_realtime_run_ledger_package", str(run_ledger_path), "仅引用 manifest package", repr(event.get("package_id")), owner)
+            valid = False
+    return valid
+
+
+def validate_realtime_package_artifacts(
+    state_path: Path, ledger_path: Path, complete_path: Path, shard: dict[str, Any], package_id: str, request_sha: str, marker: dict[str, Any], contract: dict[str, Any], collector: IssueCollector, owner: str,
+) -> bool:
+    """验证一个实时 package 的唯一终态；本地隔离和预算停止均禁止自动重排。"""
+
+    valid = True
+    state = load_json(state_path, collector, "cue_realtime_package_state", owner)
+    complete = load_json(complete_path, collector, "cue_realtime_complete", owner)
+    if state is None or complete is None:
+        return False
+    for value, label, required in ((state, str(state_path), REALTIME_PACKAGE_STATE_REQUIRED_FIELDS), (complete, str(complete_path), REALTIME_COMPLETE_REQUIRED_FIELDS)):
+        if has_forbidden_realtime_content(value):
+            collector.add("BLOCKER", "cue_realtime_raw_content", label, "无请求/响应/错误正文", "发现正文键", owner)
+            valid = False
+        missing = sorted(required.difference(value))
+        if missing:
+            collector.add("BLOCKER", "cue_realtime_package_fields", label, "完整 package 状态字段", f"缺少 {missing}", owner)
+            valid = False
+    if not valid:
+        return False
+    for value, label in ((state, str(state_path)), (complete, str(complete_path))):
+        expected = {"transport": contract["transport"], "package_id": package_id, "source_atoms_sha256": marker["source_atoms_sha256"], "cue_execution_protocol_sha256": marker["cue_execution_protocol_sha256"], "request_sha256": request_sha, "realtime_shard_index": shard["realtime_shard_index"], "run_id": shard["run_id"]}
+        for field, wanted in expected.items():
+            if value[field] != wanted:
+                collector.add("BLOCKER", "cue_realtime_package_lineage", f"{label}:{field}", repr(wanted), repr(value[field]), owner)
+                valid = False
+        if value["status"] != "validated_success":
+            collector.add("BLOCKER", "cue_realtime_package_terminal", label, "validated_success", repr(value["status"]), owner)
+            valid = False
+    # complete 是可恢复 package 的原子终态：三份摘要必须指向同目录下实际的状态、
+    # 无正文账本和已验证结果片段。否则替换片段后仍可能保留旧完成标记而逃过恢复门。
+    result_path = complete_path.with_name(f"{package_id}.result.jsonl")
+    for field, path in (("result_sha256", result_path), ("ledger_sha256", ledger_path), ("state_sha256", state_path)):
+        if not path.is_file() or not isinstance(complete[field], str) or SHA256_HEX.fullmatch(complete[field]) is None or sha256_file(path) != complete[field]:
+            collector.add("BLOCKER", "cue_realtime_complete_hash", f"{complete_path}:{field}", "匹配实际工件的 64 位 SHA256", repr(complete[field]), owner)
+            valid = False
+    events = read_jsonl(ledger_path, collector, "cue_realtime_ledger", owner)
+    if len(events) != 1:
+        collector.add("BLOCKER", "cue_realtime_ledger_terminal_unique", str(ledger_path), "每个 package 一个终态事件", str(len(events)), owner)
+        return False
+    event = events[0]
+    if has_forbidden_realtime_content(event):
+        collector.add("BLOCKER", "cue_realtime_raw_content", str(ledger_path), "无请求/响应/错误正文", "发现正文键", owner)
+        valid = False
+    required = {"realtime_shard_index", "package_id", "request_sha256", "attempt", "outcome", "usage", "retry_eligible", "failure_origin", "transport", "source_atoms_sha256", "cue_execution_protocol_sha256"}
+    missing = sorted(required.difference(event))
+    if missing:
+        collector.add("BLOCKER", "cue_realtime_ledger_fields", str(ledger_path), "冻结实时账本字段", f"缺少 {missing}", owner)
+        return False
+    if event["outcome"] != "validated_success" or event["retry_eligible"] is not False or event["failure_origin"] is not None:
+        collector.add("BLOCKER", "cue_realtime_ledger_terminal", str(ledger_path), "仅 validated_success 且不可重试", repr(event), owner)
+        valid = False
+    if event["package_id"] != package_id or event["request_sha256"] != request_sha or event["transport"] != contract["transport"] or event["source_atoms_sha256"] != marker["source_atoms_sha256"] or event["cue_execution_protocol_sha256"] != marker["cue_execution_protocol_sha256"]:
+        collector.add("BLOCKER", "cue_realtime_ledger_lineage", str(ledger_path), "匹配 manifest/协议/Source", repr(event), owner)
+        valid = False
+    if not isinstance(event["attempt"], int) or isinstance(event["attempt"], bool) or event["attempt"] < 1 or not isinstance(event["usage"], dict):
+        collector.add("BLOCKER", "cue_realtime_ledger_usage", str(ledger_path), "正整数 attempt 与无正文 usage 对象", repr(event), owner)
+        valid = False
+    return valid
+
+
+def validate_cue_v2_execution_lineage(
+    config: RunConfig,
+    marker: dict[str, Any],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """按冻结 transport 验证最终 Cue 的执行血缘，禁止跨传输混用工件。"""
+
+    # transport 只能由 T0 冻结的 registry 决定，不能相信 SUCCESS 自报。实时协议
+    # 必须在进入任何 Batch 路径前返回，确保已取消 Batch 的状态/receipt 永不被读取。
+    contract = cue_v2_execution_contract(config, collector, owner)
+    if contract is None:
+        return False
+    if contract["transport"] == "realtime_chat_completions":
+        return validate_realtime_execution_lineage(config, marker, collector, owner)
+
+    missing = sorted(CUE_V22_MARKER_FIELDS.difference(marker))
+    if missing:
+        collector.add("BLOCKER", "cue_execution_lineage_fields", "cue", "包含全部 v2 执行血缘字段", f"缺少 {missing}", owner)
+        return False
+    valid = True
+    for field_name, expected in contract.items():
+        # 传输字段在最终标记中采用带语义前缀的键，避免 Batch 与实时运行状态的
+        # 同名字段互相覆盖；由各自的 transport 分支进行严格比较。
+        if field_name == "transport":
+            continue
         actual = marker.get(field_name)
         if actual != expected:
             collector.add("BLOCKER", "cue_execution_lineage_mismatch", f"cue:{field_name}", repr(expected), repr(actual), owner)
