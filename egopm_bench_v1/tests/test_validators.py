@@ -135,7 +135,8 @@ def write_valid_realtime_artifacts(qa, config, marker: dict) -> None:
     progress = {
         "status": "completed", "wave_index": 1, "wave_task_indexes": [0],
         "total_packages": 1, "completed_packages": 1, "validated_success_packages": 1,
-        "local_validation_quarantine_packages": 0, "service_transport_exhausted_packages": 0,
+        "local_validation_quarantine_packages": 0, "needs_item_audit_packages": 0,
+        "service_transport_exhausted_packages": 0,
         "budget_stopped_packages": 0, "in_flight_packages": 0, "authorized_budget_cny": 40.0,
         "spent_cny": 0.01, "elapsed_seconds": 1.0, "eta_seconds": 0.0,
         "raw_response_saved": False, "updated_at": "2026-08-31T00:00:00+00:00",
@@ -492,6 +493,42 @@ def test_item_audit_queue_blocks_success_and_rejects_raw_or_second_repair(tmp_pa
     collector = qa.IssueCollector()
     assert not qa.validate_realtime_item_audit_queue(state, "pkg_s00000_p000", state_path, collector, "T4")
     assert any(issue["issue_type"] == "cue_realtime_item_queue_raw_content" for issue in collector.issues)
+
+
+def test_wave_audit_gate_accepts_nonblocking_audit_state_but_blocks_final_gate(tmp_path: Path) -> None:
+    """Wave 可继续时仍须把逐项审计和遗留整包隔离留在最终阻断门。"""
+
+    qa = load_validator()
+    packages = tmp_path / "wave_01" / "packages"
+    audited = packages / "pkg_s00000_p002"
+    audited.mkdir(parents=True)
+    audited_state = {
+        "package_id": audited.name,
+        "status": "needs_item_audit",
+        "unresolved_item_count": 1,
+        "item_outcomes": {"validated_success": 4, "audit": 1},
+    }
+    (audited / "realtime_state.json").write_text(json.dumps(audited_state), encoding="utf-8")
+    audit_row = {
+        "atom_id": "src_SYNTH_DAY1_000001", "item_index": 0, "code": "JSON_PARSE",
+        "path": "/", "attempt": 1, "request_identity": "rt_pkg_s00000_p002_aaaaaaaaaa",
+        "package_id": audited.name, "raw_response_saved": False,
+    }
+    (audited / "item_audit_queue.jsonl").write_text(json.dumps(audit_row) + "\n", encoding="utf-8")
+    quarantined = packages / "pkg_s00000_p003"
+    quarantined.mkdir()
+    quarantine_state = {
+        "package_id": quarantined.name,
+        "status": "local_validation_quarantine",
+        "unresolved_item_count": 0,
+        "item_outcomes": {},
+    }
+    (quarantined / "realtime_state.json").write_text(json.dumps(quarantine_state), encoding="utf-8")
+    collector = qa.IssueCollector()
+    assert not qa.validate_realtime_wave_package_audits(packages.parent, collector, "T4")
+    issue_types = {issue["issue_type"] for issue in collector.issues}
+    assert "cue_realtime_item_audit_unresolved" in issue_types
+    assert "cue_realtime_package_quarantine" in issue_types
 
 
 def test_cue_v30_rejects_tampered_package_mapping_and_raw_content(tmp_path: Path) -> None:

@@ -216,6 +216,7 @@ REALTIME_PROGRESS_REQUIRED_FIELDS = {
     "completed_packages",
     "validated_success_packages",
     "local_validation_quarantine_packages",
+    "needs_item_audit_packages",
     "service_transport_exhausted_packages",
     "budget_stopped_packages",
     "in_flight_packages",
@@ -1128,7 +1129,7 @@ def validate_realtime_progress_snapshot(
         valid = False
     numeric_fields = REALTIME_PROGRESS_REQUIRED_FIELDS.intersection({
         "total_packages", "completed_packages", "validated_success_packages",
-        "local_validation_quarantine_packages", "service_transport_exhausted_packages",
+        "local_validation_quarantine_packages", "needs_item_audit_packages", "service_transport_exhausted_packages",
         "budget_stopped_packages", "in_flight_packages",
     })
     for field in numeric_fields:
@@ -1140,7 +1141,7 @@ def validate_realtime_progress_snapshot(
         collector.add("BLOCKER", "cue_realtime_progress_inflight", str(path), "最多 10 个在飞 package", repr(progress.get("in_flight_packages")), owner)
         valid = False
     terminal_count = sum(progress[field] for field in (
-        "validated_success_packages", "local_validation_quarantine_packages",
+        "validated_success_packages", "local_validation_quarantine_packages", "needs_item_audit_packages",
         "service_transport_exhausted_packages", "budget_stopped_packages",
     ) if isinstance(progress.get(field), int) and not isinstance(progress.get(field), bool))
     if terminal_count != progress["completed_packages"] or progress["completed_packages"] + progress["in_flight_packages"] > progress["total_packages"]:
@@ -1149,6 +1150,46 @@ def validate_realtime_progress_snapshot(
     if progress["status"] != "completed" or progress["in_flight_packages"] != 0 or progress["completed_packages"] != progress["total_packages"]:
         collector.add("BLOCKER", "cue_realtime_progress_terminal", str(path), "completed、零在飞且全部 package 已终结", repr(progress), owner)
         valid = False
+    return valid
+
+
+def validate_realtime_wave_package_audits(directory: Path, collector: IssueCollector, owner: str) -> bool:
+    """检查 Wave 内逐项审计与遗留整包隔离，二者均不可穿透 Cue SUCCESS。
+
+    输入为一个 Wave 的 `packages/` 无正文状态目录；输出为最终门是否仍可通过。
+    逐项审计是第 05 步继续调度的非阻断状态，故本函数不把它解释为 Wave 停止；
+    但第 11 步必须明确拒绝任何未解决队列或旧式整包本地隔离，避免它们被误写为
+    正式 Cue library。
+    """
+
+    package_root = directory / "packages"
+    if not package_root.is_dir():
+        collector.add("BLOCKER", "cue_realtime_wave_packages_missing", str(package_root), "最终 Wave 具有 package 无正文状态目录", "不存在", owner)
+        return False
+    valid = True
+    for package_dir in sorted(path for path in package_root.iterdir() if path.is_dir()):
+        state_path = package_dir / "realtime_state.json"
+        state = load_json(state_path, collector, "cue_realtime_package_state", owner)
+        if state is None:
+            valid = False
+            continue
+        if has_forbidden_realtime_content(state):
+            collector.add("BLOCKER", "cue_realtime_raw_content", str(state_path), "无请求/响应/错误正文", "发现正文键", owner)
+            valid = False
+            continue
+        package_id = state.get("package_id")
+        if not isinstance(package_id, str) or package_id != package_dir.name:
+            collector.add("BLOCKER", "cue_realtime_wave_package_identity", str(state_path), "package_id 与目录名一致", repr(package_id), owner)
+            valid = False
+            continue
+        status = state.get("status")
+        if status == "local_validation_quarantine":
+            collector.add("BLOCKER", "cue_realtime_package_quarantine", str(state_path), "整包隔离必须展开为逐项审计或经人工关闭", repr(status), owner)
+            valid = False
+        if status == "needs_item_audit" and state.get("unresolved_item_count", 0) == 0:
+            collector.add("BLOCKER", "cue_realtime_item_state", str(state_path), "needs_item_audit 必须对应未解决项", repr(state), owner)
+            valid = False
+        valid = validate_realtime_item_audit_queue(state, package_id, state_path, collector, owner) and valid
     return valid
 
 
@@ -1175,6 +1216,7 @@ def validate_all_realtime_waves(root: Path, layout: dict[str, Any], policy: dict
         valid = validate_realtime_progress_snapshot(progress, state, policy, collector, owner, directory / str(layout["progress_filename"])) and valid
         if state.get("status") != "completed":
             collector.add("BLOCKER", "cue_realtime_wave_terminal", str(directory), "completed", repr(state.get("status")), owner); valid = False
+        valid = validate_realtime_wave_package_audits(directory, collector, owner) and valid
         tasks = progress.get("wave_task_indexes")
         if isinstance(tasks, list):
             overlap = seen_tasks.intersection(tasks)

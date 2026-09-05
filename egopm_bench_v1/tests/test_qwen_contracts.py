@@ -123,8 +123,8 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
         (json.dumps({"items": [{"n": 0, "p": [["A", "=", "活动"]], "f": "V", "start": 0, "end": 999, "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE", "/items/0/end"),
     ],
 )
-def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
-    """已计费的本地失败必须落盘固定类别/路径，且诊断不含模型输出正文。"""
+def test_local_validation_failure_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
+    """本地失败必须逐项审计，且状态与队列不含模型输出正文。"""
     value = module(); settings, policy, manifest, rows = setup(value)
 
     class Invalid:
@@ -134,20 +134,63 @@ def test_local_validation_quarantine_records_safe_category_only(tmp_path: Path, 
     root = tmp_path / "realtime"
     result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, Invalid(), root, 1.0, *buckets(value, policy))
     state = json.loads((root / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8"))
-    expected_status = "local_validation_quarantine" if payload == "{" else "needs_item_audit"
-    assert result[0] == expected_status
-    if payload == "{":
-        assert result[2]["local_validation_failure"] == {"code": expected_code, "path": expected_path}
-        assert state["local_validation_failure"] == {"code": expected_code, "path": expected_path}
-    else:
-        queue = list(value.iter_jsonl(root / "packages" / manifest["package_id"] / "item_audit_queue.jsonl"))
-        assert queue == [{"atom_id": "src_a_001", "item_index": 0, "code": expected_code, "path": expected_path,
-                          "attempt": 2, "request_identity": queue[0]["request_identity"], "package_id": manifest["package_id"], "raw_response_saved": False}]
+    assert result[0] == "needs_item_audit"
+    queue = list(value.iter_jsonl(root / "packages" / manifest["package_id"] / "item_audit_queue.jsonl"))
+    assert queue == [{"atom_id": "src_a_001", "item_index": 0, "code": expected_code, "path": expected_path,
+                      "attempt": 2, "request_identity": queue[0]["request_identity"], "package_id": manifest["package_id"], "raw_response_saved": False}]
     persisted = json.dumps(state, ensure_ascii=False)
     assert "choices" not in persisted and "message" not in persisted
     if payload != "{":
         assert payload not in persisted
     value.validate_realtime_ledger_event(result[2])
+
+
+def test_json_parse_repairs_each_known_atom_without_replaying_package(tmp_path: Path) -> None:
+    """整包 JSON 解析失败要把两个已知 Atom 分别修复，修复成功后不留审计队列。"""
+    value = module(); settings, policy, _manifest, rows = setup(value)
+    second = atom(2); rows[second["atom_id"]] = second
+    manifest = value.realtime_manifest(value.package_manifest([rows["src_a_001"], second], "source", "protocol", "synthetic", 0, 0))
+
+    class ParseThenRepair:
+        calls = 0
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {"choices": [{"message": {"content": "{" if self.calls == 1 else response()["choices"][0]["message"]["content"]}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+
+    root = tmp_path / "realtime"; transport = ParseThenRepair(); tracker = value.BudgetTracker(1.0)
+    result = value.execute_realtime_package(
+        manifest, rows, "p", {"type": "object"}, settings, policy, transport, root, 1.0,
+        *buckets(value, policy), budget_tracker=tracker,
+    )
+    package_dir = root / "packages" / manifest["package_id"]
+    saved = list(value.iter_jsonl(package_dir / f"{manifest['package_id']}.result.jsonl"))
+    assert result[0] == "validated_success" and transport.calls == 3
+    assert [cue["atom_id"] for cue in saved] == ["src_a_001", "src_a_002"]
+    assert result[2]["usage"] == {"prompt_tokens": 30, "completion_tokens": 30, "total_tokens": 60}
+    assert tracker.spent_cny() == pytest.approx(value.realtime_usage_cost(result[2]["usage"], policy))
+    assert not (package_dir / "item_audit_queue.jsonl").exists()
+    assert "choices" not in (package_dir / "realtime_state.json").read_text(encoding="utf-8")
+
+
+def test_repair_usage_crossing_budget_stops_before_later_repairs(tmp_path: Path) -> None:
+    """首轮已计费后，第一项 repair 越过预算时不得继续发送后续修复请求。"""
+    value = module(); settings, policy, _manifest, rows = setup(value)
+
+    class ParseThenCost:
+        calls = 0
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            self.calls += 1
+            return {"choices": [{"message": {"content": "{" if self.calls == 1 else json.dumps({"items": []})}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20}}
+
+    tracker = value.BudgetTracker(0.000015)
+    result = value.execute_realtime_package(
+        _manifest, rows, "p", {"type": "object"}, settings, policy, ParseThenCost(), tmp_path / "realtime", 0.000015,
+        *buckets(value, policy), budget_tracker=tracker,
+    )
+    assert result[0] == "budget_stopped" and result[2]["usage"] == {"prompt_tokens": 20, "completion_tokens": 20, "total_tokens": 40}
+    assert tracker.spent_cny() > tracker.maximum_cny
 
 
 def test_http_400_has_safe_diagnostic_without_raw_body() -> None:
@@ -365,6 +408,35 @@ def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_
     assert result["outcomes"] == {"needs_item_audit": 1, "validated_success": 1}
     assert (progress["status"], progress["completed_packages"], progress["validated_success_packages"], progress["needs_item_audit_packages"]) == ("needs_item_audit", 2, 1, 1)
     assert [event["realtime_request_id"] for event in events].count(first["realtime_request_id"]) == 1
+
+
+def test_legacy_json_parse_quarantine_migrates_to_item_audit_without_transport(tmp_path: Path) -> None:
+    """v8 旧 JSON_PARSE 隔离仅生成安全审计项，恢复时不得重新调用服务。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    root = tmp_path / "realtime"; package_dir = root / "packages" / manifest["package_id"]
+    state = {
+        "run_id": manifest["run_id"], "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"],
+        "package_id": manifest["package_id"], "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+        "status": "local_validation_quarantine", "local_validation_failure": {"code": "JSON_PARSE", "path": "/"}, "raw_response_saved": False,
+    }
+    value.atomic_write_json(package_dir / "realtime_state.json", state)
+    value.atomic_write_json(package_dir / f"{manifest['package_id']}.failed.json", {
+        "package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine",
+        "local_validation_failure": {"code": "JSON_PARSE", "path": "/"}, "raw_response_saved": False,
+    })
+    assert value.migrate_legacy_json_parse_quarantine(manifest, root, settings) is True
+    queue = list(value.iter_jsonl(package_dir / "item_audit_queue.jsonl"))
+    assert queue[0]["code"] == "JSON_PARSE" and queue[0]["attempt"] == 1 and queue[0]["raw_response_saved"] is False
+    assert value.realtime_recovery_terminal_status(manifest, root, settings) == "needs_item_audit_from_quarantine"
+
+    class MustNotCall:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            raise AssertionError("旧隔离不得重发")
+
+    assert value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, MustNotCall(), root, 1.0, *buckets(value, policy)) == (
+        "recovered_item_audit", 0.0, {"outcome": "recovered_item_audit"},
+    )
 
 
 def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> None:

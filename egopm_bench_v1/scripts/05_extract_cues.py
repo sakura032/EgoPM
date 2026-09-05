@@ -1021,6 +1021,67 @@ def safe_item_failures(manifest: dict[str, Any], failures: list[dict[str, Any]],
     return records
 
 
+def repair_realtime_item_failures(
+    manifest: dict[str, Any], atoms: list[dict[str, Any]], failures: list[dict[str, Any]], prompt: str,
+    schema: dict[str, Any], inference_schema: dict[str, Any], cue_validator: jsonschema.Draft202012Validator,
+    settings: Settings, policy: RealtimePolicy, transport: RealtimeTransport, request_bucket: TokenBucket,
+    token_bucket: TokenBucket, budget_remaining_cny: float, budget_tracker: BudgetTracker | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int | None], float, bool]:
+    """对已知失败 Atom 各作一次单项修复，输出通过 Cue 与无正文审计记录。
+
+    输入是首轮解析后可确定归属的失败项（整包 JSON 不能解析时即为该包全部 Atom）；输出
+    不保留任何模型正文。它位于第 05 阶段的恢复边界，保证修复请求不会重新支付同包
+    已合格项的成本，且每个 Atom 在本次执行中至多得到一次单项请求机会。
+    """
+
+    repaired_cues: list[dict[str, Any]] = []
+    unresolved: list[dict[str, Any]] = []
+    repair_usages: list[dict[str, int | None]] = []
+    repair_charged = 0.0
+    within_budget = True
+    for failure in failures:
+        if not within_budget:
+            # 费用一旦越界，后续 Atom 不得再发送 repair；其身份仍留在安全审计队列。
+            unresolved.extend(safe_item_failures(manifest, [failure], "rt_budget_stop", 1))
+            continue
+        item_index = int(failure["item_index"])
+        repair_identity = f"rt_repair_{manifest['package_id']}_{item_index}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': item_index, 'request_sha256': manifest['request_sha256']})[:10]}"
+        repair_atom = atoms[item_index]
+        repair_body = build_request(prompt + "\n仅修复这一个 items[0]；必须返回 n=0。", schema, [repair_atom], settings)
+        try:
+            # repair 同样是实际 API 调用，必须占用同一 RPM/TPM 桶，不能绕过十并发外的
+            # 全局限流约束；预留值按单 Atom 请求体与输出上界计算。
+            request_bucket.acquire(1)
+            token_bucket.acquire(settings.output_tokens_per_atom + max(1, len(json.dumps(repair_body, ensure_ascii=False).encode("utf-8")) // 4))
+            repair_response = transport.complete(repair_body, policy)
+            repair_usage = normalise_usage(repair_response)
+            repair_cost = realtime_usage_cost(repair_usage, policy)
+            repair_usages.append(repair_usage)
+            repair_charged += repair_cost
+            if budget_tracker is not None:
+                within_budget, _ = budget_tracker.record_charge(repair_cost)
+            else:
+                within_budget = repair_charged <= budget_remaining_cny
+            repair_content = repair_response.get("choices", [{}])[0].get("message", {}).get("content")
+            if not isinstance(repair_content, str):
+                raise LocalValidationError("RESPONSE_STRUCTURE", "/choices/0/message/content")
+            repair_parsed = json.loads(repair_content)
+            if not isinstance(repair_parsed, dict):
+                raise LocalValidationError("RESPONSE_ROOT_NOT_OBJECT", "/")
+            repaired, repair_failures = parse_realtime_items_independently(
+                repair_parsed, [repair_atom], inference_schema, cue_validator, settings, manifest["run_id"],
+            )
+            repaired_cues.extend(repaired)
+            if repair_failures:
+                unresolved.extend(safe_item_failures(
+                    manifest, [{**entry, "item_index": item_index, "atom_id": repair_atom["atom_id"]} for entry in repair_failures],
+                    repair_identity, 2,
+                ))
+        except (RealtimeServiceError, LocalValidationError, json.JSONDecodeError, KeyError, IndexError, TypeError):
+            unresolved.extend(safe_item_failures(manifest, [failure], repair_identity, 2))
+    return repaired_cues, unresolved, add_realtime_usage(*repair_usages), repair_charged, within_budget
+
+
 def preflight_report(manifests: list[dict[str, Any]], atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any], settings: Settings, protocol_sha256: str) -> dict[str, Any]:
     """核算内存中的 Batch 行与任务文件；默认不创建目录、不读密钥、不访问网络。"""
 
@@ -1131,6 +1192,15 @@ def normalise_usage(response: dict[str, Any]) -> dict[str, int | None]:
     if not all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in values.values()):
         return empty
     return values if values["prompt_tokens"] + values["completion_tokens"] == values["total_tokens"] else empty
+
+
+def add_realtime_usage(*usages: dict[str, int | None]) -> dict[str, int | None]:
+    """合并同一 package 的首轮与单项修复 usage，缺项时保持不可计费状态。"""
+
+    keys = ("prompt_tokens", "completion_tokens", "total_tokens")
+    if any(not isinstance(usage.get(key), int) for usage in usages for key in keys):
+        return {key: None for key in keys}
+    return {key: sum(int(usage[key]) for usage in usages) for key in keys}
 
 
 class RealtimeTransport:
@@ -1284,6 +1354,36 @@ def realtime_package_state_path(run_root: Path, manifest: dict[str, Any]) -> Pat
     return run_root / "packages" / str(manifest["package_id"]) / "realtime_state.json"
 
 
+def migrate_legacy_json_parse_quarantine(manifest: dict[str, Any], run_root: Path, settings: Settings) -> bool:
+    """把 v8 已落盘的整包 JSON 解析隔离迁移为逐项无正文审计，不发起修复请求。
+
+    输入是既有失败标记与冻结 package 清单；输出表示是否完成迁移。它只接受严格的
+    `JSON_PARSE` 终态，并原子创建由清单 Atom 推导的审计队列；因此旧请求绝不会被重发，
+    同时后续 Wave 可明确看到需要人工/二级模型审计的每个 Atom。
+    """
+
+    state_path = realtime_package_state_path(run_root, manifest)
+    files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
+    if not state_path.is_file():
+        return False
+    state = read_json(state_path)
+    diagnostic = state.get("local_validation_failure")
+    if state.get("status") != "local_validation_quarantine" or diagnostic != {"code": "JSON_PARSE", "path": "/"}:
+        return False
+    failed = read_json(files["failed"])
+    if failed.get("outcome") != "local_validation_quarantine" or failed.get("local_validation_failure") != diagnostic or failed.get("raw_response_saved") is not False:
+        raise ContractError("旧 JSON 解析隔离失败标记不匹配；禁止自动重发")
+    failures = [{"atom_id": atom["atom_id"], "item_index": index, "code": "JSON_PARSE", "path": "/"}
+                for index, atom in enumerate(manifest["atoms"])]
+    request_identity = f"rt_legacy_json_parse_audit_{manifest['package_id']}_{canonical_sha256(manifest['request_sha256'])[:10]}"
+    queue = safe_item_failures(manifest, failures, request_identity, 1)
+    atomic_write_jsonl(state_path.parent / "item_audit_queue.jsonl", queue)
+    atomic_write_json(state_path, {**state, "status": "needs_item_audit", "legacy_local_validation_quarantine": diagnostic,
+        "item_outcomes": {"accepted_or_rejected": 0, "unresolved": len(queue)}, "unresolved_item_count": len(queue),
+        "raw_response_saved": False})
+    return True
+
+
 def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, settings: Settings) -> str | None:
     """离线识别可恢复终态，确保本地隔离包绝不再次进入 transport。
 
@@ -1314,7 +1414,7 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
         queue = state_path.parent / "item_audit_queue.jsonl"
         if not queue.is_file() or not isinstance(state.get("unresolved_item_count"), int) or state["unresolved_item_count"] <= 0:
             raise ContractError("实时逐项审计状态缺少无正文队列；禁止自动重发")
-        return "needs_item_audit"
+        return "needs_item_audit_from_quarantine" if state.get("legacy_local_validation_quarantine") == {"code": "JSON_PARSE", "path": "/"} else "needs_item_audit"
     diagnostic = state.get("local_validation_failure")
     if (
         not isinstance(diagnostic, dict) or set(diagnostic) != {"code", "path"}
@@ -1348,7 +1448,7 @@ def require_accounted_realtime_terminal(manifest: dict[str, Any], status: str, e
         raise ContractError("实时恢复终态缺少累计无正文账本事件；禁止自动重发")
     validate_realtime_ledger_event(event)
     expected = {
-        "outcome": status, "package_id": manifest["package_id"],
+        "outcome": "local_validation_quarantine" if status == "needs_item_audit_from_quarantine" else status, "package_id": manifest["package_id"],
         "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
         "transport": "realtime_chat_completions", "source_atoms_sha256": manifest["source_atoms_sha256"],
         "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
@@ -1448,8 +1548,9 @@ def execute_realtime_package(
     files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
     if is_complete(manifest, files):
         return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
+    migrate_legacy_json_parse_quarantine(manifest, run_root, settings)
     recovered_terminal = realtime_recovery_terminal_status(manifest, run_root, settings)
-    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit"}:
+    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit", "needs_item_audit_from_quarantine"}:
         # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
         # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
         return "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit", 0.0, {"outcome": "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit"}
@@ -1514,38 +1615,30 @@ def execute_realtime_package(
                 queue_path = state_path.parent / "item_audit_queue.jsonl"
                 # 每个失败 Atom 只有一次、只含该 Atom 的 repair 请求；请求身份不含字幕或
                 # 原始模型内容，且落盘前已绑定 package、下标和初始请求身份。
-                repaired_cues: list[dict[str, Any]] = []
-                unresolved: list[dict[str, Any]] = []
-                for failure in failures:
-                    item_index = int(failure["item_index"])
-                    repair_identity = f"rt_repair_{manifest['package_id']}_{item_index}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': item_index, 'request_sha256': manifest['request_sha256']})[:10]}"
-                    repair_atom = atoms[item_index]
-                    repair_body = build_request(prompt + "\n仅修复这一个 items[0]；必须返回 n=0。", schema, [repair_atom], settings)
-                    try:
-                        repair_response = transport.complete(repair_body, policy)
-                        repair_content = repair_response.get("choices", [{}])[0].get("message", {}).get("content")
-                        if not isinstance(repair_content, str):
-                            raise LocalValidationError("RESPONSE_STRUCTURE", "/choices/0/message/content")
-                        repair_parsed = json.loads(repair_content)
-                        if not isinstance(repair_parsed, dict):
-                            raise LocalValidationError("RESPONSE_ROOT_NOT_OBJECT", "/")
-                        repaired, repair_failures = parse_realtime_items_independently(
-                            repair_parsed, [repair_atom], inference_schema, load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, manifest["run_id"],
-                        )
-                        repaired_cues.extend(repaired)
-                        if repair_failures:
-                            unresolved.extend(safe_item_failures(manifest, [{**entry, "item_index": item_index, "atom_id": repair_atom["atom_id"]} for entry in repair_failures], repair_identity, 2))
-                    except (RealtimeServiceError, LocalValidationError, json.JSONDecodeError, KeyError, IndexError, TypeError):
-                        unresolved.extend(safe_item_failures(manifest, [failure], repair_identity, 2))
+                repaired_cues, unresolved, repair_usage, repair_charged, repairs_within_budget = repair_realtime_item_failures(
+                    manifest, atoms, failures, prompt, schema, inference_schema,
+                    load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, policy, transport, request_bucket,
+                    token_bucket, max(0.0, budget_remaining_cny - charged), budget_tracker,
+                )
+                usage = add_realtime_usage(usage, repair_usage)
+                charged += repair_charged
+                event = realtime_ledger_event(manifest, "validated_success", attempts, usage)
+                atomic_write_jsonl(files["ledger"], [event])
                 if repaired_cues:
                     atomic_write_jsonl(files["result"], cues + repaired_cues)
+                if not repairs_within_budget:
+                    event = realtime_ledger_event(manifest, "budget_stopped", attempts, usage, "post_repair_budget_exceeded")
+                    atomic_write_jsonl(files["ledger"], [event])
+                    atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts,
+                        "raw_response_saved": False})
+                    return "budget_stopped", charged, event
                 if unresolved:
                     atomic_write_jsonl(queue_path, unresolved)
                     atomic_write_json(state_path, {**read_json(state_path), "status": "needs_item_audit", "retry_count": attempts,
                         "item_outcomes": {"accepted_or_rejected": len(cues) + len(repaired_cues), "unresolved": len(unresolved)},
                         "unresolved_item_count": len(unresolved), "raw_response_saved": False})
+                    event = realtime_ledger_event(manifest, "needs_item_audit", attempts, usage)
                     event["item_failures"] = unresolved
-                    event["outcome"] = "needs_item_audit"
                     atomic_write_jsonl(files["ledger"], [event])
                     return "needs_item_audit", charged, event
             atomic_write_json(state_path, {**read_json(state_path), "status": "validated_success", "retry_count": attempts})
@@ -1558,13 +1651,61 @@ def execute_realtime_package(
             })
             return "validated_success", charged, event
         except LocalValidationError as error:
-            # 本地验证失败不等于服务端未计费：若 usage 完整，仍须写入共同预算账本，然后
-            # 立即隔离并停止，不能把一次已发生调用误报为零成本。
+            # 整包 JSON 无法解析时仍可从冻结清单确定全部 Atom 身份；将其展开为单项
+            # 修复，而非整包隔离。其他本地失败没有可靠的逐项归属，保持安全隔离。
             usage = normalise_usage(response)
             charged = realtime_usage_cost(usage, policy) if all(isinstance(usage.get(key), int) for key in ("prompt_tokens", "completion_tokens")) else 0.0
+            within_budget = charged <= budget_remaining_cny
             if budget_tracker is not None:
-                budget_tracker.record_charge(charged)
+                within_budget, _ = budget_tracker.record_charge(charged)
             diagnostic = {"code": error.code, "path": error.path}
+            if error.code == "JSON_PARSE":
+                if not within_budget:
+                    event = realtime_ledger_event(manifest, "budget_stopped", attempts, usage, "post_response_budget_exceeded")
+                    atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts,
+                        "raw_response_saved": False})
+                    return "budget_stopped", charged, event
+                failures = [{"atom_id": atom["atom_id"], "item_index": index, "code": error.code, "path": error.path}
+                            for index, atom in enumerate(atoms)]
+                event = realtime_ledger_event(manifest, "validated_success", attempts, usage)
+                atomic_write_jsonl(files["manifest"], [manifest])
+                atomic_write_jsonl(files["result"], [])
+                atomic_write_jsonl(files["ledger"], [event])
+                repaired_cues, unresolved, repair_usage, repair_charged, repairs_within_budget = repair_realtime_item_failures(
+                    manifest, atoms, failures, prompt, schema, read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"),
+                    load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, policy, transport, request_bucket,
+                    token_bucket, max(0.0, budget_remaining_cny - charged), budget_tracker,
+                )
+                usage = add_realtime_usage(usage, repair_usage)
+                charged += repair_charged
+                event = realtime_ledger_event(manifest, "validated_success", attempts, usage)
+                atomic_write_jsonl(files["ledger"], [event])
+                if repaired_cues:
+                    atomic_write_jsonl(files["result"], repaired_cues)
+                if not repairs_within_budget:
+                    event = realtime_ledger_event(manifest, "budget_stopped", attempts, usage, "post_repair_budget_exceeded")
+                    atomic_write_jsonl(files["ledger"], [event])
+                    atomic_write_json(state_path, {**read_json(state_path), "status": "budget_stopped", "retry_count": attempts,
+                        "raw_response_saved": False})
+                    return "budget_stopped", charged, event
+                if unresolved:
+                    atomic_write_jsonl(state_path.parent / "item_audit_queue.jsonl", unresolved)
+                    atomic_write_json(state_path, {**read_json(state_path), "status": "needs_item_audit", "retry_count": attempts,
+                        "item_outcomes": {"accepted_or_rejected": len(repaired_cues), "unresolved": len(unresolved)},
+                        "unresolved_item_count": len(unresolved), "raw_response_saved": False})
+                    event = realtime_ledger_event(manifest, "needs_item_audit", attempts, usage)
+                    event["item_failures"] = unresolved
+                    atomic_write_jsonl(files["ledger"], [event])
+                    return "needs_item_audit", charged, event
+                atomic_write_json(state_path, {**read_json(state_path), "status": "validated_success", "retry_count": attempts})
+                atomic_write_json(files["complete"], {
+                    "run_id": manifest["run_id"], "package_id": manifest["package_id"], "transport": "realtime_chat_completions",
+                    "realtime_shard_index": manifest["realtime_shard_index"], "request_sha256": manifest["request_sha256"], "status": "validated_success",
+                    "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+                    "input_manifest_sha256": sha256_file(files["manifest"]), "result_sha256": sha256_file(files["result"]),
+                    "ledger_sha256": sha256_file(files["ledger"]), "state_sha256": sha256_file(state_path), "completed_at": utc_now(),
+                })
+                return "validated_success", charged, event
             event = realtime_ledger_event(manifest, "local_validation_quarantine", attempts, usage, "local_validation", local_validation_failure=diagnostic)
             atomic_write_json(files["failed"], {"package_id": manifest["package_id"], "transport": "realtime_chat_completions", "outcome": "local_validation_quarantine", "local_validation_failure": diagnostic, "raw_response_saved": False})
             atomic_write_json(state_path, {**read_json(state_path), "status": "local_validation_quarantine", "retry_count": attempts, "local_validation_failure": diagnostic})
@@ -1920,13 +2061,15 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     completed = 0
     remaining_manifests: list[dict[str, Any]] = []
     for manifest in manifests:
+        migrate_legacy_json_parse_quarantine(manifest, wave_root, settings)
         recovered_status = realtime_recovery_terminal_status(manifest, wave_root, settings)
         if recovered_status is None:
             remaining_manifests.append(manifest)
             continue
         require_accounted_realtime_terminal(manifest, recovered_status, cumulative_events)
         completed += 1
-        outcomes[recovered_status] = outcomes.get(recovered_status, 0) + 1
+        outcome_status = "needs_item_audit" if recovered_status == "needs_item_audit_from_quarantine" else recovered_status
+        outcomes[outcome_status] = outcomes.get(outcome_status, 0) + 1
     # 只为尚未请求的 package 预留预算；已在账本中的成功或隔离调用不能被重复预留，
     # 否则一次安全恢复会被错误阻断，也会掩盖真实的剩余授权。
     predicted = 0.0
@@ -1936,6 +2079,13 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         output_upper = settings.output_tokens_per_atom * len(package_atoms)
         predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
         predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
+        # 逐项恢复至多各一次，故在首次联网前把最坏 repair 输入/输出一并预留；否则
+        # 首轮虽在授权内，多个并发包的修复仍可能把总额推过 ¥80。
+        repair_prompt = prompt + "\n仅修复这一个 items[0]；必须返回 n=0。"
+        for repair_atom in package_atoms:
+            repair_input_proxy = max(1, request_utf8_bytes(repair_prompt, schema, [repair_atom], settings) // 4)
+            predicted += repair_input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
+            predicted += settings.output_tokens_per_atom * policy.output_price_cny_per_million_tokens / 1_000_000
     if predicted > budget.maximum_cny - budget.spent_cny():
         raise ContractError("当前波输出 token 上界已超过实时全局剩余授权预算；未读取密钥或联网")
     initialise_realtime_run(preflight, wave_root, settings, authorization)
