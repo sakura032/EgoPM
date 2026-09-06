@@ -1048,19 +1048,147 @@ def safe_item_failures(manifest: dict[str, Any], failures: list[dict[str, Any]],
     return records
 
 
+def second_repair_candidates(manifest: dict[str, Any], run_root: Path, settings: Settings) -> list[dict[str, Any]]:
+    """读取已完成首轮修复的无正文条目，作为第二次且最后一次单 Atom 修复输入。
+
+    输入是冻结 package 与安全审计队列；输出仅保留 `attempt=2` 的安全字段，拒绝
+    身份不一致或超过次数的记录，防止恢复路径重发已终态的 Atom。
+    """
+
+    state_path = realtime_package_state_path(run_root, manifest)
+    queue_path = state_path.parent / "item_audit_queue.jsonl"
+    if not queue_path.is_file():
+        raise ContractError("第二次逐项修复缺少无正文审计队列")
+    atom_ids = [atom["atom_id"] for atom in manifest["atoms"]]
+    candidates: list[dict[str, Any]] = []
+    for entry in read_jsonl(queue_path):
+        index = entry.get("item_index")
+        if (
+            not isinstance(index, int) or not 0 <= index < len(atom_ids)
+            or entry.get("atom_id") != atom_ids[index] or entry.get("package_id") != manifest["package_id"]
+            or not isinstance(entry.get("code"), str) or not isinstance(entry.get("path"), str)
+            or not isinstance(entry.get("request_identity"), str) or entry.get("raw_response_saved") is not False
+            or not isinstance(entry.get("attempt"), int)
+        ):
+            raise ContractError("第二次逐项修复队列不是可安全重放的无正文记录")
+        if entry["attempt"] == 2:
+            candidates.append({"atom_id": entry["atom_id"], "item_index": index,
+                               "code": entry["code"], "path": entry["path"]})
+        elif entry["attempt"] > 2:
+            raise ContractError("审计项已达到第二次修复上限；禁止再次发送")
+        else:
+            raise ContractError("审计项尚未完成首轮修复；禁止跳过次数")
+    if not candidates:
+        raise ContractError("逐项审计队列没有可执行的第二次修复")
+    return candidates
+
+
+def wave_coverage_disposition_path(run_root: Path) -> Path:
+    """返回 Wave 逐 Atom 覆盖账本路径；该账本只保存终态身份和安全诊断。"""
+
+    return run_root / "coverage_disposition.jsonl"
+
+
+def close_repaired_item_audits(
+    manifests: list[dict[str, Any]], run_root: Path, settings: Settings,
+) -> dict[str, int]:
+    """把已完成一次单 Atom 修复的审计项离线闭合为覆盖终态。
+
+    输入是冻结清单和本 Wave 已落盘的片段；输出是 `accepted_cue` 与
+    `excluded_after_repair` 的计数。它不读取或重放模型正文：通过项仅由已经严格
+    验证的结果片段识别，失败项仅继承既有安全错误码和 JSON 路径。每个 Atom 恰写
+    一条覆盖记录，故未通过项不会进入正式 Cue 库，也不会无限阻断后续 Wave。
+    """
+
+    records: list[dict[str, Any]] = []
+    for manifest in manifests:
+        files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
+        state_path = realtime_package_state_path(run_root, manifest)
+        if not state_path.is_file() or not files["manifest"].is_file() or not files["result"].is_file():
+            raise ContractError("覆盖闭合缺少 package 状态、清单或验证结果；禁止猜测终态")
+        if read_jsonl(files["manifest"]) != [manifest]:
+            raise ContractError("覆盖闭合的 package 清单身份不匹配")
+        state = read_json(state_path)
+        if state.get("status") not in {"validated_success", "needs_item_audit", "excluded_after_repair"}:
+            raise ContractError("覆盖闭合遇到未终结 package；不得将其排除")
+        accepted_ids: set[str] = set()
+        for cue in read_jsonl(files["result"]):
+            atom_id = cue.get("atom_id")
+            if not isinstance(atom_id, str) or atom_id in accepted_ids:
+                raise ContractError("覆盖闭合发现结果 Atom 身份无效或重复")
+            accepted_ids.add(atom_id)
+        atom_ids = [str(atom["atom_id"]) for atom in manifest["atoms"]]
+        if not accepted_ids.issubset(set(atom_ids)):
+            raise ContractError("覆盖闭合发现结果跨出本 package Atom 范围")
+        failures_by_atom: dict[str, dict[str, Any]] = {}
+        queue_path = state_path.parent / "item_audit_queue.jsonl"
+        if state.get("status") in {"needs_item_audit", "excluded_after_repair"}:
+            if not queue_path.is_file():
+                raise ContractError("逐项审计终态缺少无正文队列；不得静默排除")
+            for failure in read_jsonl(queue_path):
+                atom_id = failure.get("atom_id")
+                if (
+                    not isinstance(atom_id, str) or atom_id in failures_by_atom or atom_id not in atom_ids
+                    or not isinstance(failure.get("item_index"), int) or not isinstance(failure.get("code"), str)
+                    or not isinstance(failure.get("path"), str) or not isinstance(failure.get("attempt"), int)
+                    or not isinstance(failure.get("request_identity"), str) or failure.get("raw_response_saved") is not False
+                ):
+                    raise ContractError("逐项审计队列不是可安全闭合的无正文记录")
+                failures_by_atom[atom_id] = failure
+        for index, atom_id in enumerate(atom_ids):
+            base = {
+                "run_id": manifest["run_id"], "package_id": manifest["package_id"], "item_index": index,
+                "atom_id": atom_id, "source_atoms_sha256": manifest["source_atoms_sha256"],
+                "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+                "raw_response_saved": False,
+            }
+            if atom_id in accepted_ids:
+                records.append({**base, "disposition": "accepted_cue", "code": None, "path": None,
+                                "attempt": None, "request_identity": manifest["realtime_request_id"]})
+            elif atom_id in failures_by_atom:
+                failure = failures_by_atom[atom_id]
+                records.append({**base, "disposition": "excluded_after_repair", "code": failure["code"],
+                                "path": failure["path"], "attempt": failure["attempt"],
+                                "request_identity": failure["request_identity"]})
+            else:
+                # 已通过结构/证据门但模型返回 R/N 的项不是 Cue；显式记录该安全终态，
+                # 使覆盖完整性不依赖“每个 Atom 必须生成 Cue”这一不现实假设。
+                records.append({**base, "disposition": "excluded_no_cue", "code": "MODEL_NON_ACCEPTED",
+                                "path": f"/items/{index}/v", "attempt": 1,
+                                "request_identity": manifest["realtime_request_id"]})
+        if state.get("status") in {"needs_item_audit", "excluded_after_repair"}:
+            # 覆盖账本先整体原子落盘，随后才把队列标为已处置；保留该安全标志可阻止
+            # 恢复路径把已经修复失败的 Atom 再次发往 API。
+            atomic_write_json(state_path, {**state, "status": "excluded_after_repair",
+                "unresolved_item_count": 0, "excluded_item_count": len(failures_by_atom),
+                "item_audit_resolved": True, "raw_response_saved": False})
+    if len({record["atom_id"] for record in records}) != len(records):
+        raise ContractError("覆盖账本出现重复 Atom，不能写入正式终态")
+    atomic_write_jsonl(wave_coverage_disposition_path(run_root), records)
+    return {
+        "accepted_cue": sum(record["disposition"] == "accepted_cue" for record in records),
+        "excluded_after_repair": sum(record["disposition"] == "excluded_after_repair" for record in records),
+        "excluded_no_cue": sum(record["disposition"] == "excluded_no_cue" for record in records),
+    }
+
+
 def repair_realtime_item_failures(
     manifest: dict[str, Any], atoms: list[dict[str, Any]], failures: list[dict[str, Any]], prompt: str,
     schema: dict[str, Any], inference_schema: dict[str, Any], cue_validator: jsonschema.Draft202012Validator,
     settings: Settings, policy: RealtimePolicy, transport: RealtimeTransport, request_bucket: TokenBucket,
     token_bucket: TokenBucket, budget_remaining_cny: float, budget_tracker: BudgetTracker | None,
+    repair_attempt: int = 2,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int | None], float, bool]:
     """对已知失败 Atom 各作一次单项修复，输出通过 Cue 与无正文审计记录。
 
     输入是首轮解析后可确定归属的失败项（整包 JSON 不能解析时即为该包全部 Atom）；输出
     不保留任何模型正文。它位于第 05 阶段的恢复边界，保证修复请求不会重新支付同包
-    已合格项的成本，且每个 Atom 在本次执行中至多得到一次单项请求机会。
+    已合格项的成本，且每个 Atom 在本次执行中至多得到一次单项请求机会。次数 2 与 3
+    分别代表首轮后的第一次和第二次（最后一次）修复。
     """
 
+    if repair_attempt not in {2, 3}:
+        raise ContractError("逐项修复次数必须是首轮后的第一次或第二次")
     repaired_cues: list[dict[str, Any]] = []
     unresolved: list[dict[str, Any]] = []
     repair_usages: list[dict[str, int | None]] = []
@@ -1069,10 +1197,10 @@ def repair_realtime_item_failures(
     for failure in failures:
         if not within_budget:
             # 费用一旦越界，后续 Atom 不得再发送 repair；其身份仍留在安全审计队列。
-            unresolved.extend(safe_item_failures(manifest, [failure], "rt_budget_stop", 1))
+            unresolved.extend(safe_item_failures(manifest, [failure], "rt_budget_stop", repair_attempt))
             continue
         item_index = int(failure["item_index"])
-        repair_identity = f"rt_repair_{manifest['package_id']}_{item_index}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': item_index, 'request_sha256': manifest['request_sha256']})[:10]}"
+        repair_identity = f"rt_repair_{repair_attempt}_{manifest['package_id']}_{item_index}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': item_index, 'request_sha256': manifest['request_sha256']})[:10]}"
         repair_atom = atoms[item_index]
         repair_body = build_request(prompt + "\n仅修复这一个 items[0]；必须返回 n=0。", schema, [repair_atom], settings)
         try:
@@ -1102,10 +1230,10 @@ def repair_realtime_item_failures(
             if repair_failures:
                 unresolved.extend(safe_item_failures(
                     manifest, [{**entry, "item_index": item_index, "atom_id": repair_atom["atom_id"]} for entry in repair_failures],
-                    repair_identity, 2,
+                    repair_identity, repair_attempt,
                 ))
         except (RealtimeServiceError, LocalValidationError, json.JSONDecodeError, KeyError, IndexError, TypeError):
-            unresolved.extend(safe_item_failures(manifest, [failure], repair_identity, 2))
+            unresolved.extend(safe_item_failures(manifest, [failure], repair_identity, repair_attempt))
     return repaired_cues, unresolved, add_realtime_usage(*repair_usages), repair_charged, within_budget
 
 
@@ -1426,7 +1554,7 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
     if not state_path.is_file():
         return None
     state = read_json(state_path)
-    if state.get("status") not in {"local_validation_quarantine", "needs_item_audit"}:
+    if state.get("status") not in {"local_validation_quarantine", "needs_item_audit", "excluded_after_repair"}:
         return None
     expected = {
         "run_id": manifest["run_id"], "transport": "realtime_chat_completions",
@@ -1444,6 +1572,12 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
         if state.get("unaccounted_usage_audit") is True:
             return "needs_item_audit_unaccounted"
         return "needs_item_audit_from_quarantine" if state.get("legacy_local_validation_quarantine") == {"code": "JSON_PARSE", "path": "/"} else "needs_item_audit"
+    if state.get("status") == "excluded_after_repair":
+        if not isinstance(state.get("unresolved_item_count"), int) or state["unresolved_item_count"] < 0 or state.get("item_audit_resolved") is not True:
+            raise ContractError("逐项排除终态缺少已处置证明；禁止自动重发")
+        # 覆盖账本由 Wave 全部 package 终态后统一原子生成；它尚未出现时只能安全跳过，
+        # 不能把已经执行第二次修复的 Atom 误判为可重发。
+        return "excluded_after_repair"
     diagnostic = state.get("local_validation_failure")
     if (
         not isinstance(diagnostic, dict) or set(diagnostic) != {"code", "path"}
@@ -1482,6 +1616,12 @@ def require_accounted_realtime_terminal(manifest: dict[str, Any], status: str, e
         "transport": "realtime_chat_completions", "source_atoms_sha256": manifest["source_atoms_sha256"],
         "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
     }
+    # 已完成的 v9 单项修复在 CR-014 下可离线转为排除终态；其历史账本仍如实保留
+    # `needs_item_audit`，不能篡改已发生的请求事件或重复记账。
+    if status == "excluded_after_repair":
+        expected["outcome"] = event.get("outcome")
+        if event.get("outcome") not in {"needs_item_audit", "excluded_after_repair"}:
+            raise ContractError("逐项排除终态的历史账本结果不允许")
     if any(event.get(key) != item for key, item in expected.items()):
         raise ContractError("实时恢复终态与累计无正文账本不一致；禁止自动重发")
 
@@ -1545,7 +1685,7 @@ def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
         raise ContractError("实时账本缺少冻结字段或传输标识不符")
     if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
         raise ContractError("实时账本不得混入 Batch 身份字段")
-    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped", "needs_item_audit"}:
+    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped", "needs_item_audit", "excluded_after_repair"}:
         raise ContractError("实时账本具有未知终态")
     diagnostic = event.get("service_error")
     if diagnostic is not None and (not isinstance(diagnostic, dict) or set(diagnostic) != {"http_status", "service_code", "service_message"}):
@@ -1558,6 +1698,64 @@ def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
             raise ContractError("实时账本的本地验证错误码无效")
         if not isinstance(local_failure["path"], str) or not re.fullmatch(r"/(?:[A-Za-z0-9_./-]+)?", local_failure["path"]):
             raise ContractError("实时账本的本地验证路径无效")
+
+
+def resume_second_item_repairs(
+    manifest: dict[str, Any], atoms: list[dict[str, Any]], prompt: str, schema: dict[str, Any],
+    settings: Settings, policy: RealtimePolicy, transport: RealtimeTransport, run_root: Path,
+    request_bucket: TokenBucket, token_bucket: TokenBucket, budget_remaining_cny: float,
+    budget_tracker: BudgetTracker | None,
+) -> tuple[str, float, dict[str, Any]]:
+    """仅恢复首轮修复失败的 Atom，执行第二次且最后一次修复并安全终结 package。
+
+    读取既有无正文队列和已验证结果，不发送 package 原请求。第二次仍失败的 Atom 保留
+    `attempt=3` 与独立 repair 身份，package 标为 `excluded_after_repair`；成功项立即
+    并入原结果文件。该函数是 CR-014 的恢复边界，不重发 accepted Atom。
+    """
+
+    state_path = realtime_package_state_path(run_root, manifest)
+    files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
+    state = read_json(state_path)
+    failures = second_repair_candidates(manifest, run_root, settings)
+    repaired, unresolved, usage, charged, within_budget = repair_realtime_item_failures(
+        manifest, atoms, failures, prompt, schema, read_json(ROOT / "schemas/cue_inference_batch_compact_v1.schema.json"),
+        load_validator(ROOT / "schemas/cue_candidate.schema.json"), settings, policy, transport, request_bucket,
+        token_bucket, budget_remaining_cny, budget_tracker, repair_attempt=3,
+    )
+    retry_count = 2  # `realtime_ledger_event` 使用零基 retry_count；此项对应第三次总尝试。
+    if not within_budget:
+        event = realtime_ledger_event(manifest, "budget_stopped", retry_count, usage, "post_repair_budget_exceeded")
+        atomic_write_json(state_path, {**state, "status": "budget_stopped", "raw_response_saved": False})
+        return "budget_stopped", charged, event
+    prior_cues = read_jsonl(files["result"])
+    if repaired:
+        atomic_write_jsonl(files["result"], prior_cues + repaired)
+    queue_path = state_path.parent / "item_audit_queue.jsonl"
+    if unresolved:
+        atomic_write_jsonl(queue_path, unresolved)
+        atomic_write_json(state_path, {**state, "status": "excluded_after_repair",
+            "unresolved_item_count": len(unresolved), "excluded_item_count": len(unresolved),
+            "item_audit_resolved": True, "raw_response_saved": False})
+        event = realtime_ledger_event(manifest, "excluded_after_repair", retry_count, usage)
+        event["repair_request_identities"] = [entry["request_identity"] for entry in unresolved]
+        atomic_write_jsonl(files["ledger"], [event])
+        return "excluded_after_repair", charged, event
+    # 没有剩余合同失败项时，第二次修复后的 Cue 与有效 R/N 都已是可覆盖终态。
+    atomic_write_json(state_path, {**state, "status": "validated_success", "unresolved_item_count": 0,
+        "item_audit_resolved": True, "raw_response_saved": False})
+    event = realtime_ledger_event(manifest, "validated_success", retry_count, usage)
+    event["repair_request_identities"] = [
+        f"rt_repair_3_{manifest['package_id']}_{failure['item_index']}" for failure in failures
+    ]
+    atomic_write_jsonl(files["ledger"], [event])
+    atomic_write_json(files["complete"], {
+        "run_id": manifest["run_id"], "package_id": manifest["package_id"], "transport": "realtime_chat_completions",
+        "realtime_shard_index": manifest["realtime_shard_index"], "request_sha256": manifest["request_sha256"], "status": "validated_success",
+        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+        "input_manifest_sha256": sha256_file(files["manifest"]), "result_sha256": sha256_file(files["result"]),
+        "ledger_sha256": sha256_file(files["ledger"]), "state_sha256": sha256_file(state_path), "completed_at": utc_now(),
+    })
+    return "validated_success", charged, event
 
 
 def execute_realtime_package(
@@ -1579,7 +1777,15 @@ def execute_realtime_package(
         return "recovered_skip", 0.0, {"outcome": "recovered_skip"}
     migrate_legacy_json_parse_quarantine(manifest, run_root, settings)
     recovered_terminal = realtime_recovery_terminal_status(manifest, run_root, settings)
-    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit", "needs_item_audit_from_quarantine", "needs_item_audit_unaccounted"}:
+    if recovered_terminal in {"needs_item_audit", "needs_item_audit_from_quarantine"}:
+        # CR-014：队列仅含首轮修复失败的 Atom 时，恢复为第二次且最后一次单项修复；
+        # 不构造或发送原 package 请求，已通过 Atom 不会再次计费。
+        atoms = [atoms_by_id[item["atom_id"]] for item in manifest["atoms"]]
+        return resume_second_item_repairs(
+            manifest, atoms, prompt, schema, settings, policy, transport, run_root, request_bucket,
+            token_bucket, budget_remaining_cny, budget_tracker,
+        )
+    if recovered_terminal in {"local_validation_quarantine", "needs_item_audit_unaccounted"}:
         # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
         # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
         return "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit", 0.0, {"outcome": "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit"}
@@ -2154,6 +2360,12 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
         if recovered_status is None:
             remaining_manifests.append(manifest)
             continue
+        if recovered_status in {"needs_item_audit", "needs_item_audit_from_quarantine"}:
+            # 仅将 `attempt=2` 的安全队列项排入恢复调度；函数会拒绝任何越界次数，
+            # 因此不会把旧审计 package 当作新的整包请求。
+            second_repair_candidates(manifest, wave_root, settings)
+            remaining_manifests.append(manifest)
+            continue
         if recovered_status != "needs_item_audit_unaccounted":
             require_accounted_realtime_terminal(manifest, recovered_status, cumulative_events)
         completed += 1
@@ -2163,16 +2375,27 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     # 否则一次安全恢复会被错误阻断，也会掩盖真实的剩余授权。
     predicted = 0.0
     for manifest in remaining_manifests:
+        recovered_status = realtime_recovery_terminal_status(manifest, wave_root, settings)
+        if recovered_status in {"needs_item_audit", "needs_item_audit_from_quarantine"}:
+            repair_prompt = prompt + "\n仅修复这一个 items[0]；必须返回 n=0。"
+            for failure in second_repair_candidates(manifest, wave_root, settings):
+                repair_atom = atoms[failure["atom_id"]]
+                repair_input_proxy = max(1, request_utf8_bytes(repair_prompt, schema, [repair_atom], settings) // 4)
+                predicted += repair_input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
+                predicted += settings.output_tokens_per_atom * policy.output_price_cny_per_million_tokens / 1_000_000
+            continue
         package_atoms = [atoms[item["atom_id"]] for item in manifest["atoms"]]
         input_proxy = max(1, request_utf8_bytes(prompt, schema, package_atoms, settings) // 4)
         output_upper = settings.output_tokens_per_atom * len(package_atoms)
         predicted += input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
         predicted += output_upper * policy.output_price_cny_per_million_tokens / 1_000_000
-        # 逐项恢复至多各一次，故在首次联网前把最坏 repair 输入/输出一并预留；否则
-        # 首轮虽在授权内，多个并发包的修复仍可能把总额推过 ¥80。
+        # 首轮后可有两次单项修复，故在首次联网前把最坏输入/输出一并预留；否则
+        # 首轮虽在授权内，多个并发修复仍可能把总额推过冻结的全局上限。
         repair_prompt = prompt + "\n仅修复这一个 items[0]；必须返回 n=0。"
         for repair_atom in package_atoms:
             repair_input_proxy = max(1, request_utf8_bytes(repair_prompt, schema, [repair_atom], settings) // 4)
+            predicted += repair_input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
+            predicted += settings.output_tokens_per_atom * policy.output_price_cny_per_million_tokens / 1_000_000
             predicted += repair_input_proxy * policy.input_price_cny_per_million_tokens / 1_000_000
             predicted += settings.output_tokens_per_atom * policy.output_price_cny_per_million_tokens / 1_000_000
     if predicted > budget.maximum_cny - budget.spent_cny():

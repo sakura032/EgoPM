@@ -23,6 +23,29 @@
 必须使用新 run ID、绑定新协议 SHA 的本机授权，授权上限仍为 `¥80`。`realtime_v8_01` 仅审计，
 不重跑、不重写、不作为新运行输入。
 
+## CR-2026-014：Atom 终态覆盖与部分 Cue library SUCCESS
+
+**状态：已冻结，待实现。**
+
+`realtime_v9_01` Wave 1 已完成 1,000 个 package，其中 714 个严格通过、286 个进入逐项审计。
+要求每个 package 都产生 Cue 才能写 SUCCESS，会把已验证的 Cue 与未通过证据门的 Atom 错误地
+捆绑为同一阻断条件。现改为 Atom 终态覆盖：每个输入 Atom 必须恰有一个无正文 disposition：
+`accepted_cue`、`excluded_no_cue` 或 `excluded_after_repair`。`excluded_no_cue` 只适用于模型
+返回的有效显式非接受结论；`excluded_after_repair` 只允许在首轮和至多两次同 Atom 修复后仍未通过
+严格验证时产生，并保留 `atom_id`、`item_index`、安全错误码、JSON 路径、package/run/协议身份；
+不得保留模型正文、不得把失败 Cue 写入 library、不得自动追加请求。
+
+正式 `cue_library.jsonl` 仍只含 `accepted_cue`，逐条保持原字段证据、血缘、Schema 与语义门。
+`CUE_LIBRARY_SUCCESS.json` 新增并绑定 coverage/disposition ledger 的 SHA256、`accepted_cue_count`、
+`excluded_no_cue_count`、`excluded_after_repair_count` 与 `source_atoms_processed_count`；SUCCESS 的覆盖条件改为全部输入 Atom
+均恰有一个终态、无 `needs_item_audit`，而非全部 Atom 都必须生成 Cue。T4 必须独立核验该分区
+与 Source 的一对一覆盖，且拒绝任何未解决审计项或失败 Cue 混入。
+
+本 CR 的修复预算上限由 `¥80` 调整为 `¥100`。这只修改最终覆盖与 SUCCESS 合同及逐项恢复上限，
+不修改 v3.6 请求对象、提示词、模型、证据规则或协议哈希；
+因此 `realtime_v9_01` 仅可由受控的离线闭合程序读取既有无正文结果和审计队列，禁止重发或混入
+`realtime_v8_01`。所有后续 Wave 也使用同一终态覆盖规则。
+
 ## CR-2026-012：Cue 显式证据字段与字段内格式归一化
 
 ### 状态、动机与范围

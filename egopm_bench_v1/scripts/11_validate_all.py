@@ -1230,6 +1230,70 @@ def validate_realtime_wave_package_audits(directory: Path, collector: IssueColle
     return valid
 
 
+def validate_realtime_coverage_disposition(directory: Path, collector: IssueCollector, owner: str) -> bool:
+    """验证 Wave 逐 Atom 覆盖账本，拒绝未完成两次修复的排除终态。
+
+    覆盖账本是 CR-014 将“每包都成功”改为“每个 Atom 均有可审计终态”的唯一
+    证据。有效模型 `R/N` 是明确的 `excluded_no_cue`；而
+    `excluded_after_repair` 只能在首轮和两次同 Atom 修复均未通过后出现，因而不得
+    用一次失败、整包失败或无正文缺失来提前排除。
+    """
+
+    path = directory / "coverage_disposition.jsonl"
+    if not path.is_file():
+        collector.add("BLOCKER", "cue_realtime_coverage_missing", str(path), "最终 Wave 具有逐 Atom 覆盖账本", "不存在", owner)
+        return False
+    required = {
+        "run_id", "package_id", "item_index", "atom_id", "source_atoms_sha256",
+        "cue_execution_protocol_sha256", "raw_response_saved", "disposition", "code",
+        "path", "attempt", "request_identity",
+    }
+    valid = True
+    seen: set[tuple[str, int, str]] = set()
+    for row in read_jsonl(path, collector, "cue_realtime_coverage_disposition", owner):
+        if has_forbidden_realtime_content(row):
+            collector.add("BLOCKER", "cue_realtime_coverage_raw_content", str(path), "覆盖账本绝不含正文", "发现正文键", owner)
+            valid = False
+            continue
+        if set(row) != required:
+            collector.add("BLOCKER", "cue_realtime_coverage_fields", str(path), "固定的无正文覆盖字段", repr(sorted(set(row))), owner)
+            valid = False
+            continue
+        identity = row["request_identity"]
+        key = (row["package_id"], row["item_index"], row["atom_id"])
+        if (not isinstance(row["package_id"], str) or not isinstance(row["item_index"], int)
+                or isinstance(row["item_index"], bool) or row["item_index"] < 0
+                or not isinstance(row["atom_id"], str) or not row["atom_id"].startswith("src_")
+                or row["raw_response_saved"] is not False):
+            collector.add("BLOCKER", "cue_realtime_coverage_value", str(path), "安全 Atom 身份、索引与无正文标志", repr(row), owner)
+            valid = False
+        if key in seen:
+            collector.add("BLOCKER", "cue_realtime_coverage_unique", str(path), "每个 package/item/Atom 恰一条终态", repr(key), owner)
+            valid = False
+        seen.add(key)
+        if row["disposition"] == "accepted_cue":
+            if row["code"] is not None or row["path"] is not None or row["attempt"] is not None or not isinstance(identity, str):
+                collector.add("BLOCKER", "cue_realtime_coverage_accepted", str(path), "accepted_cue 不携带失败信息且具有请求身份", repr(row), owner)
+                valid = False
+        elif row["disposition"] == "excluded_after_repair":
+            if (not isinstance(row["code"], str) or not isinstance(row["path"], str)
+                    or row["attempt"] != 3
+                    or not isinstance(identity, str)
+                    or not re.fullmatch(rf"rt_repair_{re.escape(row['package_id'])}_\d+_[0-9a-f]{{10}}", identity)):
+                collector.add("BLOCKER", "cue_realtime_coverage_exclusion_limit", str(path), "排除仅限初始加两次同 Atom 修复后的 attempt=3", repr(row), owner)
+                valid = False
+        elif row["disposition"] == "excluded_no_cue":
+            if (row["code"] != "MODEL_NON_ACCEPTED" or not isinstance(row["path"], str)
+                    or row["attempt"] != 1 or not isinstance(identity, str)
+                    or not re.fullmatch(rf"rt_{re.escape(row['package_id'])}_[0-9a-f]{{10}}", identity)):
+                collector.add("BLOCKER", "cue_realtime_coverage_no_cue", str(path), "有效模型 R/N 仅以首轮 MODEL_NON_ACCEPTED 终态排除", repr(row), owner)
+                valid = False
+        else:
+            collector.add("BLOCKER", "cue_realtime_coverage_disposition", str(path), "accepted_cue、excluded_no_cue 或 excluded_after_repair", repr(row["disposition"]), owner)
+            valid = False
+    return valid
+
+
 def validate_all_realtime_waves(root: Path, layout: dict[str, Any], policy: dict[str, Any], collector: IssueCollector, owner: str) -> bool:
     """聚合验证八个实时波次，要求完整、不重叠且与根级累计账本一致。
 
@@ -1254,6 +1318,7 @@ def validate_all_realtime_waves(root: Path, layout: dict[str, Any], policy: dict
         if state.get("status") != "completed":
             collector.add("BLOCKER", "cue_realtime_wave_terminal", str(directory), "completed", repr(state.get("status")), owner); valid = False
         valid = validate_realtime_wave_package_audits(directory, collector, owner) and valid
+        valid = validate_realtime_coverage_disposition(directory, collector, owner) and valid
         tasks = progress.get("wave_task_indexes")
         if isinstance(tasks, list):
             overlap = seen_tasks.intersection(tasks)
@@ -1557,9 +1622,9 @@ def validate_realtime_item_audit_queue(
                 or re.fullmatch(r"/(?:[A-Za-z0-9_./-]+)?", row["path"]) is None or row["package_id"] != package_id
                 or row["raw_response_saved"] is not False):
             collector.add("BLOCKER", "cue_realtime_item_queue_value", str(queue_path), "安全失败码、路径、Atom 身份与无正文标志", repr(row), owner); valid = False
-        if not isinstance(row["attempt"], int) or isinstance(row["attempt"], bool) or row["attempt"] not in {1, 2}:
-            collector.add("BLOCKER", "cue_realtime_item_repair_limit", str(queue_path), "每项初始失败加至多一次修复，即 attempt 为 1 或 2", repr(row.get("attempt")), owner); valid = False
-        if not isinstance(identity, str) or (row["attempt"] == 2 and not re.fullmatch(rf"rt_repair_{re.escape(package_id)}_\d+_[0-9a-f]{{10}}", identity)):
+        if not isinstance(row["attempt"], int) or isinstance(row["attempt"], bool) or row["attempt"] not in {1, 2, 3}:
+            collector.add("BLOCKER", "cue_realtime_item_repair_limit", str(queue_path), "每项初始失败加至多两次修复，即 attempt 为 1、2 或 3", repr(row.get("attempt")), owner); valid = False
+        if not isinstance(identity, str) or (row["attempt"] in {2, 3} and not re.fullmatch(rf"rt_repair_{re.escape(package_id)}_\d+_[0-9a-f]{{10}}", identity)):
             collector.add("BLOCKER", "cue_realtime_item_repair_identity", str(queue_path), "修复请求仅指向本 package 的单 Atom 身份", repr(identity), owner); valid = False
         key = (atom_id, item_index)
         if key in seen:

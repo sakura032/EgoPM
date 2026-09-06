@@ -9,7 +9,7 @@
 | 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`realtime_v8_01` 的已知汇总为 573 package 暂存成功、427 package 待审；CR-2026-013 已冻结 v3.6.0 | v3.6 按用户要求未运行测试；V8 本地运行目录当前缺失，汇总结果仅作审计记录，阻断 SUCCESS 与 Seed | 绑定 v3.6 协议 SHA 的新 `¥80` 授权后，以新 run ID 从 Wave 1 重启；不得混入 V8 |
+| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`realtime_v9_01` Wave 1 为 714 package 严格通过、286 package 待第二次单 Atom 修复；CR-2026-014 已冻结 | 按用户要求未运行测试；覆盖/SUCCESS 闭合和剩余 Wave 尚未完成，Seed 仍被阻断 | 使用同一 v3.6 run 仅修复 V9 审计 Atom；总授权上限 `¥100`，不得重发成功项或旧 V8 |
 | Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
