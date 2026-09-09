@@ -7,10 +7,21 @@
 
 ## 2026-09-09 当前实施边界
 
-- CR-2026-013/014/015 的 Cue 实时运行已经完成八波 Atom 覆盖；三类 excluded 与内容过滤终态不得重跑。CR-2026-016 的正式 task 分片、manifest、SUCCESS 已生成，当前仅等待 T4 Cue QA 关闭门禁。
-- 本文件较早章节中“单一 `cue_library.jsonl` 是正式权威文件”的表述已由 CR-2026-016 替代。单文件只可作为由 manifest 确定性生成的便利缓存。
-- CR-2026-005 与 CR-2026-017 阻断 Seed 正式生产：必须先完成固定 BGE-M3 混合检索、`trigger_cue_id` 血缘、lure 同组/跨组构成、失败子句和跨 Seed 不复用实现。
-- Cue 之后的模型生成与模型审计统一使用 `qwen3.7-plus-2026-05-26`，分别固定 medium/high；不再使用 Max。人工终审不变。
+- CR-2026-013/014/015 的 V9 实时运行、费用、覆盖账本和 CR-2026-016 的 75 个分片/manifest/SUCCESS 全部保持不可变，但 CR-2026-018 已因系统性内容语义问题撤销其 Seed 上游资格。旧数据只作审计，不得删除、覆盖、修复、重发或混入 Cue v2。
+- CR-2026-018/019/020 冻结 Cue/Seed v2 方向：WSL BGE-M3 先筛选 8,000–12,000 个候选 Atom；三个百炼账号用同一 `qwen3.7-flash` 协议并行抽取约 3,000–5,000 条高质量 Cue；生成 900–1,400 个候选 Seed，最终冻结 480 个 Seed 并派生 2,880 条 Life Log。
+- 同一生产阶段只允许一个固定模型，阶段间允许不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量高成本审计；不用 Max。
+- Cue v2、Seed 和 Life Log 的分布报告写入 `egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/`，并由对应阶段 SUCCESS 绑定其 manifest SHA。
+- 本文件后续旧章节若仍描述全量 Cue、35–40 Seed、约 60 候选或统一 Plus，均只作历史背景；正式实施以 `AGENTS.md` v1.3、协调登记册 CR-2026-018/019/020 和 `CUE_SEED_V2_PLAN.md` 为准。
+
+## CR-2026-018/019/020：Cue/Seed v2 总体迁移
+
+**状态：方向已批准；Schema、配置、代码、模型调用和正式数据均未实施。**
+
+Cue v2 删除顶层 `cue_type`、`confidence`、空置 entities/scene/activity、重复 Source 正文和逐行模型/run/Schema 元数据。正式行只保留 `cue_id`、`atom_id` 与 `predicate.all_of`；每个 clause 自带完整词 `dimension/operator/value` 和单一原字段 evidence。模型候选可判断 accepted/no-cue/ambiguous，但 ambiguous 必须复核闭环，正式 Cue 分片只包含 accepted Cue。
+
+三账号并行不允许共享追加账本。每个 worker 独立授权、预算、ledger、费用快照、租约和 staging；协调器只读聚合已关闭账本。request ID 绑定 campaign、worker、partition、package、Atom 集合 SHA 和 attempt。重复 ID、费用缺失、终态冲突或身份不一致一律阻断且禁止自动重发。
+
+WSL BGE-M3 使用专用 `.venv-bge-m3`、固定 revision、单 GPU 单编码进程。完整部署、缓存、恢复、输出和 Windows 导入合同见 `wsl_BGE-M3_filter/`。完整 Cue/Seed 生产、语义门、分布报告和 480 Seed 停止规则见 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`。
 
 ## CR-2026-016：逻辑快照与大规模分片合同
 

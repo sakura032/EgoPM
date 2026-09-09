@@ -21,6 +21,9 @@
 | CR-2026-015 | 2026-09-06 | T0 | 第 05 步实时执行 | 内容安全过滤器对口语字幕返回 400 `data_inspection_failed` 时不应停整波；新增 `content_filtered` 终态与 `excluded_content_filtered` 覆盖处置 | 无 API；需要已落盘的旧 `service_transport_exhausted` 包在续跑时被新代码重分类为 `content_filtered` | 批准 | 执行语义扩展（不改变冻结 Source/协议哈希） | DONE |
 | CR-2026-016 | 2026-09-09 | T0 | 正式产物存储与 SUCCESS 合同 | 将阶段完成定义为一个逻辑快照；Source/Cue 允许 manifest+分片，Seed/Frozen/Life Log 保持单文件，Decision/Evidence 延后按规模冻结 | 已冻结 Source 不重建；Cue 已将 75 个 task 物化并由顶层 manifest/SUCCESS 统一绑定，T4 Cue 专项零阻断 | 批准；实现与 T4 Cue QA 已完成 | 治理合同 `v1.2.0` | DONE |
 | CR-2026-017 | 2026-09-09 | T0 | Seed Schema、检索结果与审计规则 | 新增必填 `trigger_cue_id`；冻结 cue→atom/type/predicate 血缘、同组+跨组 lure 构成、失败子句和跨 Seed 禁止复用；后续模型统一 Plus | Schema/配置/06–08/T4 已升级；正式 BGE 权重缺失，Seed 仍不得启动 | 批准；无 API 实现已完成，待 BGE 检索与 T4 验证 | Seed 数据合同 `v1.1.0` | IN_PROGRESS |
+| CR-2026-018 | 2026-09-09 | T0 | Cue v1 语义资格与 Cue v2 Schema | V9 虽通过旧结构 QA，但出现 `time` 塌缩、字符串 `null`、人物进入时间槽、冗余字段全空和自报 confidence 失真；旧 Cue 撤销 Seed 上游资格，Cue v2 改为 clause-level predicate/evidence、仅 `all_of`、删除冗余逐行字段 | 破坏性 Cue Schema 变更；V9 保留不可变审计，不覆盖、不混入；Seed 及全部下游必须从 Cue v2 重建 | 方向批准；待 Schema、prompt、执行器和 T4 语义门实施 | Cue Schema `v2.0.0`、治理合同 `v1.3.0` | IN_PROGRESS |
+| CR-2026-019 | 2026-09-09 | T0 | Cue v2 候选选择与 WSL BGE-M3 | 不再全量生成 370799 条 Cue；先以固定 BGE-M3 对全量 Source 做 dense+sparse+多样性筛选，形成 8,000–12,000 个候选 Atom，再生成约 3,000–5,000 条高质量 Cue | CR-005 的模型 revision 与混合检索原则保留，但旧 Cue 驱动 query 序列化不再适用；需新建 Source→candidate selection 合同和导入门 | 方向批准；WSL 说明已建立，待 selection request、实现和 T4 验证 | Cue/检索合同后续版本 | IN_PROGRESS |
+| CR-2026-020 | 2026-09-09 | T0 | Seed 规模、模型、三账号并行、账本和分布报告 | Seed candidates 调整为 900–1,400，Frozen Seed 固定 480；Cue 抽取沿用同一 `qwen3.7-flash` 协议并允许三个阿里云账号处理静态分区；各 worker 独立授权/预算/账本，阶段 SUCCESS 绑定分布报告 manifest | 替代 CR-017 中后续统一 Plus、35–40 Seed 和小规模单文件假设；Seed/Life Log 布局需按新规模重新冻结；旧账本不迁入 | 方向批准；待配置、Schema、执行器、恢复工具和 QA 实施 | 治理合同 `v1.3.0` | IN_PROGRESS |
 
 > 注：`CR-2026-012` 继续保留为空号，未获得权威材料前不得补写语义；`CR-2026-013` 已按冻结的 v3.6 协议与 SHA 补录。
 
@@ -74,3 +77,29 @@ Seed 必填 `trigger_cue_id`，并满足 `Cue.atom_id == trigger_atom_id`、`Cue
 同一正式候选快照内，trigger Cue、trigger Atom 和 lure Atom 均全局唯一，不得跨 Seed 复用。被拒 Seed 的 Atom 只能在生成一个全新候选快照时释放并重新分配。模型生成使用 `qwen3.7-plus-2026-05-26` + `reasoning_effort=medium`；模型审计使用同一 Plus 快照 + `reasoning_effort=high`；人工对全部候选独立签字，模型不得替代人工终审。
 
 若稀有 cue 类型因全局不复用或同组/跨组构成而不足，不得降低规则或复用 Atom；按固定排名继续扩大候选深度，仍不足则将该候选记为不可构造并扩大 trigger 候选池。最终报告必须给出每类缺口和被去重占用的数量，避免静默改变样本分布。
+
+### CR-2026-018
+
+旧 `realtime_v9_01` 的执行账本、费用、coverage/disposition、75 个正式分片、manifest 和 SUCCESS 全部保持不可变。其 T4“0 blocker”解释限定为旧合同下的结构、哈希、Source 血缘与证据片段检查通过；不得扩张解释为 predicate 语义正确。Seed 和后续正式阶段不得再读取旧 Cue manifest。
+
+Cue v2 正式行只包含稳定 `cue_id`、`atom_id` 和 `predicate.all_of`。每个 clause 必须含完整词形式的 `dimension`、`operator`、`value` 和单字段 `evidence.field/evidence.span`。删除顶层 `cue_type`、`confidence`、`entities`、`scene_type`、`activity_type`、重复 Source 正文和逐行运行元数据。`split`、Source 文本和参与者信息由 `atom_id` 回查；模型、prompt、Schema、run 和参数写入 campaign/shard manifest。
+
+模型候选判断允许 `accepted/no_cue/ambiguous`；`ambiguous` 复核后必须转为 `accepted_cue`、`excluded_no_cue` 或 `excluded_ambiguous`。正式 Cue 分片只含第一类，其他终态只进入无正文 disposition。Cue 只表达一个 Source Atom 中可直接观察的事实，并只允许 `all_of`；`any_of`、虚拟时间、跨 Atom 条件和生命周期规则属于 Seed/Rule。
+
+T4 新增 clause-level 语义门：证据必须来自指定原字段，value 必须被其直接支持，dimension 不得错槽，time 必须有明确时间语义，所有 `null/none/unknown/n/a` 变体为零，禁止跨字段/跨 Atom 拼接和释义。Schema 正确但语义不正确必须计 blocker。
+
+### CR-2026-019
+
+WSL2 使用专用 `.venv-bge-m3`、单 GPU 单编码进程和固定 `BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181`。候选 selection 由确定性资格过滤、dense 查询召回、sparse 查询召回、RRF 和 dense 多样性补足的并集组成；按 split、参与者、模态和 `source_group_id` 分层去重。BGE 只决定候选 Atom，不生成 predicate 或 accepted 判断。
+
+WSL 说明包位于 `wsl_BGE-M3_filter/`。正式返回 Windows 的 selection 进入 `cues/v2/source_selection/<selection_id>/`；embedding、稀疏权重和索引仍是 WSL 可重建缓存，不要求传回。导入门必须复算 Source SHA、模型 revision、参数哈希、候选唯一性和分布报告。
+
+### CR-2026-020
+
+Cue v2 目标约 3,000–5,000 条 accepted Cue，但不以数量单独判成功；当 Seed 覆盖门满足且至少 576 个候选通过机器门后可停止扩充。Seed candidate 目标 900–1,400，最终 Frozen Seed 固定 480，建议暂按 train 240、dev 80、test 160 规划，最终须根据冻结 Source split 的参与者和来源组可达性确认。每个 Seed 派生 6 条 Life Log，预计 2,880 条。
+
+三个阿里云账号使用同一个 `qwen3.7-flash` Cue 协议，分别绑定三个静态 worker/partition 集。每个 worker 独立授权、预算、ledger、费用快照、租约和 staging；协调器只读聚合，不允许共享追加累计账本。request ID 必须绑定 campaign、worker、partition、package、Atom 集合 SHA 和 attempt；重复 ID、费用缺失、终态冲突或共享身份错误一律阻断且不自动重发。恢复只处理所属 worker/partition 的未终态请求。
+
+阶段内只有一个固定生产模型，阶段间允许选择不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量审计。Seed 生成、Seed 审计和 Life Log 生成的最终模型在各自生产前另行冻结。
+
+所有阶段分布报告统一写入 `audit/distributions/<stage>/<snapshot_id>/`，至少包含 `by_model.json`、多账号阶段的 `by_worker.json`、`by_split.json`、`by_participant.json`、`by_modality.json`、`by_shard.jsonl`、阶段特有维度、语义门报告、manifest 和 `DISTRIBUTION_SUCCESS.json`。对应生产 SUCCESS 必须绑定 `distribution_manifest_sha256`。

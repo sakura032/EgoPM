@@ -1,5 +1,7 @@
 # T2 交接：CR-2026-011 的 Cue v3 实时 API 无 API 生产者
 
+> **2026-09-09 v1.3 接续说明**：本文件后续内容主要记录旧 Cue 协议及其实现历史。CR-2026-018/019/020 已撤销 V9 Cue 的 Seed 上游资格，并以 `../CUE_SEED_V2_PLAN.md` 替代旧的全量 Cue、统一 Plus 和小规模 Seed 计划。T2 下一阶段只能先实现 WSL BGE selection 导入、Cue Schema v2、三个百炼账号的隔离账本/租约、clause 语义门和分布报告；在新 CR 实现与 T4 验证完成前不得调用 API 或生成 Seed。
+
 ## 2026-09-05：实时 API 切换的离线执行准备
 
 本次仅实现和测试实时执行的离线部件；未读取 `DASHSCOPE_API_KEY`、未联网、未调用 API，

@@ -1,5 +1,7 @@
 # T4：CR-2026-011 Cue v3 实时执行无 API QA 交接
 
+> **2026-09-09 v1.3 接续说明**：旧 V9 的“0 blocker”仅表示旧合同下结构、哈希、证据片段和覆盖 QA 通过，不再代表 Cue 语义可供 Seed 使用。T4 必须为 Cue v2 新增 clause-level 语义门、三账号账本/租约一致性、模型同质性和 `audit/distributions/<stage>/<snapshot_id>/` 报告验证；旧 V9 文件保持只读审计。
+
 ## 交接元数据
 
 - 分支：`main`。

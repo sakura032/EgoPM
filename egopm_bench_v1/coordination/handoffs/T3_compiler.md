@@ -1,5 +1,7 @@
 # T3 确定性基准编译器交接
 
+> **2026-09-09 v1.3 接续说明**：最终规模改为 480 个 Frozen Seed 和 2,880 条六路 Life Log。Life Log 正式布局、生成模型和协议参数必须在生产前另开 CR；T3 在 Cue v2、Seed candidates、人工审计、T4 Seed QA 和 `SEEDS_FROZEN_SUCCESS` 完成前只能使用 synthetic fixture，不得读取旧 V9 Cue 启动正式编译。
+
 ## 合同与提交状态
 
 - 治理合同版本：`v1.1.0`。
