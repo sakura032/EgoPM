@@ -1,16 +1,16 @@
 # EgoPM-Bench v1 状态板
 
-当前治理合同冻结版本：**v1.1.0**（2026-08-31）。配置合同与 Source Atom Schema 为 `v1.1.0`；其余数据 Schema 保持 `v1.0.0`。
+当前治理合同冻结版本：**v1.2.0**（2026-09-09）。配置合同与已冻结 Source Atom Schema 为 `v1.1.0`；Cue manifest 已生成，Seed 数据合同 `v1.1.0` 与固定 BGE-M3 正式检索仍未完成，不能据此启动 Seed 正式生产。
 
 `DONE` 表示 T0 已审阅产物并确认通过必需验证。状态只能是 `TODO`、`IN_PROGRESS`、`BLOCKED` 或 `DONE`。
 
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| 治理合同 v1.1 | T0 | DONE | v1.1.0；CR-2026-001；`c719a03` | 无 | 允许 Wave 1 的 fixture-only 开发，并执行 Python 中文注释门禁 |
+| 治理合同 v1.2 | T0 | DONE | v1.2.0；CR-2026-016、CR-2026-017；2026-09-09 文档决议 | 无 | 按新逻辑快照、Seed 血缘/lure 与 Plus 政策实施，实施完成前不得越过数据门 |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | T2 可启动第 05 步正式 Cue library；T0 审阅其 SUCCESS 后启动 Cue QA |
-| Cue library | T2 | BLOCKED | Source SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；`realtime_v9_01` Wave 1 为 714 package 严格通过、286 package 待第二次单 Atom 修复；CR-2026-014 已冻结 | 按用户要求未运行测试；覆盖/SUCCESS 闭合和剩余 Wave 尚未完成，Seed 仍被阻断 | 使用同一 v3.6 run 仅修复 V9 审计 Atom；总授权上限 `¥100`，不得重发成功项或旧 V8 |
-| Seed candidates | T2 | BLOCKED | Wave 1 客户端与合同测试已合并；无正式产物 | `CUE_LIBRARY_SUCCESS` 哈希 + Cue QA + `CR-2026-005` 决定 | 禁止正式生成 |
+| Cue library | T2 | DONE | `realtime_v9_01`；75 个 task 分片；294839 条 Cue；manifest/SUCCESS SHA256 `a7ccd99e629d185911084bb654f79ca6891711b7874cd950c07b0bc7972fdf75`；四类 disposition 已绑定；协议 SHA256 `c7d809927f9cca4ff7d4501a0121c419768cd95c1d3c05d13b156000c50fbbb5` | Cue 专项 T4：0 blocker；下游缺失属于预期 blocker | 仅可从 Cue manifest 读取；继续完成 CR-005/017 的固定 BGE 检索 |
+| Seed candidates | T2 | BLOCKED | 无正式产物；Cue manifest/SUCCESS 与 T4 Cue QA 已通过；CR-2026-005/017 无 API 实现已完成 | `.venv` 缺少 `FlagEmbedding`、`huggingface_hub` 与固定 `BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181` 权重；正式检索未运行 | 安装并准备固定 BGE 权重后运行第 06 步；不得退回 lexical 或调用 API |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | — | 审计冻结 + T4 seed QA | 仅以 fixture 开发编译器 |
 | Protocol parameters v1 | T0 | BLOCKED | — | 研究协议要求先有完整 source/seed 统计 | 冻结预算、冷却与重复提醒策略 |
@@ -18,7 +18,19 @@
 | Final QA | T4 | BLOCKED | — | `DECISIONS_SUCCESS` 哈希 | 验证全部正式产物 |
 | Release | T0 | BLOCKED | — | `FINAL_VALIDATION_SUCCESS` 哈希 | 审阅并发布 manifest |
 
-## T0 审阅记录
+## 2026-09-09 当前决议
+
+- 八波实时 Cue 执行已经结束，370799 个 Source Atom 均有唯一 disposition；正式 Cue 已在无 API 离线收官中冻结为 75 个 task 分片、顶层 manifest 和 SUCCESS。`cue_library.jsonl` 仍不是权威输入；不再次修复或重跑 `excluded_after_repair`、`excluded_no_cue`、`excluded_content_filtered`。
+- 不重发三类 excluded Atom。`excluded_no_cue` 是有效模型显式无 Cue，`excluded_after_repair` 已耗尽冻结修复次数，`excluded_content_filtered` 是安全过滤终态；若未来改变纳入政策，必须新开破坏性 CR 和新 run，旧账本保持不可变。
+- Cue 正式接口采用 75 个 task 分片 + `cue_library_manifest.json` + 一个 `CUE_LIBRARY_SUCCESS.json`。实时 package 结果保留作审计，不直接进入下游。已冻结 Source 单文件不重建。
+- Seed candidates、Frozen seeds 与 Life Log 保持单文件；Decision/Evidence 在正式生成前根据实际规模冻结布局。
+- 正式 Seed 必须新增 `trigger_cue_id`，禁止跨 Seed 复用 trigger/lure Atom，并至少配置一个同 `source_group_id` lure 与一个跨组 lure；所有 lure 仍必须同 split，且记录未满足 predicate 子句。
+- 第 06 步生产检索必须从 `lexical_jaccard_v1` 切换到 CR-2026-005 冻结的 `bge_m3_hybrid_rrf_v1`。后续生成与模型审计统一使用固定 Plus 快照，分别采用 medium/high 推理强度，不再使用 Max。
+- 多终端可以并行处理静态划分且互不重叠的 task/partition；只有协调器能写 manifest/SUCCESS。任何终端都不得并发追加同一个正式文件。
+
+## T0 历史审阅记录
+
+以下各条按发生时间保留，仅用于追溯当时状态；若与上方状态表或“2026-09-09 当前决议”冲突，以当前决议为准。
 
 - Wave 0 合同冻结提交为 `487fa9a`。`raw/` 中有 808 个 SRT 文件并已被忽略；没有源媒体或源数据加入 Git。
 - 本合同冻结数据形状、路径语义、文件所有权、SUCCESS 标记语义、来源 split 策略、模型登记表和评测协议结构。

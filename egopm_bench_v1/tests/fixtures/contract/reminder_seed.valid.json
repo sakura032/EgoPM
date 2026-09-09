@@ -8,8 +8,29 @@
     "action_content": "Take the medicine from the refrigerator."
   },
   "primary_cue_type": "activity",
+  "trigger_cue_id": "cue_SYNTH_000001",
   "trigger_atom_id": "src_SYNTH_DAY1_000001",
   "lure_atom_ids": ["src_SYNTH_DAY1_000002", "src_SYNTH_DAY1_000003"],
+  "lure_audit": [
+    {
+      "atom_id": "src_SYNTH_DAY1_000002",
+      "source_group_id": "group_SYNTH_DAY1_SESSION1",
+      "group_relation": "same_source_group",
+      "unsatisfied_predicate_clause_indexes": [1],
+      "rank_dense": 1,
+      "rank_sparse": 2,
+      "rrf_score": 0.032
+    },
+    {
+      "atom_id": "src_SYNTH_DAY1_000003",
+      "source_group_id": "group_SYNTH_DAY1_SESSION2",
+      "group_relation": "different_source_group",
+      "unsatisfied_predicate_clause_indexes": [0],
+      "rank_dense": 3,
+      "rank_sparse": null,
+      "rrf_score": 0.015
+    }
+  ],
   "trigger_predicate": {
     "all_of": [
       {"slot": "place", "operator": "eq", "value": "kitchen"},
@@ -35,6 +56,6 @@
     "run_id": "run_fixture_002",
     "model_id": "synthetic-fixture",
     "prompt_version": "fixture",
-    "schema_version": "v1.0.0"
+    "schema_version": "v1.1.0"
   }
 }

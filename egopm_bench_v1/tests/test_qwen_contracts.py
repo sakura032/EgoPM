@@ -116,6 +116,103 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     with pytest.raises(value.ContractError, match="Batch"): value.validate_realtime_ledger_event({**result[2], "batch_custom_id": "x"})
 
 
+def test_wave_coverage_close_writes_ledger_then_marks_resolved(tmp_path: Path) -> None:
+    """覆盖闭合成功时先原子落盘覆盖账本，再把审计 package 标为已处置。"""
+    value = module(); settings, *_ = setup(value)
+    base = value.package_manifest([atom(1)], "source", "protocol", "synthetic", 0, 0)
+    manifest = value.realtime_manifest(base)
+    root = tmp_path / "realtime"
+    package_dir = root / "packages" / manifest["package_id"]
+    package_dir.mkdir(parents=True)
+    (package_dir / f"{manifest['package_id']}.input.jsonl").write_text(json.dumps(manifest, ensure_ascii=False) + "\n", encoding="utf-8")
+    (package_dir / f"{manifest['package_id']}.result.jsonl").write_text("", encoding="utf-8")
+    (package_dir / "realtime_state.json").write_text(json.dumps({"status": "needs_item_audit", "raw_response_saved": False}, ensure_ascii=False) + "\n", encoding="utf-8")
+    (package_dir / "item_audit_queue.jsonl").write_text(json.dumps({"atom_id": manifest["atoms"][0]["atom_id"], "item_index": 0, "code": "X", "path": "/items/0/x", "attempt": 2, "request_identity": "rt_x", "raw_response_saved": False}, ensure_ascii=False) + "\n", encoding="utf-8")
+    counts = value.close_repaired_item_audits([manifest], root, settings)
+    assert counts == {"accepted_cue": 0, "excluded_after_repair": 1, "excluded_no_cue": 0, "excluded_content_filtered": 0}
+    records = list(value.iter_jsonl(root / "coverage_disposition.jsonl"))
+    assert len(records) == 1 and records[0]["disposition"] == "excluded_after_repair"
+    state = json.loads((package_dir / "realtime_state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "excluded_after_repair" and state["item_audit_resolved"] is True
+
+
+def test_wave_coverage_close_is_transactional_on_mid_failure(tmp_path: Path) -> None:
+    """覆盖闭合中途失败不得写入覆盖账本，也不得把已通过校验的 package 标为已处置。"""
+    value = module(); settings, *_ = setup(value)
+
+    def make_manifest(shard: int) -> dict[str, Any]:
+        return value.realtime_manifest(value.package_manifest([atom(1 + shard)], "source", "protocol", "synthetic", shard, 0))
+
+    manifest_a = make_manifest(0)
+    manifest_b = make_manifest(1)
+    root = tmp_path / "realtime"
+    a_dir = root / "packages" / manifest_a["package_id"]
+    a_dir.mkdir(parents=True)
+    (a_dir / f"{manifest_a['package_id']}.input.jsonl").write_text(json.dumps(manifest_a, ensure_ascii=False) + "\n", encoding="utf-8")
+    (a_dir / f"{manifest_a['package_id']}.result.jsonl").write_text("", encoding="utf-8")
+    (a_dir / "realtime_state.json").write_text(json.dumps({"status": "needs_item_audit", "raw_response_saved": False}, ensure_ascii=False) + "\n", encoding="utf-8")
+    (a_dir / "item_audit_queue.jsonl").write_text(json.dumps({"atom_id": manifest_a["atoms"][0]["atom_id"], "item_index": 0, "code": "X", "path": "/items/0/x", "attempt": 2, "request_identity": "rt_x", "raw_response_saved": False}, ensure_ascii=False) + "\n", encoding="utf-8")
+    # package B 缺少结果文件，会在闭合中途触发合同失败。
+    b_dir = root / "packages" / manifest_b["package_id"]
+    b_dir.mkdir(parents=True)
+    (b_dir / f"{manifest_b['package_id']}.input.jsonl").write_text(json.dumps(manifest_b, ensure_ascii=False) + "\n", encoding="utf-8")
+    (b_dir / "realtime_state.json").write_text(json.dumps({"status": "validated_success", "raw_response_saved": False}, ensure_ascii=False) + "\n", encoding="utf-8")
+    with pytest.raises(value.ContractError, match=manifest_b["package_id"]):
+        value.close_repaired_item_audits([manifest_a, manifest_b], root, settings)
+    assert not (root / "coverage_disposition.jsonl").exists()
+    state_a = json.loads((a_dir / "realtime_state.json").read_text(encoding="utf-8"))
+    assert state_a["status"] == "needs_item_audit"
+    assert "item_audit_resolved" not in state_a
+
+
+def test_wave_coverage_close_records_content_filtered_package(tmp_path: Path) -> None:
+    """被内容过滤的 package 无结果文件，闭合须为全部 Atom 写 excluded_content_filtered。"""
+    value = module(); settings, *_ = setup(value)
+    manifest = value.realtime_manifest(value.package_manifest([atom(1)], "source", "protocol", "synthetic", 0, 0))
+    root = tmp_path / "realtime"
+    package_dir = root / "packages" / manifest["package_id"]
+    value.atomic_write_json(package_dir / "realtime_state.json", {
+        "run_id": manifest["run_id"], "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"],
+        "package_id": manifest["package_id"], "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+        "status": "content_filtered", "retry_count": 1, "raw_response_saved": False,
+        "service_error": {"http_status": 400, "service_code": "data_inspection_failed", "service_message": "inappropriate content"},
+    })
+    (package_dir / f"{manifest['package_id']}.input.jsonl").write_text(json.dumps(manifest, ensure_ascii=False) + "\n", encoding="utf-8")
+    counts = value.close_repaired_item_audits([manifest], root, settings)
+    assert counts == {"accepted_cue": 0, "excluded_after_repair": 0, "excluded_no_cue": 0, "excluded_content_filtered": 1}
+    records = list(value.iter_jsonl(root / "coverage_disposition.jsonl"))
+    assert len(records) == 1 and records[0]["disposition"] == "excluded_content_filtered"
+    assert records[0]["code"] == "data_inspection_failed" and records[0]["path"] is None and records[0]["attempt"] == 1
+
+
+def test_realtime_run_continues_after_content_filtered_without_stopping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """内容过滤包不得停掉整波：混合 content_filtered 与成功的波次应以 completed 收尾。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    manifests = []
+    for index in range(2):
+        base = value.package_manifest([rows["src_a_001"]], "source", "protocol", "synthetic", 0, index)
+        manifests.append(value.realtime_manifest(base))
+
+    def fake_execute(item: dict[str, Any], *_args: Any, **_kwargs: Any) -> tuple[str, float, dict[str, Any]]:
+        if item["package_id"] == manifests[0]["package_id"]:
+            diagnostic = {"http_status": 400, "service_code": "data_inspection_failed", "service_message": "inappropriate content"}
+            return "content_filtered", 0.0, value.realtime_ledger_event(item, "content_filtered", 1, {}, "content_policy", diagnostic)
+        return "validated_success", 0.001, value.realtime_ledger_event(item, "validated_success", 0, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+
+    monkeypatch.setattr(value, "materialize_realtime_wave", lambda *_args: (manifests, rows))
+    monkeypatch.setattr(value, "load_realtime_authorization", lambda *_args: {"maximum_total_cny": 10.0})
+    monkeypatch.setattr(value, "execute_realtime_package", fake_execute)
+    monkeypatch.setattr(value, "RealtimeTransport", lambda *_args: object())
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic")
+    args = SimpleNamespace(run_root=tmp_path / "realtime", authorization=tmp_path / "authorization.json", run_id="synthetic", wave_index=1)
+    result = value.execute_realtime_run(args, settings, policy, {"sha256": "source"}, object(), "p", {"type": "object"}, "protocol")
+    progress = json.loads((args.run_root / "runs" / args.run_id / "wave_01" / "progress.json").read_text(encoding="utf-8"))
+    assert result["outcomes"] == {"content_filtered": 1, "validated_success": 1}
+    assert progress["status"] == "completed" and progress["content_filtered_packages"] == 1
+    assert progress["validated_success_packages"] + progress["content_filtered_packages"] == progress["total_packages"]
+
+
 @pytest.mark.parametrize(
     ("payload", "expected_code", "expected_path"),
     [
@@ -217,6 +314,48 @@ def test_permanent_http_400_writes_safe_failed_terminal_state(tmp_path: Path) ->
     assert result[0] == "service_transport_exhausted" and result[2]["retry_eligible"] is False
     assert state["service_error"] == {"http_status": 400, "service_code": "invalid_parameter", "service_message": "body.response_format is unsupported"}
     assert "choices" not in json.dumps(state, ensure_ascii=False)
+
+
+def test_content_inspection_failure_is_content_filtered_terminal_not_wave_stop(tmp_path: Path) -> None:
+    """内容安全过滤 400 必须归为逐条 content_filtered 终态，而不是停掉整波。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    class ContentBlocked:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            raise value.RealtimeServiceError(400, False, "data_inspection_failed", "Input text data may contain inappropriate content.")
+    result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, ContentBlocked(), tmp_path / "realtime", 1.0, *buckets(value, policy))
+    assert result[0] == "content_filtered" and result[2]["outcome"] == "content_filtered"
+    assert result[2]["failure_origin"] == "content_policy" and result[2]["retry_eligible"] is False
+    state = json.loads((tmp_path / "realtime" / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "content_filtered" and state["retry_count"] == 1
+    assert state["service_error"]["service_code"] == "data_inspection_failed"
+    assert "choices" not in json.dumps(state, ensure_ascii=False)
+    # content_filtered 包必须补写冻结清单，离线覆盖闭合才能识别其 Atom 范围。
+    manifest_path = tmp_path / "realtime" / "packages" / manifest["package_id"] / f"{manifest['package_id']}.input.jsonl"
+    assert manifest_path.is_file()
+    rows = [json.loads(line) for line in manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert len(rows) == 1 and rows[0]["package_id"] == manifest["package_id"]
+
+
+def test_recovery_skips_existing_content_filtered_terminal_without_transport(tmp_path: Path) -> None:
+    """已落盘的 content_filtered 包在恢复时必须被识别为终态跳过，不能再次请求服务。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    root = tmp_path / "realtime"
+    package_dir = root / "packages" / manifest["package_id"]
+    state = {
+        "run_id": manifest["run_id"], "transport": "realtime_chat_completions", "realtime_shard_index": manifest["shard_index"],
+        "package_id": manifest["package_id"], "realtime_request_id": manifest["realtime_request_id"], "request_sha256": manifest["request_sha256"],
+        "source_atoms_sha256": manifest["source_atoms_sha256"], "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+        "status": "content_filtered", "retry_count": 1, "raw_response_saved": False,
+        "service_error": {"http_status": 400, "service_code": "data_inspection_failed", "service_message": "Input text data may contain inappropriate content."},
+    }
+    value.atomic_write_json(package_dir / "realtime_state.json", state)
+    class ShouldNotBeCalled:
+        def complete(self, _body: dict[str, Any], _policy: Any) -> dict[str, Any]:
+            raise AssertionError("content_filtered 包不应再次请求服务")
+    value.append_ledger_event(root / settings.layout["run_ledger_filename"], value.realtime_ledger_event(manifest, "content_filtered", 1, {}, "content_policy", state["service_error"]))
+    assert value.realtime_recovery_terminal_status(manifest, root, settings) == "content_filtered"
+    result = value.execute_realtime_package(manifest, rows, "p", {"type": "object"}, settings, policy, ShouldNotBeCalled(), root, 1.0, *buckets(value, policy))
+    assert result == ("recovered_content_filtered", 0.0, {"outcome": "recovered_content_filtered"})
 
 
 def test_server_compatible_inference_schema_keeps_entity_deduplication_locally() -> None:
@@ -370,6 +509,38 @@ def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkey
     assert result["outcomes"] == {"validated_success": 12}
     assert (progress["wave_index"], progress["wave_task_indexes"], progress["total_packages"], progress["completed_packages"], progress["in_flight_packages"]) == (1, [0], 12, 12, 0)
     assert "source_text" not in json.dumps(progress, ensure_ascii=False)
+
+
+def test_realtime_run_transient_failure_does_not_stop_wave(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """单个网络/服务端瞬断不得停整波，也不得写账本；下一轮恢复会把它当未完成重发。"""
+    value = module(); settings, policy, manifest, rows = setup(value)
+    manifests = []
+    for index in range(3):
+        base = value.package_manifest([rows["src_a_001"]], "source", "protocol", "synthetic", 0, index)
+        manifests.append(value.realtime_manifest(base))
+
+    def fake_execute(item: dict[str, Any], *_args: Any, **_kwargs: Any) -> tuple[str, float, dict[str, Any]]:
+        if item["package_id"] == manifests[0]["package_id"]:
+            diagnostic = {"http_status": None, "service_code": None, "service_message": None}
+            return "service_transport_exhausted", 0.0, value.realtime_ledger_event(item, "service_transport_exhausted", 3, {}, "transient_service", diagnostic)
+        return "validated_success", 0.001, value.realtime_ledger_event(item, "validated_success", 0, {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
+
+    monkeypatch.setattr(value, "materialize_realtime_wave", lambda *_args: (manifests, rows))
+    monkeypatch.setattr(value, "load_realtime_authorization", lambda *_args: {"maximum_total_cny": 10.0})
+    monkeypatch.setattr(value, "execute_realtime_package", fake_execute)
+    monkeypatch.setattr(value, "RealtimeTransport", lambda *_args: object())
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "synthetic")
+    args = SimpleNamespace(run_root=tmp_path / "realtime", authorization=tmp_path / "authorization.json", run_id="synthetic", wave_index=1)
+    result = value.execute_realtime_run(args, settings, policy, {"sha256": "source"}, object(), "p", {"type": "object"}, "protocol")
+    wave_root = args.run_root / "runs" / args.run_id / "wave_01"
+    progress = json.loads((wave_root / "progress.json").read_text(encoding="utf-8"))
+    # 三个包都被尝试（completed=3），瞬断包计入 service_transport_exhausted，但整波不因单点瞬断停住。
+    assert result["outcomes"] == {"service_transport_exhausted": 1, "validated_success": 2}
+    assert progress["completed_packages"] == 3 and progress["service_transport_exhausted_packages"] == 1
+    # 瞬断包不写账本：恢复下一轮重发成功后只写一条 validated_success，不会撞“重复 request id”。
+    first_id = manifests[0]["realtime_request_id"]
+    ledger_ids = [json.loads(line)["realtime_request_id"] for line in open(wave_root / settings.layout["run_ledger_filename"], encoding="utf-8") if line.strip()]
+    assert first_id not in ledger_ids
 
 
 def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

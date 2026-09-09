@@ -32,8 +32,8 @@ EXPECTED_MODEL_ID = "qwen3.7-plus-2026-05-26"
 PROMPT_VERSION = "seed_generator_v1"
 CONTRACT_VERSION = "v1.1.0"
 CONFIG_VERSION = "v1.1.0"
-TRIGGER_LURE_SCHEMA_VERSION = "v1.0.0"
-SEED_SCHEMA_VERSION = "v1.0.0"
+TRIGGER_LURE_SCHEMA_VERSION = "v1.1.0"
+SEED_SCHEMA_VERSION = "v1.1.0"
 REQUIRED_TERMINAL_CONDITIONS = {"completed", "cancelled", "expired", "already_reminded"}
 SUCCESS_REQUIRED_FIELDS = {
     "artifact_path",
@@ -96,6 +96,7 @@ def _declares_artifact(marker: dict[str, Any], artifact: Path, marker_path: Path
     declared = Path(str(marker["artifact_path"]))
     candidates = [declared] if declared.is_absolute() else [
         marker_path.parent / declared,
+        ROOT / declared,
         ROOT.parent / declared,
         artifact.parent / declared,
     ]
@@ -130,6 +131,22 @@ def require_direct_upstream(marker: dict[str, Any], name: str, expected_hash: st
     if not isinstance(upstream_hashes, dict) or upstream_hashes.get(name) != expected_hash:
         # 不仅单文件哈希正确，还要保证 cue 和检索确实建立在本次来源版本上。
         raise ContractError(f"上游 SUCCESS 标记未绑定预期 {name} 哈希")
+
+
+def require_verified_manifest_success(manifest_path: Path, marker_path: Path) -> dict[str, Any]:
+    """验证 JSON manifest 的 SUCCESS；manifest 本身不是可按行计数的 JSONL。"""
+
+    if not manifest_path.is_file() or not marker_path.is_file():
+        raise ContractError(f"缺少 Cue manifest 或 SUCCESS：{manifest_path}；{marker_path}")
+    marker = read_json(marker_path)
+    missing = SUCCESS_REQUIRED_FIELDS.difference(marker)
+    if missing or marker.get("artifact_type") != "cue_library_manifest":
+        raise ContractError(f"Cue manifest SUCCESS 字段或类型不完整：{sorted(missing)}")
+    if marker["contract_version"] != CONTRACT_VERSION or marker["config_version"] != CONFIG_VERSION or not _declares_artifact(marker, manifest_path, marker_path):
+        raise ContractError("Cue manifest SUCCESS 版本或路径不匹配")
+    if marker["sha256"] != sha256_file(manifest_path) or marker.get("manifest_sha256") != marker["sha256"]:
+        raise ContractError("Cue manifest SUCCESS SHA256 不匹配")
+    return marker
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -188,11 +205,23 @@ def validate_retrieval_rows(rows: list[dict[str, Any]]) -> None:
     required = {
         "retrieval_id",
         "cue_id",
+        "trigger_cue_id",
         "trigger_atom_id",
         "split",
         "source_group_id",
         "lure_atom_ids",
         "run_id",
+        "lure_audit",
+        "retrieval_method",
+        "model_id",
+        "model_revision",
+        "channel_top_k",
+        "rrf_k",
+        "query_serialization_version",
+        "passage_serialization_version",
+        "retrieval_parameters_sha256",
+        "source_atoms_sha256",
+        "cue_manifest_sha256",
         "schema_version",
     }
     seen: set[str] = set()
@@ -205,9 +234,48 @@ def validate_retrieval_rows(rows: list[dict[str, Any]]) -> None:
         seen.add(row["retrieval_id"])
         if row["schema_version"] != TRIGGER_LURE_SCHEMA_VERSION:
             raise ContractError("trigger/lure 集 Schema 版本不兼容")
+        if row["retrieval_method"] != "bge_m3_hybrid_rrf_v1" or row["model_id"] != "BAAI/bge-m3" or row["channel_top_k"] != 64 or row["rrf_k"] != 60:
+            raise ContractError("trigger/lure 集检索参数不符合 bge_m3_hybrid_rrf_v1")
         lure_ids = row["lure_atom_ids"]
-        if not isinstance(lure_ids, list) or len(lure_ids) < 2 or len(set(lure_ids)) != len(lure_ids):
+        audits = row["lure_audit"]
+        if not isinstance(lure_ids, list) or not isinstance(audits, list) or len(lure_ids) < 2 or len(set(lure_ids)) != len(lure_ids) or [item.get("atom_id") for item in audits] != lure_ids:
             raise ContractError("每个 trigger/lure 集至少需要两个不同 lure")
+        if not any(item.get("group_relation") == "same_source_group" for item in audits) or not any(item.get("group_relation") == "different_source_group" for item in audits):
+            raise ContractError("每个 trigger/lure 集必须同时含同组和跨组 lure")
+        if any(not item.get("unsatisfied_predicate_clause_indexes") for item in audits):
+            raise ContractError("每个 lure 必须记录未满足的 predicate 子句")
+
+
+def load_cue_rows_from_manifest(manifest_path: Path, success_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """验证并读取正式 Cue manifest，禁止 Seed 直接读取 package 或便利缓存。"""
+
+    marker = require_verified_manifest_success(manifest_path, success_path)
+    manifest = read_json(manifest_path)
+    if manifest.get("artifact_type") != "cue_library_logical_snapshot" or manifest.get("shard_count") != 75:
+        raise ContractError("Cue 输入必须是 75 个 task 分片的正式 manifest")
+    shards = manifest.get("shards")
+    if not isinstance(shards, list) or len(shards) != 75:
+        raise ContractError("Cue manifest 分片数不为 75")
+    rows: list[dict[str, Any]] = []
+    seen_tasks: set[int] = set()
+    for shard in shards:
+        task_index = shard.get("task_index")
+        if not isinstance(task_index, int) or task_index in seen_tasks or not 0 <= task_index < 75:
+            raise ContractError("Cue manifest task index 重复、越界或无效")
+        seen_tasks.add(task_index)
+        path = (ROOT / str(shard.get("path"))).resolve()
+        formal_dir = (ROOT / "cues" / "formal").resolve()
+        if path.parent != formal_dir or path.name != f"task_{task_index:03d}.jsonl" or not path.is_file():
+            raise ContractError("Cue manifest 分片路径不是 formal/task_NNN.jsonl")
+        if sha256_file(path) != shard.get("sha256") or path.stat().st_size != shard.get("byte_count"):
+            raise ContractError(f"Cue 分片哈希或字节数不匹配：{path}")
+        part = read_jsonl(path)
+        if len(part) != shard.get("row_count"):
+            raise ContractError(f"Cue 分片行数不匹配：{path}")
+        rows.extend(part)
+    if len(rows) != manifest.get("cue_count") or len(rows) != marker.get("row_count"):
+        raise ContractError("Cue manifest 与 SUCCESS 总行数不一致")
+    return rows, marker
 
 
 def seed_identifiers(index: int) -> dict[str, str | list[str]]:
@@ -230,6 +298,7 @@ def build_chat_request(
     identifiers: dict[str, str | list[str]],
     run_id: str,
     thinking_settings: dict[str, Any],
+    retrieval: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     # 预填受控 ID 与链接字段，让模型只决定候选语义，不能重写来源、split 或运行血缘。
     prefilled = {
@@ -239,8 +308,10 @@ def build_chat_request(
         "source_group_id": trigger["source_group_id"],
         "intention_id": identifiers["intention_id"],
         "primary_cue_type": cue["cue_type"],
+        "trigger_cue_id": cue["cue_id"],
         "trigger_atom_id": trigger["atom_id"],
         "lure_atom_ids": [lure["atom_id"] for lure in lures],
+        "lure_audit": (retrieval or {}).get("lure_audit", []),
         "rule_ids": identifiers["rule_ids"],
         "generation_record": {
             "run_id": run_id,
@@ -258,6 +329,7 @@ def build_chat_request(
             {"atom_id": lure["atom_id"], "split": lure["split"], "visible_text": lure["visible_text"]}
             for lure in lures
         ],
+        "retrieval_audit": retrieval or {},
     }
     return {
         "model": EXPECTED_MODEL_ID,
@@ -338,6 +410,7 @@ def validate_seed_semantics(
     lures: list[dict[str, Any]],
     identifiers: dict[str, str | list[str]],
     run_id: str,
+    retrieval: dict[str, Any] | None = None,
 ) -> None:
     expected = {
         "seed_id": identifiers["seed_id"],
@@ -345,6 +418,7 @@ def validate_seed_semantics(
         "split": trigger["split"],
         "source_group_id": trigger["source_group_id"],
         "primary_cue_type": cue["cue_type"],
+        "trigger_cue_id": cue["cue_id"],
         "trigger_atom_id": trigger["atom_id"],
         "rule_ids": identifiers["rule_ids"],
     }
@@ -371,8 +445,24 @@ def validate_seed_semantics(
     for lure in lures:
         if lure["atom_id"] in lure_ids and lure["split"] != seed["split"]:
             raise ContractError("Seed lure 与 trigger 必须同 split")
-    if not clause_set(cue["normalized_predicate"]).issubset(clause_set(seed["trigger_predicate"])):
-        raise ContractError("Seed trigger_predicate 必须包含 cue 的 all_of 谓词")
+    if seed["trigger_predicate"] != cue["normalized_predicate"]:
+        raise ContractError("Seed trigger_predicate 必须与正式 Cue normalized_predicate 完全一致")
+    audit_by_id = {item["atom_id"]: item for item in lures}
+    lure_audit = seed["lure_audit"]
+    if [item["atom_id"] for item in lure_audit] != lure_ids or any(item["atom_id"] not in audit_by_id for item in lure_audit):
+        raise ContractError("Seed lure_audit 必须逐项绑定受控 lure")
+    if retrieval is not None and lure_audit != retrieval.get("lure_audit"):
+        # rank、RRF 和失败子句来自受控检索，模型只能生成候选语义，不能改写检索审计。
+        raise ContractError("Seed lure_audit 必须与受控 BGE 检索结果完全一致")
+    if not any(item["group_relation"] == "same_source_group" for item in lure_audit) or not any(item["group_relation"] == "different_source_group" for item in lure_audit):
+        raise ContractError("Seed 必须同时包含同组和跨组 lure")
+    if any(not item["unsatisfied_predicate_clause_indexes"] for item in lure_audit):
+        raise ContractError("Seed 每个 lure 必须记录未满足的 predicate 子句")
+    for item in lure_audit:
+        lure = audit_by_id[item["atom_id"]]
+        expected_relation = "same_source_group" if lure["source_group_id"] == trigger["source_group_id"] else "different_source_group"
+        if item["source_group_id"] != lure["source_group_id"] or item["group_relation"] != expected_relation or lure["split"] != trigger["split"]:
+            raise ContractError("Seed lure_audit 的组别关系或 split 与 Source 不一致")
     window = seed["valid_window"]
     if window["end_offset_sec"] < window["start_offset_sec"]:
         raise ContractError("Seed 有效窗口结束不得早于开始")
@@ -411,13 +501,13 @@ def run(args: argparse.Namespace) -> int:
     endpoint, api_key_name, region, model_settings = load_runtime_settings(args.model_registry)
     # 在任何 Plus 请求前检查整个血缘链，避免支付调用成本后才发现上游混版。
     source_marker = require_verified_success(args.source_atoms, args.source_success)
-    cue_marker = require_verified_success(args.cue_library, args.cue_success)
+    cue_marker_path = args.cue_success
+    cue_rows, cue_marker = load_cue_rows_from_manifest(args.cue_manifest, cue_marker_path)
     retrieval_marker = require_verified_success(args.trigger_lures, args.trigger_lures_success)
     require_direct_upstream(cue_marker, "source_atoms", source_marker["sha256"])
     require_direct_upstream(retrieval_marker, "source_atoms", source_marker["sha256"])
-    require_direct_upstream(retrieval_marker, "cue_library", cue_marker["sha256"])
+    require_direct_upstream(retrieval_marker, "cue_manifest", cue_marker["sha256"])
     source_rows = read_jsonl(args.source_atoms)
-    cue_rows = read_jsonl(args.cue_library)
     retrieval_rows = read_jsonl(args.trigger_lures)
     validate_rows(source_rows, load_validator(args.source_schema), "source atom")
     validate_rows(cue_rows, load_validator(args.cue_schema), "cue")
@@ -436,13 +526,22 @@ def run(args: argparse.Namespace) -> int:
     request_time = utc_now()
     seeds: list[dict[str, Any]] = []
     retry_count = 0
-    for index, retrieval in enumerate(retrieval_rows[: args.max_candidates], start=1):
+    used_trigger_cues: set[str] = set()
+    used_trigger_atoms: set[str] = set()
+    used_lure_atoms: set[str] = set()
+    candidate_index = 0
+    for retrieval in retrieval_rows:
+        if candidate_index >= args.max_candidates:
+            break
         cue = cue_by_id.get(retrieval["cue_id"])
         trigger = atom_by_id.get(retrieval["trigger_atom_id"])
         if cue is None or trigger is None:
             raise ContractError("trigger/lure 集引用了不存在或未接受的 cue/atom")
         if retrieval["split"] != trigger["split"] or retrieval["source_group_id"] != trigger["source_group_id"]:
             raise ContractError("trigger/lure 集的 split 或 source_group 与 trigger 不一致")
+        if retrieval["trigger_cue_id"] != cue["cue_id"] or retrieval["trigger_cue_id"] in used_trigger_cues or trigger["atom_id"] in used_trigger_atoms:
+            # 候选快照内禁止释放后复用 trigger；冲突项跳过，不能通过复用凑数量。
+            continue
         lures = []
         for lure_id in retrieval["lure_atom_ids"]:
             lure = atom_by_id.get(lure_id)
@@ -451,7 +550,10 @@ def run(args: argparse.Namespace) -> int:
             if lure["split"] != trigger["split"] or lure_id == trigger["atom_id"]:
                 raise ContractError("trigger/lure 集含跨 split 或 trigger 自身")
             lures.append(lure)
-        identifiers = seed_identifiers(index)
+        if any(lure["atom_id"] in used_lure_atoms for lure in lures):
+            continue
+        candidate_index += 1
+        identifiers = seed_identifiers(candidate_index)
         payload = build_chat_request(
             prompt=prompt,
             schema=seed_schema,
@@ -461,6 +563,7 @@ def run(args: argparse.Namespace) -> int:
             identifiers=identifiers,
             run_id=run_id,
             thinking_settings=model_settings,
+            retrieval=retrieval,
         )
         seed, retries = call_structured_qwen(
             endpoint=endpoint,
@@ -478,8 +581,12 @@ def run(args: argparse.Namespace) -> int:
             lures=lures,
             identifiers=identifiers,
             run_id=run_id,
+            retrieval=retrieval,
         )
         seeds.append(seed)
+        used_trigger_cues.add(retrieval["trigger_cue_id"])
+        used_trigger_atoms.add(trigger["atom_id"])
+        used_lure_atoms.update(lure["atom_id"] for lure in lures)
 
     write_jsonl_atomic(args.output, seeds)
     write_json_atomic(
@@ -494,7 +601,7 @@ def run(args: argparse.Namespace) -> int:
             "generated_at": utc_now(),
             "upstream_hashes": {
                 "source_atoms": source_marker["sha256"],
-                "cue_library": cue_marker["sha256"],
+                "cue_manifest": cue_marker["sha256"],
                 "trigger_lures": retrieval_marker["sha256"],
             },
             "run_id": run_id,
@@ -506,7 +613,7 @@ def run(args: argparse.Namespace) -> int:
             "temperature": model_settings["temperature"],
             "prompt_version": PROMPT_VERSION,
             "request_time": request_time,
-            "input_atom_ids": [row["trigger_atom_id"] for row in retrieval_rows[: args.max_candidates]],
+            "input_atom_ids": [row["trigger_atom_id"] for row in retrieval_rows[: candidate_index]],
             "raw_response_path": None,
             "parse_status": "validated",
             "retry_count": retry_count,
@@ -521,7 +628,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-registry", type=Path, default=ROOT / "config" / "model_registry.yaml")
     parser.add_argument("--source-atoms", type=Path, default=ROOT / "source" / "source_video_atoms.jsonl")
     parser.add_argument("--source-success", type=Path, default=ROOT / "source" / "SOURCE_ATOMS_SUCCESS.json")
-    parser.add_argument("--cue-library", type=Path, default=ROOT / "cues" / "cue_library.jsonl")
+    parser.add_argument("--cue-manifest", type=Path, default=ROOT / "cues" / "cue_library_manifest.json")
     parser.add_argument("--cue-success", type=Path, default=ROOT / "cues" / "CUE_LIBRARY_SUCCESS.json")
     parser.add_argument("--trigger-lures", type=Path, default=ROOT / "cues" / "trigger_lure_sets.jsonl")
     parser.add_argument("--trigger-lures-success", type=Path, default=ROOT / "cues" / "TRIGGER_LURES_SUCCESS.json")

@@ -27,6 +27,7 @@ artifacts:
   source_split_map: ../source/source_split_map.jsonl
   source_report: ../source/atom_build_report.json
   cue_library: ../cues/cue_library.jsonl
+  cue_library_manifest: ../cues/cue_library_manifest.json
   seed_candidates: ../seeds/reminder_seed_candidates.jsonl
   seed_audit: ../seeds/reminder_seed_audit.csv
   frozen_seeds: ../seeds/reminder_seeds_frozen.jsonl

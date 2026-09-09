@@ -9,7 +9,7 @@ default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 models:
   cue_extraction:
-    # 基础别名同时适用于北京实时接口；日期快照不再作为本次实时协议的冻结标识。
+    # 公共池基础别名；使用新账号后不再依赖 TPM 预留快照 ID。
     model_id: qwen3.7-flash
     thinking_enabled: false
     reasoning_effort: none
@@ -129,12 +129,30 @@ models:
     prompt_version: seed_generator_v1
     schema: reminder_seed.schema.json
   seed_audit:
-    model_id: qwen3.7-max-2026-06-08
+    # Seed 生成与审计统一使用同一 Plus 快照；审计仍以更高推理强度独立进行。
+    model_id: qwen3.7-plus-2026-05-26
     thinking_enabled: true
     reasoning_effort: high
     temperature: 0
     prompt_version: seed_auditor_v1
     schema: reminder_seed.schema.json
+  seed_retrieval:
+    method: bge_m3_hybrid_rrf_v1
+    model_id: BAAI/bge-m3
+    model_revision: 5617a9f61b028005a4858fdac845db406aefb181
+    dense_representation: cls
+    max_input_tokens: 512
+    channel_top_k: 64
+    rrf_k: 60
+    ranking_depth: 128
+    use_fp16: false
+    dense_normalization: l2
+    dense_similarity: cpu_exact_inner_product
+    sparse_similarity: dot_product
+    ann: false
+    reranker: null
+    query_serialization_version: cue_query_v1
+    passage_serialization_version: atom_passage_v1
 
 run_manifest_required_fields:
   - run_id

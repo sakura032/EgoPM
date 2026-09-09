@@ -3,9 +3,34 @@
 本文件由 T0 维护，用于记录跨角色、跨门禁或需要冻结执行语义的变更。本文件不授权绕过
 任何 `SUCCESS`、哈希、质量验证或用户预算确认门。
 
+编号、状态与精确参数的表格化登记以 `egopm_bench_v1/coordination/CHANGE_REQUESTS.md` 为准；本文件保留详细背景与迁移说明。两者冲突时必须停止执行并由 T0 修正文档，不得自行选择较宽松版本。
+
+## 2026-09-09 当前实施边界
+
+- CR-2026-013/014/015 的 Cue 实时运行已经完成八波 Atom 覆盖；三类 excluded 与内容过滤终态不得重跑。CR-2026-016 的正式 task 分片、manifest、SUCCESS 已生成，当前仅等待 T4 Cue QA 关闭门禁。
+- 本文件较早章节中“单一 `cue_library.jsonl` 是正式权威文件”的表述已由 CR-2026-016 替代。单文件只可作为由 manifest 确定性生成的便利缓存。
+- CR-2026-005 与 CR-2026-017 阻断 Seed 正式生产：必须先完成固定 BGE-M3 混合检索、`trigger_cue_id` 血缘、lure 同组/跨组构成、失败子句和跨 Seed 不复用实现。
+- Cue 之后的模型生成与模型审计统一使用 `qwen3.7-plus-2026-05-26`，分别固定 medium/high；不再使用 Max。人工终审不变。
+
+## CR-2026-016：逻辑快照与大规模分片合同
+
+**状态：正式分片与 manifest/SUCCESS 实现已完成，等待 T4 零阻断确认。**
+
+阶段完成被定义为一个不可变逻辑快照，而不是一个物理巨型 JSONL。Cue 的正式数据面固定为 task `000`–`074` 的 75 个不相交分片；`cues/cue_library_manifest.json` 按固定顺序记录相对路径、SHA256、行数、字节数、覆盖范围、Source/协议/run 血缘，`CUE_LIBRARY_SUCCESS.json` 绑定 manifest SHA、总行数、分片数和四类 disposition 总数。实时 package 文件只作审计，不得供 Seed 读取。
+
+已冻结 Source 单文件不因布局升级而重建。Seed candidates、Frozen seeds 和 Life Log 继续使用单文件；Decision/Evidence 在正式生成前按实际规模另开 CR 冻结。多终端只允许写静态分配且互不重叠的临时 partition；协调器独占 manifest/SUCCESS。
+
+## CR-2026-017：Seed Cue 血缘、lure 审计与 Plus-only
+
+**状态：无 API Schema/配置/执行器/验证器实现已完成；正式 BGE 权重缺失，尚未运行正式检索。**
+
+Seed 新增必填 `trigger_cue_id`，并强制 `Cue.atom_id == trigger_atom_id`、`Cue.cue_type == primary_cue_type`、`Cue.normalized_predicate == trigger_predicate`。每个 Seed 至少有一个同 `source_group_id` lure 和一个跨组 lure；全部 lure 与 trigger 同 split，并记录未满足的 predicate 子句以及 BGE 两通道 rank/RRF 分数。同一正式候选快照内，trigger Cue、trigger Atom 和 lure Atom 均不得跨 Seed 复用。
+
+生产检索采用 CR-2026-005 的 `bge_m3_hybrid_rrf_v1`；Seed 生成使用固定 Plus 快照 medium，模型审计使用同一 Plus 快照 high，最终由人工逐项签字。
+
 ## CR-2026-013：弃用裸位置偏移，恢复字段内归一化证据片段
 
-**状态：已冻结，待实现。**
+**状态：已冻结并完成八波执行；正式 Cue manifest/SUCCESS 由 CR-2026-016 接续。**
 
 `realtime_v8_01` Wave 1 的 674 条无正文审计记录中，585 条为
 `SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE`，且主要位于 `/items/*/end`。原始模型响应按无正文规则
@@ -25,7 +50,7 @@
 
 ## CR-2026-014：Atom 终态覆盖与部分 Cue library SUCCESS
 
-**状态：已冻结，待实现。**
+**状态：已冻结并完成 Atom 覆盖；正式 Cue manifest/SUCCESS 由 CR-2026-016 替代单文件闭合方式。**
 
 `realtime_v9_01` Wave 1 已完成 1,000 个 package，其中 714 个严格通过、286 个进入逐项审计。
 要求每个 package 都产生 Cue 才能写 SUCCESS，会把已验证的 Cue 与未通过证据门的 Atom 错误地

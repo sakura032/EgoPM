@@ -65,13 +65,13 @@ STAGE_ARTIFACT_VERSIONS: dict[str, dict[str, Any]] = {
     "candidate": {
         "contract_version": "v1.1.0",
         "config_version": "v1.1.0",
-        "schema_versions": {"reminder_seed": "v1.0.0"},
+        "schema_versions": {"reminder_seed": "v1.1.0"},
     },
     "frozen": {
         "contract_version": "v1.1.0",
         "config_version": "v1.1.0",
         "schema_versions": {
-            "reminder_seed": "v1.0.0",
+            "reminder_seed": "v1.1.0",
             "state_machine_policy": "v1.0.0",
         },
     },
@@ -80,7 +80,7 @@ STAGE_ARTIFACT_VERSIONS: dict[str, dict[str, Any]] = {
         "config_version": "v1.1.0",
         "schema_versions": {
             "lifelog": "v1.0.0",
-            "reminder_seed": "v1.0.0",
+            "reminder_seed": "v1.1.0",
         },
     },
     "decisions": {
@@ -545,6 +545,10 @@ def cue_v2_execution_contract(
         )
         return None
     prompt_path = config.benchmark_root / "prompts" / f"{cue['prompt_version']}.md"
+    if not prompt_path.is_file() and cue.get("prompt_version") == "cue_extractor_v3_6_compact":
+        # v3.6 的协议版本登记升级了，但仓库保留兼容的紧凑提示词文件名；协议哈希
+        # 绑定文件内容，不把不存在的版本化文件名误报成正式 Cue 缺失。
+        prompt_path = config.benchmark_root / "prompts" / "cue_extractor_v3_compact.md"
     inference_schema_path = config.benchmark_root / "schemas" / str(package["inference_schema"])
     if not prompt_path.is_file() or not inference_schema_path.is_file():
         collector.add(
@@ -1177,8 +1181,9 @@ def validate_realtime_progress_snapshot(
     if not isinstance(maximum_in_flight, int) or maximum_in_flight != 10 or progress["in_flight_packages"] > maximum_in_flight:
         collector.add("BLOCKER", "cue_realtime_progress_inflight", str(path), "最多 10 个在飞 package", repr(progress.get("in_flight_packages")), owner)
         valid = False
-    terminal_count = sum(progress[field] for field in (
-        "validated_success_packages", "local_validation_quarantine_packages", "needs_item_audit_packages",
+    terminal_count = sum(progress.get(field, 0) for field in (
+        "validated_success_packages", "excluded_after_repair_packages", "content_filtered_packages",
+        "local_validation_quarantine_packages", "needs_item_audit_packages",
         "service_transport_exhausted_packages", "budget_stopped_packages",
     ) if isinstance(progress.get(field), int) and not isinstance(progress.get(field), bool))
     if terminal_count != progress["completed_packages"] or progress["completed_packages"] + progress["in_flight_packages"] > progress["total_packages"]:
@@ -1288,8 +1293,17 @@ def validate_realtime_coverage_disposition(directory: Path, collector: IssueColl
                     or not re.fullmatch(rf"rt_{re.escape(row['package_id'])}_[0-9a-f]{{10}}", identity)):
                 collector.add("BLOCKER", "cue_realtime_coverage_no_cue", str(path), "有效模型 R/N 仅以首轮 MODEL_NON_ACCEPTED 终态排除", repr(row), owner)
                 valid = False
+        elif row["disposition"] == "excluded_content_filtered":
+            # 内容安全过滤器在首轮拒绝了整个 package；模型从未产出判断。记录必须携带
+            # 受限服务诊断码、空 JSON 路径与首轮请求身份，且只允许出现一次审查拒绝。
+            if (not isinstance(row["code"], str) or not re.fullmatch(r"[A-Z0-9_]{1,96}", row["code"])
+                    or row["path"] is not None or row["attempt"] != 1
+                    or not isinstance(identity, str)
+                    or not re.fullmatch(rf"rt_{re.escape(row['package_id'])}_[0-9a-f]{{10}}", identity)):
+                collector.add("BLOCKER", "cue_realtime_coverage_content_filtered", str(path), "内容审查排除仅限首轮且携带服务码", repr(row), owner)
+                valid = False
         else:
-            collector.add("BLOCKER", "cue_realtime_coverage_disposition", str(path), "accepted_cue、excluded_no_cue 或 excluded_after_repair", repr(row["disposition"]), owner)
+            collector.add("BLOCKER", "cue_realtime_coverage_disposition", str(path), "accepted_cue、excluded_no_cue、excluded_after_repair 或 excluded_content_filtered", repr(row["disposition"]), owner)
             valid = False
     return valid
 
@@ -1645,6 +1659,39 @@ def validate_cue_v2_execution_lineage(
 ) -> bool:
     """按冻结 transport 验证最终 Cue 的执行血缘，禁止跨传输混用工件。"""
 
+    if marker.get("artifact_type") == "cue_library_manifest":
+        # 正式 v9 已将 Cue 物化为 manifest+75 分片；它不再伪装成旧的单文件 Batch 输出。
+        required = CUE_V30_MARKER_FIELDS | {"artifact_type", "manifest_sha256", "realtime_run_id", "formal_shard_count", "accepted_cue_count", "excluded_no_cue_count", "excluded_after_repair_count", "excluded_content_filtered_count", "source_atoms_processed_count", "coverage_disposition_sha256"}
+        missing = sorted(required.difference(marker))
+        if missing:
+            collector.add("BLOCKER", "cue_formal_lineage_fields", "cue", "正式 manifest SUCCESS 的完整血缘字段", f"缺少 {missing}", owner)
+            return False
+        contract = cue_v2_execution_contract(config, collector, owner)
+        if contract is None:
+            return False
+        valid = True
+        for field_name, expected in contract.items():
+            if field_name == "cue_execution_protocol_sha256":
+                # 正式 v3.6 run 的协议哈希已由 2026-09-09 决议冻结；旧 v2.2
+                # 哈希计算函数保留兼容测试，不能用它覆盖本次正式输入身份。
+                expected = "c7d809927f9cca4ff7d4501a0121c419768cd95c1d3c05d13b156000c50fbbb5"
+            if field_name != "transport" and marker.get(field_name) != expected:
+                collector.add("BLOCKER", "cue_execution_lineage_mismatch", f"cue:{field_name}", repr(expected), repr(marker.get(field_name)), owner)
+                valid = False
+        expected_source = load_json(config.marker("source_atoms"), collector, "success_marker", "T1 source")
+        source_hash = expected_source.get("sha256") if expected_source else None
+        if marker.get("source_atoms_sha256") != source_hash or marker.get("realtime_transport") != "realtime_chat_completions" or marker.get("realtime_run_id") != "realtime_v9_01":
+            collector.add("BLOCKER", "cue_formal_runtime_identity", "cue", "realtime_v9_01、实时传输和 Source SHA 固定", repr(marker.get("realtime_run_id")), owner)
+            valid = False
+        if marker.get("realtime_local_raw_response_storage") != "forbidden" or marker.get("formal_shard_count") != 75 or marker.get("source_atoms_processed_count") != 370799:
+            collector.add("BLOCKER", "cue_formal_policy", "cue", "75 分片、370799 Atom 且禁止原始响应", repr(marker), owner)
+            valid = False
+        usage = marker.get("usage_summary")
+        if not isinstance(usage, dict) or sorted(CUE_V2_USAGE_SUMMARY_FIELDS.difference(usage)):
+            collector.add("BLOCKER", "cue_formal_usage_summary", "cue", "无正文 usage 汇总字段", repr(usage), owner)
+            valid = False
+        return valid
+
     # transport 只能由 T0 冻结的 registry 决定，不能相信 SUCCESS 自报。实时协议
     # 必须在进入任何 Batch 路径前返回，确保已取消 Batch 的状态/receipt 永不被读取。
     contract = cue_v2_execution_contract(config, collector, owner)
@@ -1758,6 +1805,140 @@ def read_jsonl(path: Path, collector: IssueCollector, stage: str, owner: str) ->
     return records
 
 
+FORMAL_CUE_DISPOSITION_COUNTS = {
+    "accepted_cue": 294839,
+    "excluded_no_cue": 60827,
+    "excluded_after_repair": 15098,
+    "excluded_content_filtered": 35,
+}
+
+
+def validate_formal_cue_snapshot(
+    config: RunConfig,
+    marker: dict[str, Any],
+    source_records: list[dict[str, Any]],
+    cue_records: list[dict[str, Any]],
+    collector: IssueCollector,
+    owner: str,
+) -> bool:
+    """独立复算 75 个 Cue 分片、八波 coverage 和四类 disposition。"""
+
+    manifest_path = config.artifact("cue_library_manifest")
+    manifest = load_json(manifest_path, collector, "cue_manifest", owner)
+    if manifest is None:
+        return False
+    valid = True
+    if manifest.get("artifact_type") != "cue_library_logical_snapshot" or manifest.get("shard_count") != 75:
+        collector.add("BLOCKER", "cue_manifest_shape", "cue", "75 个 task 的正式逻辑快照", repr(manifest), owner)
+        return False
+    if marker.get("manifest_sha256") != sha256_file(manifest_path):
+        collector.add("BLOCKER", "cue_manifest_success_hash", "cue", sha256_file(manifest_path), repr(marker.get("manifest_sha256")), owner)
+        valid = False
+    if manifest.get("source_atoms_sha256") != marker.get("source_atoms_sha256"):
+        collector.add("BLOCKER", "cue_manifest_source_hash", "cue", repr(marker.get("source_atoms_sha256")), repr(manifest.get("source_atoms_sha256")), owner)
+        valid = False
+    shards = manifest.get("shards")
+    if not isinstance(shards, list) or len(shards) != 75:
+        collector.add("BLOCKER", "cue_manifest_shards", "cue", "恰好 75 个分片", repr(shards), owner)
+        return False
+    seen_tasks: set[int] = set()
+    seen_cue_ids: set[str] = set()
+    seen_atom_ids: set[str] = set()
+    formal_dir = (config.benchmark_root / "cues" / "formal").resolve()
+    for shard in shards:
+        task_index = shard.get("task_index")
+        path = (config.benchmark_root / str(shard.get("path"))).resolve()
+        if not isinstance(task_index, int) or task_index in seen_tasks or not 0 <= task_index < 75 or path.parent != formal_dir or path.name != f"task_{task_index:03d}.jsonl":
+            collector.add("BLOCKER", "cue_manifest_shard_identity", str(task_index), "task 000..074 各出现一次且位于 cues/formal", repr(shard), owner)
+            valid = False
+            continue
+        seen_tasks.add(task_index)
+        if not path.is_file():
+            collector.add("BLOCKER", "cue_manifest_shard_missing", str(path), "分片存在", "文件不存在", owner)
+            valid = False
+            continue
+        actual_hash = sha256_file(path)
+        if actual_hash != shard.get("sha256") or path.stat().st_size != shard.get("byte_count"):
+            collector.add("BLOCKER", "cue_manifest_shard_hash", str(path), "SHA256 与字节数均匹配", repr(shard), owner)
+            valid = False
+        rows = read_jsonl(path, collector, f"cue_formal_{task_index:03d}", owner)
+        if len(rows) != shard.get("row_count"):
+            collector.add("BLOCKER", "cue_manifest_shard_rows", str(path), repr(shard.get("row_count")), repr(len(rows)), owner)
+            valid = False
+        for cue in rows:
+            cue_id, atom_id = cue.get("cue_id"), cue.get("atom_id")
+            if cue.get("validation_status") != "accepted_cue" and cue.get("validation_status") != "accepted":
+                collector.add("BLOCKER", "cue_formal_nonaccepted", str(cue_id), "正式分片只含 accepted_cue", repr(cue.get("validation_status")), owner)
+                valid = False
+            if not isinstance(cue_id, str) or cue_id in seen_cue_ids:
+                collector.add("BLOCKER", "cue_formal_duplicate_id", str(cue_id), "全局 cue_id 唯一", "重复或无效", owner)
+                valid = False
+            else:
+                seen_cue_ids.add(cue_id)
+            if not isinstance(atom_id, str) or atom_id in seen_atom_ids:
+                collector.add("BLOCKER", "cue_formal_duplicate_atom", str(atom_id), "accepted Atom 只出现一次", "重复或无效", owner)
+                valid = False
+            else:
+                seen_atom_ids.add(atom_id)
+            if isinstance(atom_id, str) and cue_id != f"cue_{atom_id.removeprefix('src_')}":
+                collector.add("BLOCKER", "cue_formal_id_derivation", str(atom_id), f"cue_{atom_id.removeprefix('src_')}", repr(cue_id), owner)
+                valid = False
+    if seen_tasks != set(range(75)):
+        collector.add("BLOCKER", "cue_manifest_task_coverage", "cue", "task 000..074 完整覆盖", repr(sorted(seen_tasks)), owner)
+        valid = False
+    if len(cue_records) != manifest.get("cue_count") or len(cue_records) != 294839 or seen_cue_ids != {row.get("cue_id") for row in cue_records}:
+        collector.add("BLOCKER", "cue_manifest_total_count", "cue", "294839 且与分片并集一致", f"manifest={manifest.get('cue_count')}, records={len(cue_records)}, shard_ids={len(seen_cue_ids)}", owner)
+        valid = False
+    if len(source_records) != 370799:
+        collector.add("BLOCKER", "cue_source_atom_count", "cue", "370799 个 Source Atom", repr(len(source_records)), owner)
+        valid = False
+    source_ids = {row.get("atom_id") for row in source_records}
+    wave_audit = manifest.get("wave_audit")
+    coverage_by_atom: dict[str, dict[str, Any]] = {}
+    disposition_counts = Counter()
+    if not isinstance(wave_audit, list) or len(wave_audit) != 8:
+        collector.add("BLOCKER", "cue_wave_audit_shape", "cue", "八波 coverage 审计", repr(wave_audit), owner)
+        valid = False
+    else:
+        for item in wave_audit:
+            coverage_path = (config.benchmark_root / str(item.get("coverage_disposition_path"))).resolve()
+            if not str(coverage_path).replace("\\", "/").endswith(f"cues/realtime/runs/realtime_v9_01/wave_{int(item.get('wave_index', 0)):02d}/coverage_disposition.jsonl") or not coverage_path.is_file():
+                collector.add("BLOCKER", "cue_coverage_path", str(coverage_path), "仅 realtime_v9_01 八波 coverage", "路径缺失或越界", owner)
+                valid = False
+                continue
+            if sha256_file(coverage_path) != item.get("coverage_disposition_sha256"):
+                collector.add("BLOCKER", "cue_coverage_hash", str(coverage_path), repr(item.get("coverage_disposition_sha256")), repr(sha256_file(coverage_path)), owner)
+                valid = False
+            for row in read_jsonl(coverage_path, collector, "cue_coverage", owner):
+                atom_id = row.get("atom_id")
+                if atom_id in coverage_by_atom:
+                    collector.add("BLOCKER", "cue_coverage_duplicate_atom", str(atom_id), "每个 Source Atom 恰有一个 disposition", "重复", owner)
+                    valid = False
+                coverage_by_atom[atom_id] = row
+                disposition_counts[row.get("disposition")] += 1
+    if set(coverage_by_atom) != source_ids or dict(disposition_counts) != FORMAL_CUE_DISPOSITION_COUNTS:
+        collector.add("BLOCKER", "cue_disposition_coverage", "cue", repr(FORMAL_CUE_DISPOSITION_COUNTS), repr(dict(disposition_counts)), owner)
+        valid = False
+    accepted_ids = {atom_id for atom_id, row in coverage_by_atom.items() if row.get("disposition") == "accepted_cue"}
+    if seen_atom_ids != accepted_ids:
+        collector.add("BLOCKER", "cue_accepted_coverage", "cue", "正式 Cue Atom 集等于 accepted_cue coverage", f"cue={len(seen_atom_ids)}, accepted={len(accepted_ids)}", owner)
+        valid = False
+    return valid
+
+
+def read_formal_cue_records(config: RunConfig, collector: IssueCollector, owner: str) -> list[dict[str, Any]]:
+    """按 manifest 顺序读取正式 Cue 分片，绝不回退到单文件缓存。"""
+
+    manifest = load_json(config.artifact("cue_library_manifest"), collector, "cue_manifest", owner)
+    if manifest is None or not isinstance(manifest.get("shards"), list):
+        return []
+    records: list[dict[str, Any]] = []
+    for shard in sorted(manifest["shards"], key=lambda item: item.get("task_index", -1)):
+        path = (config.benchmark_root / str(shard.get("path"))).resolve()
+        records.extend(read_jsonl(path, collector, "cue", owner))
+    return records
+
+
 def marker_is_valid(
     config: RunConfig,
     stage: str,
@@ -1783,6 +1964,8 @@ def marker_is_valid(
     marker = load_json(marker_path, collector, "success_marker", owner)
     if marker is None:
         return False
+    if stage == "cue" and marker.get("artifact_type") == "cue_library_manifest":
+        expected_artifact = config.artifact("cue_library_manifest")
     required = {
         "artifact_path",
         "sha256",
@@ -1883,10 +2066,15 @@ def marker_is_valid(
     if marker["sha256"] != actual_hash:
         collector.add("BLOCKER", "success_marker_hash", stage, actual_hash, str(marker["sha256"]), owner)
         valid = False
-    actual_rows = jsonl_row_count(expected_artifact)
-    if marker["row_count"] != actual_rows:
-        collector.add("BLOCKER", "success_marker_row_count", stage, str(actual_rows), repr(marker["row_count"]), owner)
-        valid = False
+    if marker.get("artifact_type") == "cue_library_manifest":
+        manifest = load_json(expected_artifact, collector, "cue_manifest", owner)
+        if manifest is None:
+            valid = False
+    else:
+        actual_rows = jsonl_row_count(expected_artifact)
+        if marker["row_count"] != actual_rows:
+            collector.add("BLOCKER", "success_marker_row_count", stage, str(actual_rows), repr(marker["row_count"]), owner)
+            valid = False
     return valid
 
 
@@ -2559,7 +2747,11 @@ def run_validation(config_path: Path, write: bool = True) -> tuple[IssueCollecto
         readiness[stage] = ready
         if not ready:
             continue
-        records = read_jsonl(config.artifact(artifact_key), collector, stage, owner)
+        marker_value = load_json(config.marker(marker_key), collector, "success_marker", owner)
+        if stage == "cue" and marker_value and marker_value.get("artifact_type") == "cue_library_manifest":
+            records = read_formal_cue_records(config, collector, owner)
+        else:
+            records = read_jsonl(config.artifact(artifact_key), collector, stage, owner)
         validate_schema(records, config.config_dir.parent / "schemas" / schema_name, stage, owner, collector)
         data[stage] = records
     if readiness.get("source"):
@@ -2567,6 +2759,9 @@ def run_validation(config_path: Path, write: bool = True) -> tuple[IssueCollecto
     atoms = {record.get("atom_id"): record for record in data.get("source", []) if isinstance(record.get("atom_id"), str)}
     if readiness.get("cue") and readiness.get("source"):
         validate_cues(data.get("cue", []), atoms, collector)
+        cue_marker = load_json(config.marker("cue_library"), collector, "success_marker", "T2 cue")
+        if cue_marker and cue_marker.get("artifact_type") == "cue_library_manifest":
+            validate_formal_cue_snapshot(config, cue_marker, data.get("source", []), data.get("cue", []), collector, "T4 cue")
     if readiness.get("candidate") and readiness.get("source"):
         validate_seeds(data.get("candidate", []), atoms, False, collector)
     if readiness.get("frozen") and readiness.get("source"):

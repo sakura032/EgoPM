@@ -246,3 +246,23 @@ git diff --check
 - 该改动改变执行协议哈希；T0 必须更新冻结协议/授权绑定，T4 应复核诊断字段和无正文保证。
 - 旧 `realtime_v5_01` 仅保留审计，不自动重跑。以新协议和新 run id 发起的、小范围诊断运行才会
   产生可归类的失败记录；是否调用 API 仍须由用户单独确认。
+
+## CR-016/017 正式 Cue 与 Seed 链升级交接（2026-09-09）
+
+### 本次交付
+
+- 在 `main` 分支完成正式 Cue 收官器：只读取 `realtime_v9_01`，将 accepted Cue 原子地写成 `task_000.jsonl` 至 `task_074.jsonl`，并生成 manifest/SUCCESS；package 与 Wave ledger 仅作审计输入。
+- 完成 Cue manifest 读取接口、`trigger_cue_id` 必填字段、Cue→Atom/type/predicate 精确血缘、同组/跨组 lure、失败 predicate 子句和候选快照全局不复用门。
+- 第 06 步固定 `bge_m3_hybrid_rrf_v1`、`BAAI/bge-m3` revision `5617a9f61b028005a4858fdac845db406aefb181`、双通道前 64、RRF `k=60`、CPU FP32 精确内积；缺依赖时阻断，不退回 lexical。
+- Seed 生成与审计登记统一为 `qwen3.7-plus-2026-05-26`，分别使用 `medium`/`high`；本次未调用 API，也未保存模型原始响应。
+
+### 交接边界
+
+- 分支：`main`；当前工作区未提交，保护既有未提交修改。
+- Cue manifest SHA256：`a7ccd99e629d185911084bb654f79ca6891711b7874cd950c07b0bc7972fdf75`；Cue 总数 `294839`；分片数 `75`。
+- Source SHA256：`be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；协议 SHA256：`c7d809927f9cca4ff7d4501a0121c419768cd95c1d3c05d13b156000c50fbbb5`。
+- BGE-M3 正式检索尚未运行：项目 `.venv` 当前缺少 `FlagEmbedding`、`huggingface_hub` 及固定 revision 权重。因此 Seed 仍阻断；不得静默使用 lexical 检索。
+
+### Python 门禁
+
+本次修改的 Python 文件均保留中文模块说明；正式冻结、manifest/SUCCESS 原子写入、BGE 缺失阻断、Cue 血缘和 Seed 不复用判断均有中文关键注释。交接前须用项目 `.venv` 执行定向测试、全量测试和 `git diff --check`。

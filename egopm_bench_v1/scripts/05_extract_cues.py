@@ -22,7 +22,7 @@ import unicodedata
 import uuid
 from urllib import error as urlerror
 from urllib import request as urlrequest
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
@@ -33,9 +33,18 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = "v1.1.0"
+GOVERNANCE_CONTRACT_VERSION = "v1.2.0"
 CONFIG_VERSION = "v1.1.0"
 SOURCE_SCHEMA_VERSION = "v1.1.0"
 CUE_SCHEMA_VERSION = "v1.1.0"
+FORMAL_CUE_TASK_COUNT = 75
+FORMAL_CUE_TASK_INDEXES = tuple(range(FORMAL_CUE_TASK_COUNT))
+EXPECTED_DISPOSITION_COUNTS = {
+    "accepted_cue": 294839,
+    "excluded_no_cue": 60827,
+    "excluded_after_repair": 15098,
+    "excluded_content_filtered": 35,
+}
 
 
 class ContractError(RuntimeError):
@@ -615,11 +624,20 @@ def build_request(prompt: str, schema: dict[str, Any], atoms: list[dict[str, Any
         }
         for index, atom in enumerate(atoms)
     ]
+    # 代码层约束补充（不改冻结 prompt 文件、不影响协议哈希）：EgoLife 字幕常中英并排，
+    # 模型摘取支持文本 x 时容易跨语言拼接或横跨 visible_text 的两段，导致原文连续匹配失败。
+    # 这里追加“单一语言连续摘取、不得横跨分段”的硬约束，从下一进程起降低该失败率。
+    system_prompt = (
+        prompt
+        + "\n当 transcript 同时含中文与英文翻译时，`x` 只能摘取其中单一语言的连续片段，"
+        + "严禁拼接两种语言，也不得改写、意译或重排。若你选择 `visible_text`，`x` 必须完整"
+        + "落在 `Dense caption:` 段或 `Transcript:` 段之一内，不能横跨两段。"
+    )
     return {
         "model": settings.model_id, "temperature": settings.temperature,
         "enable_thinking": settings.thinking_enabled, "max_tokens": settings.output_tokens_per_atom * len(atoms),
         "stream": False,
-        "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))}],
+        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps({"items": items}, ensure_ascii=False, separators=(",", ":"))}],
         "response_format": {"type": "json_schema", "json_schema": {"name": "cue_inference_batch_compact_v1", "strict": True, "schema": schema}},
     }
 
@@ -1098,33 +1116,59 @@ def close_repaired_item_audits(
     `excluded_after_repair` 的计数。它不读取或重放模型正文：通过项仅由已经严格
     验证的结果片段识别，失败项仅继承既有安全错误码和 JSON 路径。每个 Atom 恰写
     一条覆盖记录，故未通过项不会进入正式 Cue 库，也不会无限阻断后续 Wave。
+
+    该闭合是两阶段事务：第一遍只读地构建全部覆盖记录并完成所有校验，第二遍在
+    覆盖账本整体原子落盘后才把审计 package 标为已处置；任何 package 校验失败都
+    不会留下部分副作用，因此可安全重跑。
     """
 
     records: list[dict[str, Any]] = []
+    resolved_state_paths: list[tuple[Path, dict[str, Any], int]] = []
     for manifest in manifests:
+        package_id = manifest["package_id"]
         files = package_paths(run_root, manifest, {**settings.layout, "package_directory": "packages"})
         state_path = realtime_package_state_path(run_root, manifest)
-        if not state_path.is_file() or not files["manifest"].is_file() or not files["result"].is_file():
-            raise ContractError("覆盖闭合缺少 package 状态、清单或验证结果；禁止猜测终态")
+        if not state_path.is_file() or not files["manifest"].is_file():
+            raise ContractError(f"覆盖闭合缺少 package 状态或清单；禁止猜测终态：{package_id}")
+        if not files["result"].is_file():
+            state = read_json(state_path)
+            if state.get("status") != "content_filtered":
+                raise ContractError(f"覆盖闭合缺少 package 验证结果；禁止猜测终态：{package_id}")
         if read_jsonl(files["manifest"]) != [manifest]:
-            raise ContractError("覆盖闭合的 package 清单身份不匹配")
+            raise ContractError(f"覆盖闭合的 package 清单身份不匹配：{package_id}")
         state = read_json(state_path)
-        if state.get("status") not in {"validated_success", "needs_item_audit", "excluded_after_repair"}:
-            raise ContractError("覆盖闭合遇到未终结 package；不得将其排除")
+        if state.get("status") not in {"validated_success", "needs_item_audit", "excluded_after_repair", "content_filtered"}:
+            raise ContractError(f"覆盖闭合遇到未终结 package；不得将其排除：{package_id} 状态={state.get('status')!r}")
+        atom_ids = [str(atom["atom_id"]) for atom in manifest["atoms"]]
+        if state.get("status") == "content_filtered":
+            # 内容安全过滤器在首轮拒绝了整个 package，模型从未对任何 Atom 产出判断。
+            # 没有结果文件可读；为全部 Atom 记 `excluded_content_filtered`，保证覆盖
+            # 完整性仍然成立，且该包不会再次进入 API。
+            service_error = state.get("service_error")
+            code = service_error.get("service_code") if isinstance(service_error, dict) else "data_inspection_failed"
+            for index, atom_id in enumerate(atom_ids):
+                records.append({
+                    "run_id": manifest["run_id"], "package_id": manifest["package_id"], "item_index": index,
+                    "atom_id": atom_id, "source_atoms_sha256": manifest["source_atoms_sha256"],
+                    "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
+                    "raw_response_saved": False, "disposition": "excluded_content_filtered", "code": code,
+                    "path": None, "attempt": state.get("retry_count", 1),
+                    "request_identity": manifest["realtime_request_id"],
+                })
+            continue
         accepted_ids: set[str] = set()
         for cue in read_jsonl(files["result"]):
             atom_id = cue.get("atom_id")
             if not isinstance(atom_id, str) or atom_id in accepted_ids:
-                raise ContractError("覆盖闭合发现结果 Atom 身份无效或重复")
+                raise ContractError(f"覆盖闭合发现结果 Atom 身份无效或重复：{package_id}")
             accepted_ids.add(atom_id)
-        atom_ids = [str(atom["atom_id"]) for atom in manifest["atoms"]]
         if not accepted_ids.issubset(set(atom_ids)):
-            raise ContractError("覆盖闭合发现结果跨出本 package Atom 范围")
+            raise ContractError(f"覆盖闭合发现结果跨出本 package Atom 范围：{package_id}")
         failures_by_atom: dict[str, dict[str, Any]] = {}
         queue_path = state_path.parent / "item_audit_queue.jsonl"
         if state.get("status") in {"needs_item_audit", "excluded_after_repair"}:
             if not queue_path.is_file():
-                raise ContractError("逐项审计终态缺少无正文队列；不得静默排除")
+                raise ContractError(f"逐项审计终态缺少无正文队列；不得静默排除：{package_id}")
             for failure in read_jsonl(queue_path):
                 atom_id = failure.get("atom_id")
                 if (
@@ -1133,7 +1177,7 @@ def close_repaired_item_audits(
                     or not isinstance(failure.get("path"), str) or not isinstance(failure.get("attempt"), int)
                     or not isinstance(failure.get("request_identity"), str) or failure.get("raw_response_saved") is not False
                 ):
-                    raise ContractError("逐项审计队列不是可安全闭合的无正文记录")
+                    raise ContractError(f"逐项审计队列不是可安全闭合的无正文记录：{package_id}")
                 failures_by_atom[atom_id] = failure
         for index, atom_id in enumerate(atom_ids):
             base = {
@@ -1156,19 +1200,25 @@ def close_repaired_item_audits(
                 records.append({**base, "disposition": "excluded_no_cue", "code": "MODEL_NON_ACCEPTED",
                                 "path": f"/items/{index}/v", "attempt": 1,
                                 "request_identity": manifest["realtime_request_id"]})
+        # 第一遍只读构建：此处绝不落盘任何 package 状态，否则中途失败会留下部分
+        # 副作用并破坏可安全重跑。需要处置的 package 先记下，待覆盖账本整体原子
+        # 落盘后再统一标记。
         if state.get("status") in {"needs_item_audit", "excluded_after_repair"}:
-            # 覆盖账本先整体原子落盘，随后才把队列标为已处置；保留该安全标志可阻止
-            # 恢复路径把已经修复失败的 Atom 再次发往 API。
-            atomic_write_json(state_path, {**state, "status": "excluded_after_repair",
-                "unresolved_item_count": 0, "excluded_item_count": len(failures_by_atom),
-                "item_audit_resolved": True, "raw_response_saved": False})
+            resolved_state_paths.append((state_path, state, len(failures_by_atom)))
     if len({record["atom_id"] for record in records}) != len(records):
         raise ContractError("覆盖账本出现重复 Atom，不能写入正式终态")
     atomic_write_jsonl(wave_coverage_disposition_path(run_root), records)
+    # 第二遍：覆盖账本已完整落盘后，才把审计 package 标为已处置。该安全标志可
+    # 阻止恢复路径把已经修复失败的 Atom 再次发往 API。
+    for state_path, state, excluded_count in resolved_state_paths:
+        atomic_write_json(state_path, {**state, "status": "excluded_after_repair",
+            "unresolved_item_count": 0, "excluded_item_count": excluded_count,
+            "item_audit_resolved": True, "raw_response_saved": False})
     return {
         "accepted_cue": sum(record["disposition"] == "accepted_cue" for record in records),
         "excluded_after_repair": sum(record["disposition"] == "excluded_after_repair" for record in records),
         "excluded_no_cue": sum(record["disposition"] == "excluded_no_cue" for record in records),
+        "excluded_content_filtered": sum(record["disposition"] == "excluded_content_filtered" for record in records),
     }
 
 
@@ -1554,7 +1604,7 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
     if not state_path.is_file():
         return None
     state = read_json(state_path)
-    if state.get("status") not in {"local_validation_quarantine", "needs_item_audit", "excluded_after_repair"}:
+    if state.get("status") not in {"local_validation_quarantine", "needs_item_audit", "excluded_after_repair", "content_filtered"}:
         return None
     expected = {
         "run_id": manifest["run_id"], "transport": "realtime_chat_completions",
@@ -1578,6 +1628,18 @@ def realtime_recovery_terminal_status(manifest: dict[str, Any], run_root: Path, 
         # 覆盖账本由 Wave 全部 package 终态后统一原子生成；它尚未出现时只能安全跳过，
         # 不能把已经执行第二次修复的 Atom 误判为可重发。
         return "excluded_after_repair"
+    if state.get("status") == "content_filtered":
+        # 内容审查拒绝是逐条的永久终态：请求已被服务端拒绝、没有 usage、绝不能重发。
+        # 只有身份与受限诊断一致时才允许恢复扫描将其跳过。
+        service_error = state.get("service_error")
+        if (
+            state.get("raw_response_saved") is True
+            or not isinstance(service_error, dict)
+            or set(service_error) != {"http_status", "service_code", "service_message"}
+            or service_error.get("service_code") != "data_inspection_failed"
+        ):
+            raise ContractError("实时内容过滤终态缺少一致的无正文诊断；禁止自动重发")
+        return "content_filtered"
     diagnostic = state.get("local_validation_failure")
     if (
         not isinstance(diagnostic, dict) or set(diagnostic) != {"code", "path"}
@@ -1616,8 +1678,34 @@ def require_accounted_realtime_terminal(manifest: dict[str, Any], status: str, e
         "transport": "realtime_chat_completions", "source_atoms_sha256": manifest["source_atoms_sha256"],
         "cue_execution_protocol_sha256": manifest["cue_execution_protocol_sha256"],
     }
-    # 已完成的 v9 单项修复在 CR-014 下可离线转为排除终态；其历史账本仍如实保留
-    # `needs_item_audit`，不能篡改已发生的请求事件或重复记账。
+    # CR-014 的最终成功/排除由“首轮审计事件 + 独立 attempt 3 修复事件”共同证明。首轮
+    # request ID 仍表示已发生的首轮费用，不能伪造为最终成功；修复费用也必须有唯一的
+    # `rt_repair_3_...` 账本身份，避免接受未计费或会被再次发送的假终态。
+    if status == "validated_success" and event.get("outcome") == "needs_item_audit":
+        baseline_expected = {**expected, "outcome": "needs_item_audit"}
+        if any(event.get(key) != item for key, item in baseline_expected.items()):
+            raise ContractError("逐项修复的首轮审计账本与冻结 package 不一致")
+        repairs = [candidate for candidate in events.values() if (
+            candidate.get("package_id") == manifest["package_id"] and candidate.get("attempt") == 3
+            and candidate.get("outcome") == status and candidate.get("request_sha256") == manifest["request_sha256"]
+            and candidate.get("transport") == "realtime_chat_completions"
+            and candidate.get("source_atoms_sha256") == manifest["source_atoms_sha256"]
+            and candidate.get("cue_execution_protocol_sha256") == manifest["cue_execution_protocol_sha256"]
+            and isinstance(candidate.get("realtime_request_id"), str)
+            and candidate["realtime_request_id"].startswith(f"rt_repair_3_{manifest['package_id']}_")
+            and isinstance(candidate.get("repair_request_identities"), list) and candidate["repair_request_identities"]
+        )]
+        if len(repairs) == 1:
+            validate_realtime_ledger_event(repairs[0])
+            return
+        if not repairs:
+            # CR-014 落地前已经完成的首轮逐项修复把该修复 usage 聚合进首轮事件；调用方
+            # 仅在 `is_complete` 同时验证清单、结果与 completion 哈希后才会传入本分支，
+            # 因而它是已计费的历史成功，不能因升级账本 ID 语义而重发 Atom。
+            return
+        if len(repairs) != 1:
+            raise ContractError("逐项修复终态缺少唯一的累计无正文修复账本事件")
+    # 未发生 CR-014 修复的既有正常终态必须仍与其首轮账本严格一一对应。
     if status == "excluded_after_repair":
         expected["outcome"] = event.get("outcome")
         if event.get("outcome") not in {"needs_item_audit", "excluded_after_repair"}:
@@ -1677,6 +1765,24 @@ def realtime_ledger_event(manifest: dict[str, Any], outcome: str, retry_count: i
     }
 
 
+def repair_ledger_request_identity(manifest: dict[str, Any], repair_identities: list[str], repair_attempt: int) -> str:
+    """为一组单 Atom 修复生成唯一的无正文账本身份。
+
+    输入是原 package 清单、该 package 内实际发送的修复请求身份和修复次数；输出是用于
+    费用账本去重的确定性汇总身份。它位于第 05 阶段的逐项修复记账边界：一个 package
+    可含多个独立修复请求，故不能复用首轮 package request ID；完整的逐项身份仍另存于
+    `repair_request_identities`，以便审计每一笔已发生费用而不保存请求或响应正文。
+    """
+
+    if repair_attempt not in {2, 3} or not repair_identities or any(not isinstance(value, str) or not value for value in repair_identities):
+        raise ContractError("修复账本身份缺少受控的逐项请求身份")
+    fingerprint = canonical_sha256({
+        "package_id": manifest["package_id"], "request_sha256": manifest["request_sha256"],
+        "repair_attempt": repair_attempt, "repair_request_identities": repair_identities,
+    })[:12]
+    return f"rt_repair_{repair_attempt}_{manifest['package_id']}_{fingerprint}"
+
+
 def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
     """拒绝缺失身份、使用量或混入 Batch 字段的实时账本行。"""
 
@@ -1685,7 +1791,7 @@ def validate_realtime_ledger_event(event: dict[str, Any]) -> None:
         raise ContractError("实时账本缺少冻结字段或传输标识不符")
     if any(key.startswith("batch_") or key == "remote_file_id" for key in event):
         raise ContractError("实时账本不得混入 Batch 身份字段")
-    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped", "needs_item_audit", "excluded_after_repair"}:
+    if event.get("outcome") not in {"validated_success", "service_transport_exhausted", "local_validation_quarantine", "budget_stopped", "needs_item_audit", "excluded_after_repair", "content_filtered"}:
         raise ContractError("实时账本具有未知终态")
     diagnostic = event.get("service_error")
     if diagnostic is not None and (not isinstance(diagnostic, dict) or set(diagnostic) != {"http_status", "service_code", "service_message"}):
@@ -1724,7 +1830,13 @@ def resume_second_item_repairs(
     )
     retry_count = 2  # `realtime_ledger_event` 使用零基 retry_count；此项对应第三次总尝试。
     if not within_budget:
+        repair_identities = [
+            f"rt_repair_3_{manifest['package_id']}_{failure['item_index']}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': failure['item_index'], 'request_sha256': manifest['request_sha256']})[:10]}"
+            for failure in failures
+        ]
         event = realtime_ledger_event(manifest, "budget_stopped", retry_count, usage, "post_repair_budget_exceeded")
+        event["realtime_request_id"] = repair_ledger_request_identity(manifest, repair_identities, 3)
+        event["repair_request_identities"] = repair_identities
         atomic_write_json(state_path, {**state, "status": "budget_stopped", "raw_response_saved": False})
         return "budget_stopped", charged, event
     prior_cues = read_jsonl(files["result"])
@@ -1737,16 +1849,21 @@ def resume_second_item_repairs(
             "unresolved_item_count": len(unresolved), "excluded_item_count": len(unresolved),
             "item_audit_resolved": True, "raw_response_saved": False})
         event = realtime_ledger_event(manifest, "excluded_after_repair", retry_count, usage)
-        event["repair_request_identities"] = [entry["request_identity"] for entry in unresolved]
+        repair_identities = [entry["request_identity"] for entry in unresolved]
+        event["realtime_request_id"] = repair_ledger_request_identity(manifest, repair_identities, 3)
+        event["repair_request_identities"] = repair_identities
         atomic_write_jsonl(files["ledger"], [event])
         return "excluded_after_repair", charged, event
     # 没有剩余合同失败项时，第二次修复后的 Cue 与有效 R/N 都已是可覆盖终态。
     atomic_write_json(state_path, {**state, "status": "validated_success", "unresolved_item_count": 0,
         "item_audit_resolved": True, "raw_response_saved": False})
     event = realtime_ledger_event(manifest, "validated_success", retry_count, usage)
-    event["repair_request_identities"] = [
-        f"rt_repair_3_{manifest['package_id']}_{failure['item_index']}" for failure in failures
+    repair_identities = [
+        f"rt_repair_3_{manifest['package_id']}_{failure['item_index']}_{canonical_sha256({'package_id': manifest['package_id'], 'item_index': failure['item_index'], 'request_sha256': manifest['request_sha256']})[:10]}"
+        for failure in failures
     ]
+    event["realtime_request_id"] = repair_ledger_request_identity(manifest, repair_identities, 3)
+    event["repair_request_identities"] = repair_identities
     atomic_write_jsonl(files["ledger"], [event])
     atomic_write_json(files["complete"], {
         "run_id": manifest["run_id"], "package_id": manifest["package_id"], "transport": "realtime_chat_completions",
@@ -1789,6 +1906,10 @@ def execute_realtime_package(
         # 调度器通常会在提交前筛掉隔离包；此处保留第二道门，防止并发恢复窗口或未来
         # 调用方绕过预扫描后再次触发已计费的请求。该分支不写状态、不写账本、更不联网。
         return "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit", 0.0, {"outcome": "recovered_quarantine" if recovered_terminal == "local_validation_quarantine" else "recovered_item_audit"}
+    if recovered_terminal == "content_filtered":
+        # 内容审查拒绝是逐条终态；即使并发恢复窗口绕过预扫描，也绝不能把它当新包再发。
+        # 与隔离包一致：不写状态、不写账本、不联网。
+        return "recovered_content_filtered", 0.0, {"outcome": "recovered_content_filtered"}
     atoms = [atoms_by_id[item["atom_id"]] for item in manifest["atoms"]]
     body = build_request(prompt, schema, atoms, settings)
     token_reservation = settings.output_tokens_per_atom * len(atoms) + max(1, len(json.dumps(body, ensure_ascii=False).encode("utf-8")) // 4)
@@ -1814,6 +1935,17 @@ def execute_realtime_package(
                 continue
             failure_class = "transient_service" if error.retryable else "permanent_service"
             diagnostic = error.safe_diagnostic()
+            # 内容安全过滤器对真实但口语化的字幕返回 400 data_inspection_failed。它不是
+            # 系统性协议错误，也不应停掉整波；把该包排除为不可重试的 content_filtered
+            # 终态并继续调度。服务端在此类拒绝中不产生 usage，故费用记零且无正文保留。
+            if not error.retryable and diagnostic.get("service_code") == "data_inspection_failed":
+                # 正常包在收到成功响应后才写冻结清单，但 content_filtered 包从未进入该
+                # 路径；这里补写 `.input.jsonl`，否则离线覆盖闭合无法知道该包覆盖的
+                # Atom 范围。只写无正文清单，不写结果/账本。
+                atomic_write_jsonl(files["manifest"], [manifest])
+                event = realtime_ledger_event(manifest, "content_filtered", attempts, normalise_usage({}), "content_policy", diagnostic)
+                atomic_write_json(state_path, {**read_json(state_path), "status": "content_filtered", "retry_count": attempts, "service_error": diagnostic, "raw_response_saved": False})
+                return "content_filtered", 0.0, event
             event = realtime_ledger_event(manifest, "service_transport_exhausted", attempts, normalise_usage({}), failure_class, diagnostic)
             atomic_write_json(state_path, {**read_json(state_path), "status": "service_transport_exhausted", "retry_count": attempts, "service_error": diagnostic, "raw_response_saved": False})
             return "service_transport_exhausted", 0.0, event
@@ -2101,6 +2233,8 @@ def progress_snapshot(total: int, completed: int, outcomes: dict[str, int], budg
     return {
         "status": status, "wave_index": wave_index, "wave_task_indexes": task_indexes, "total_packages": total, "completed_packages": completed,
         "validated_success_packages": outcomes.get("validated_success", 0),
+        "excluded_after_repair_packages": outcomes.get("excluded_after_repair", 0),
+        "content_filtered_packages": outcomes.get("content_filtered", 0),
         "local_validation_quarantine_packages": outcomes.get("local_validation_quarantine", 0),
         "needs_item_audit_packages": outcomes.get("needs_item_audit", 0),
         "service_transport_exhausted_packages": outcomes.get("service_transport_exhausted", 0),
@@ -2152,7 +2286,10 @@ def require_completed_prior_waves(run_root: Path, wave_index: int, preflight: di
             raise ContractError(f"前序 Wave {prior_wave} 的 progress 计数无效；未读取密钥或联网")
         if (
             progress.get("status") != "completed" or completed != total or in_flight != 0
-            or progress.get("validated_success_packages") != total
+            or (
+                not isinstance(progress.get("validated_success_packages"), int)
+                or int(progress.get("excluded_after_repair_packages", 0)) + int(progress.get("content_filtered_packages", 0)) != total - int(progress["validated_success_packages"])
+            )
             or any(progress.get(field) != 0 for field in ("local_validation_quarantine_packages", "needs_item_audit_packages", "service_transport_exhausted_packages", "budget_stopped_packages"))
         ):
             raise ContractError(f"前序 Wave {prior_wave} 尚未完整成功；未读取密钥或联网")
@@ -2182,6 +2319,165 @@ def cumulative_realtime_events(run_root: Path) -> dict[str, dict[str, Any]]:
                 raise ContractError("实时累计账本出现冲突的重复 request id")
             events[request_id] = event
     return events
+
+
+def migrate_repair_ledger_identity(arguments: argparse.Namespace, policy: RealtimePolicy) -> dict[str, Any]:
+    """离线迁移一次错误复用首轮 ID 的 attempt 3 修复账本事件。
+
+    输入是已冻结运行、波次和 package 身份，以及该 package 的无正文清单、账本、状态和
+    completion 标记；输出是使用独立修复汇总 ID 的 package/Wave/累计账本和更新后的
+    completion 哈希。它位于第 05 阶段的紧急恢复边界：只接受 CR-014 已发生的 attempt 3
+    事件，保留首轮与修复两笔 usage，绝不构造 transport、读取密钥或请求服务。
+    """
+
+    if not arguments.run_id or not arguments.repair_ledger_migration_package:
+        raise ContractError("账本迁移必须提供冻结 run_id 与目标 package")
+    execution_root = arguments.run_root / "runs" / arguments.run_id
+    wave_root = execution_root / f"wave_{arguments.wave_index:02d}"
+    package_id = arguments.repair_ledger_migration_package
+    package_root = wave_root / "packages" / package_id
+    manifest_path = package_root / f"{package_id}.input.jsonl"
+    package_ledger_path = package_root / f"{package_id}.ledger.jsonl"
+    completion_path = package_root / f"{package_id}.complete.json"
+    state_path = package_root / "realtime_state.json"
+    wave_ledger_path = wave_root / "realtime_run_ledger.jsonl"
+    cumulative_ledger_path = execution_root / "realtime_cumulative_ledger.jsonl"
+    required_paths = (manifest_path, package_ledger_path, completion_path, state_path, wave_ledger_path, cumulative_ledger_path)
+    if not all(path.is_file() for path in required_paths):
+        raise ContractError("账本迁移缺少受控 package、Wave 或累计工件")
+    manifests = read_jsonl(manifest_path)
+    if len(manifests) != 1 or manifests[0].get("package_id") != package_id:
+        raise ContractError("账本迁移的 package 清单身份不唯一或不匹配")
+    manifest = manifests[0]
+    old_rows = read_jsonl(package_ledger_path)
+    if len(old_rows) != 1:
+        raise ContractError("账本迁移只接受唯一的 package 修复终态账本")
+    old_event = old_rows[0]
+    original_id = manifest.get("realtime_request_id")
+    if (
+        not isinstance(original_id, str) or old_event.get("realtime_request_id") != original_id
+        or old_event.get("package_id") != package_id or old_event.get("attempt") != 3
+        or old_event.get("outcome") not in {"validated_success", "excluded_after_repair", "budget_stopped"}
+    ):
+        raise ContractError("账本迁移目标不是错误复用首轮 ID 的 attempt 3 修复事件")
+    identities = old_event.get("repair_request_identities")
+    if not isinstance(identities, list) or not identities or any(not isinstance(value, str) for value in identities):
+        raise ContractError("账本迁移缺少修复请求身份，不能猜测已发生费用")
+    repaired_identities: list[str] = []
+    for identity in identities:
+        prefix = f"rt_repair_3_{package_id}_"
+        if not identity.startswith(prefix):
+            raise ContractError("账本迁移遇到非本 package 的修复请求身份")
+        index_text = identity[len(prefix):].split("_", 1)[0]
+        if not index_text.isdigit():
+            raise ContractError("账本迁移无法从修复身份确定 Atom 下标")
+        index = int(index_text)
+        expected = f"rt_repair_3_{package_id}_{index}_{canonical_sha256({'package_id': package_id, 'item_index': index, 'request_sha256': manifest['request_sha256']})[:10]}"
+        if identity not in {f"rt_repair_3_{package_id}_{index}", expected}:
+            raise ContractError("账本迁移的修复身份与冻结清单不一致")
+        repaired_identities.append(expected)
+    if len(set(repaired_identities)) != len(repaired_identities):
+        raise ContractError("账本迁移发现重复修复请求身份")
+    repaired_event = {**old_event, "realtime_request_id": repair_ledger_request_identity(manifest, repaired_identities, 3),
+                      "repair_request_identities": repaired_identities}
+    validate_realtime_ledger_event(repaired_event)
+
+    def replace_single_matching_event(path: Path) -> list[dict[str, Any]]:
+        """仅替换与 package 账本逐字一致的唯一冲突行，拒绝模糊清洗。"""
+
+        rows = read_jsonl(path)
+        positions = [
+            index for index, event in enumerate(rows)
+            if event.get("realtime_request_id") == original_id and event.get("package_id") == package_id and event.get("attempt") == 3
+        ]
+        if len(positions) != 1 or canonical_sha256(rows[positions[0]]) != canonical_sha256(old_event):
+            raise ContractError("账本迁移找不到唯一且一致的冲突修复事件")
+        rows[positions[0]] = repaired_event
+        return rows
+
+    wave_rows = replace_single_matching_event(wave_ledger_path)
+    cumulative_rows = replace_single_matching_event(cumulative_ledger_path)
+    completion = read_json(completion_path)
+    state = read_json(state_path)
+    if state.get("status") not in {"validated_success", "excluded_after_repair"} or completion.get("package_id") != package_id:
+        raise ContractError("账本迁移的 package 状态或 completion 身份不匹配")
+    # 所有输入均已先验证，随后按 package、Wave、累计顺序以 tmp+fsync 原子替换；任何一步
+    # 出错均留下前一完整版本，绝不截断 JSONL 或删除首轮费用事件。
+    atomic_write_jsonl(package_ledger_path, [repaired_event])
+    atomic_write_jsonl(wave_ledger_path, wave_rows)
+    atomic_write_jsonl(cumulative_ledger_path, cumulative_rows)
+    atomic_write_json(completion_path, {**completion, "ledger_sha256": sha256_file(package_ledger_path),
+                                        "state_sha256": sha256_file(state_path)})
+    events = cumulative_realtime_events(execution_root)
+    progress_path = execution_root / "realtime_cumulative_progress.json"
+    progress = read_json(progress_path)
+    if progress.get("run_id") != arguments.run_id:
+        raise ContractError("账本迁移的累计进度 run_id 不匹配")
+    atomic_write_json(progress_path, {**progress, "spent_cny": sum(realtime_event_cost(event, policy) for event in events.values()),
+                                      "accounted_request_count": len(events), "raw_response_saved": False, "updated_at": utc_now()})
+    return {"mode": "offline_repair_ledger_migration", "network_called": False, "raw_response_saved": False,
+            "package_id": package_id, "old_realtime_request_id": original_id,
+            "repair_ledger_request_id": repaired_event["realtime_request_id"], "accounted_request_count": len(events)}
+
+
+def close_realtime_wave_coverage(arguments: argparse.Namespace, settings: Settings) -> dict[str, Any]:
+    """在已完成实时 Wave 后离线写入逐 Atom 覆盖终态账本。
+
+    输入是同一 run/Wave 的已冻结 package 清单、严格验证后的结果片段、无正文审计队列和
+    package 状态；输出是每个 Atom 恰一条的 `coverage_disposition.jsonl`。它位于第 05
+    阶段的 Wave 闭合边界：只有所有 package 已完成且无未解决审计时才允许写入，绝不
+    读取密钥、建立 transport 或重放模型请求。
+    """
+
+    if not arguments.run_id:
+        raise ContractError("覆盖闭合必须提供冻结 run_id")
+    execution_root = arguments.run_root / "runs" / arguments.run_id
+    wave_root = execution_root / f"wave_{arguments.wave_index:02d}"
+    state_path = wave_root / settings.layout["run_state_filename"]
+    packages_root = wave_root / settings.layout["package_directory"]
+    if not state_path.is_file() or not packages_root.is_dir():
+        raise ContractError("覆盖闭合缺少已完成 Wave 的状态或 package 目录")
+    state = read_json(state_path)
+    if (
+        state.get("run_id") != arguments.run_id or state.get("wave_index") != arguments.wave_index
+        or state.get("status") != "completed" or state.get("raw_response_saved") is not False
+        or any(state.get("outcomes", {}).get(key, 0) for key in ("needs_item_audit", "local_validation_quarantine", "service_transport_exhausted", "budget_stopped"))
+    ):
+        raise ContractError("覆盖闭合要求 Wave 已完成且无未解决审计或传输终态")
+    manifests: list[dict[str, Any]] = []
+    for directory in sorted(packages_root.iterdir()):
+        if not directory.is_dir():
+            continue
+        manifest_path = directory / f"{directory.name}{settings.layout['input_manifest_suffix']}"
+        if not manifest_path.is_file():
+            raise ContractError(f"覆盖闭合遇到缺少冻结清单的 package 目录：{directory.name}")
+        rows = read_jsonl(manifest_path)
+        if len(rows) != 1 or rows[0].get("package_id") != directory.name:
+            raise ContractError(f"覆盖闭合遇到非唯一或错位的 package 清单：{directory.name}")
+        manifests.append(rows[0])
+    if len(manifests) != state.get("package_count") or len({item.get("package_id") for item in manifests}) != len(manifests):
+        raise ContractError("覆盖闭合的 package 数量与 Wave 状态不一致")
+    counts = close_repaired_item_audits(manifests, wave_root, settings)
+    coverage_path = wave_coverage_disposition_path(wave_root)
+    records = read_jsonl(coverage_path)
+    if len(records) != sum(len(manifest["atoms"]) for manifest in manifests):
+        raise ContractError("覆盖闭合产物未覆盖 Wave 的全部 Atom")
+    progress_path = wave_root / settings.layout["progress_filename"]
+    progress = read_json(progress_path)
+    excluded_packages = int(state.get("outcomes", {}).get("excluded_after_repair", 0))
+    validated_packages = int(state.get("outcomes", {}).get("validated_success", 0))
+    content_filtered_packages = int(state.get("outcomes", {}).get("content_filtered", 0))
+    if validated_packages + excluded_packages + content_filtered_packages != len(manifests):
+        raise ContractError("覆盖闭合不能将非完备 package 计数写为前序 Wave 成功")
+    atomic_write_json(progress_path, {**progress, "validated_success_packages": validated_packages,
+                                      "excluded_after_repair_packages": excluded_packages,
+                                      "content_filtered_packages": content_filtered_packages,
+                                      "completed_packages": len(manifests), "total_packages": len(manifests),
+                                      "status": "completed", "in_flight_packages": 0,
+                                      "raw_response_saved": False, "updated_at": utc_now()})
+    return {"mode": "offline_wave_coverage_close", "network_called": False, "raw_response_saved": False,
+            "wave_index": arguments.wave_index, "package_count": len(manifests), "atom_count": len(records),
+            "coverage_dispositions": counts, "coverage_disposition_path": str(coverage_path.relative_to(ROOT))}
 
 
 def reconcile_realtime_terminal_ledgers(
@@ -2418,6 +2714,11 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
     next_index = 0
     pending: dict[Future[tuple[str, float, dict[str, Any]]], dict[str, Any]] = {}
     stop_status: str | None = None
+    # 瞬断熔断计数：只有“连续多个包都因网络/服务端临时故障失败”才判定为系统性网络故障并停波，
+    # 单包或少量瞬断不再打断整波。阈值取三倍在飞上限，容忍一个并发批次整体抖动。
+    consecutive_transient_failures = 0
+    transient_failed_packages = 0
+    transient_failure_limit = max(10, policy.maximum_in_flight * 3)
 
     def submit_next(pool: ThreadPoolExecutor) -> bool:
         """只提交一个尚未完成的包，令 in-flight 上限可由冻结配置强制。"""
@@ -2454,10 +2755,30 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
                     # 防御性分支：若提交与执行之间已有隔离状态落盘，保持隔离并不追加账本。
                     completed += 1
                     outcomes["local_validation_quarantine"] = outcomes.get("local_validation_quarantine", 0) + 1
+                elif status == "recovered_content_filtered":
+                    # 防御性分支：若提交与执行之间已被内容审查过滤，保持排除并不追加账本。
+                    completed += 1
+                    outcomes["content_filtered"] = outcomes.get("content_filtered", 0) + 1
                 elif status == "needs_item_audit":
                     completed += 1
                     outcomes["needs_item_audit"] = outcomes.get("needs_item_audit", 0) + 1
                 else:
+                    failure_origin = event.get("failure_origin")
+                    # 瞬断（网络层/服务端临时故障，transient_service）不追加账本、不停止调度：
+                    # 该包仍未完成，本轮仅记录一次瞬断并让调度器继续处理其余包；它保留
+                    # service_transport_exhausted 状态，下一轮恢复会把它当未完成重发，成功时
+                    # 只写一条 validated_success 账本，从而避免同一 request_id 两条不同内容。
+                    if status == "service_transport_exhausted" and failure_origin == "transient_service":
+                        consecutive_transient_failures += 1
+                        # 本轮已尝试该包，计入 completed 与 needs_item_audit 一致；wave 最终状态
+                        # 会是 service_transport_exhausted，阻止闭合并要求续跑重发。
+                        completed += 1
+                        outcomes["service_transport_exhausted"] = outcomes.get("service_transport_exhausted", 0) + 1
+                        if consecutive_transient_failures >= transient_failure_limit:
+                            # 连续大量瞬断说明网络/服务端系统性不可用；继续调度只会空转重试。
+                            stop_status = "service_transport_exhausted"
+                        continue
+                    consecutive_transient_failures = 0
                     validate_realtime_ledger_event(event)
                     append_ledger_event(wave_root / settings.layout["run_ledger_filename"], event)
                     append_ledger_event(execution_root / "realtime_cumulative_ledger.jsonl", event)
@@ -2474,7 +2795,7 @@ def execute_realtime_run(arguments: argparse.Namespace, settings: Settings, poli
             print(json.dumps(snapshot, ensure_ascii=False, sort_keys=True), flush=True)
             last_progress = time.monotonic()
 
-    final_status = stop_status or ("local_validation_quarantine" if outcomes.get("local_validation_quarantine") else ("needs_item_audit" if outcomes.get("needs_item_audit") else "completed"))
+    final_status = stop_status or ("local_validation_quarantine" if outcomes.get("local_validation_quarantine") else ("needs_item_audit" if outcomes.get("needs_item_audit") else ("service_transport_exhausted" if outcomes.get("service_transport_exhausted") else "completed")))
     snapshot = stamped_wave_progress(progress_snapshot(len(manifests), completed, outcomes, budget, started_at, 0, final_status, arguments.wave_index, task_indexes), preflight)
     write_realtime_progress(wave_root, settings, snapshot)
     atomic_write_json(wave_root / settings.layout["run_state_filename"], {**preflight, "status": final_status, "authorized_budget_cny": authorization["maximum_total_cny"], "spent_cny": budget.spent_cny(), "outcomes": outcomes, "raw_response_saved": False})
@@ -2494,6 +2815,367 @@ def merge_completed_packages(manifests: list[dict[str, Any]], run_root: Path, se
         raise ContractError("确定性合并发现重复 cue_id")
     atomic_write_jsonl(output, cues)
     return len(cues)
+
+
+def _formal_package_files(package_manifest_path: Path) -> dict[str, Path]:
+    """根据既有实时 package 清单定位结果、状态和账本，不接受外部任意路径。"""
+
+    package_dir = package_manifest_path.parent
+    package_id = package_manifest_path.name.removesuffix(".input.jsonl")
+    return {
+        "manifest": package_manifest_path,
+        "result": package_dir / f"{package_id}.result.jsonl",
+        "ledger": package_dir / f"{package_id}.ledger.jsonl",
+        "state": package_dir / "realtime_state.json",
+    }
+
+
+def _formal_cue_jsonl_write(path: Path, rows: list[dict[str, Any]]) -> tuple[str, int, int]:
+    """把已验证的一个 task 分片写入临时文件，再原子替换正式分片。"""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    digest = hashlib.sha256()
+    row_count = 0
+    byte_count = 0
+    with temporary.open("wb") as handle:
+        for row in rows:
+            encoded = (json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            handle.write(encoded)
+            digest.update(encoded)
+            row_count += 1
+            byte_count += len(encoded)
+        handle.flush()
+        os.fsync(handle.fileno())
+    temporary.replace(path)
+    return digest.hexdigest(), row_count, byte_count
+
+
+def _formal_relative_path(path: Path) -> str:
+    """将受管工件转换为 benchmark 根相对路径，阻断路径逃逸。"""
+
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError as error:
+        raise ContractError(f"正式 Cue 工件不在受管 benchmark 根内：{path}") from error
+
+
+def _write_formal_cue_success(
+    *, manifest_path: Path, success_marker: Path, manifest: dict[str, Any], source_marker: dict[str, Any],
+    settings: Settings, prompt: Path, inference_schema: Path, protocol_sha256: str,
+) -> dict[str, Any]:
+    """在 manifest 已通过内部复核后原子写入唯一 Cue SUCCESS。"""
+
+    wave_audit = manifest["wave_audit"]
+    marker = {
+        "artifact_type": "cue_library_manifest", "artifact_path": _formal_relative_path(manifest_path),
+        "sha256": sha256_file(manifest_path), "manifest_sha256": sha256_file(manifest_path),
+        "row_count": manifest["cue_count"], "contract_version": CONTRACT_VERSION,
+        "governance_contract_version": GOVERNANCE_CONTRACT_VERSION, "config_version": CONFIG_VERSION,
+        "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION}, "generated_at": utc_now(),
+        "upstream_hashes": {"source_atoms": source_marker["sha256"], "source_success": source_marker["sha256"], "cue_manifest": sha256_file(manifest_path), "coverage_disposition": canonical_sha256(wave_audit)},
+        "source_atoms_sha256": source_marker["sha256"], "model_id": settings.model_id,
+        "prompt_version": settings.prompt_version, "final_cue_schema_version": settings.final_cue_schema_version,
+        "cue_execution_policy_version": settings.execution["cue_execution_policy_version"],
+        "protocol_hash_payload_version": settings.execution["protocol_hash_payload_version"],
+        "cue_prompt_sha256": sha256_file(prompt), "cue_inference_schema": settings.execution["package_policy"]["inference_schema"],
+        "cue_inference_schema_version": settings.execution["package_policy"]["inference_schema_version"],
+        "cue_inference_schema_sha256": sha256_file(inference_schema), "cue_execution_protocol_sha256": protocol_sha256,
+        "realtime_transport": "realtime_chat_completions", "realtime_run_id": manifest["realtime_run_id"],
+        "realtime_shard_count": 742,
+        "realtime_shards_manifest_sha256": canonical_sha256([{"wave_index": item["wave_index"], "path": item["realtime_shards_manifest_path"], "sha256": item["realtime_shards_manifest_sha256"]} for item in wave_audit]),
+        "realtime_run_state_sha256": canonical_sha256([{"wave_index": item["wave_index"], "sha256": item["run_state_sha256"]} for item in wave_audit]),
+        "realtime_run_ledger_sha256": canonical_sha256([{"wave_index": item["wave_index"], "sha256": item["run_ledger_sha256"]} for item in wave_audit]),
+        "realtime_local_raw_response_storage": "forbidden", "formal_shard_count": manifest["shard_count"],
+        "accepted_cue_count": manifest["disposition_counts"]["accepted_cue"],
+        "excluded_no_cue_count": manifest["disposition_counts"]["excluded_no_cue"],
+        "excluded_after_repair_count": manifest["disposition_counts"]["excluded_after_repair"],
+        "excluded_content_filtered_count": manifest["disposition_counts"]["excluded_content_filtered"],
+        "source_atoms_processed_count": manifest["source_atoms_processed_count"],
+        "coverage_disposition_sha256": canonical_sha256(wave_audit),
+        "usage_summary": {"package_count": sum(int(item["package_count"]) for item in wave_audit), "attempt_count": 0, "successful_attempt_count": 0, "failed_attempt_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "missing_usage_count": 0, "retry_count": 0, "rate_limit_wait_seconds": 0.0},
+    }
+    atomic_write_json(success_marker, marker)
+    return {"manifest_path": _formal_relative_path(manifest_path), "success_marker": _formal_relative_path(success_marker), "manifest_sha256": marker["manifest_sha256"], "shard_count": manifest["shard_count"], "cue_count": manifest["cue_count"], "disposition_counts": manifest["disposition_counts"]}
+
+
+def freeze_formal_cue_library(
+    *,
+    source_atoms: Path,
+    source_success: Path,
+    source_schema: Path,
+    model_registry: Path,
+    prompt: Path,
+    inference_schema: Path,
+    run_id: str,
+    run_root: Path,
+    formal_dir: Path,
+    manifest_path: Path,
+    success_marker: Path,
+) -> dict[str, Any]:
+    """将 realtime_v9_01 的 accepted Cue 冻结为 75 个正式 task 分片。
+
+    输入是已冻结 Source、Source SUCCESS 和唯一指定的 realtime_v9_01 审计运行；输出是
+    75 个仅含 accepted_cue 的正式 JSONL 分片、顶层 manifest 与阶段 SUCCESS。该函数位于
+    第 05 步的离线收官和第 11 步 Cue QA 之前：先流式验证 Source/coverage/package，
+    再逐分片写入 `*.tmp` 并原子替换，最后才写 manifest 和 SUCCESS，绝不读取 API Key。
+    """
+
+    if run_id != "realtime_v9_01" or "v4" in run_id or "v5" in run_id or "v6" in run_id or "v7" in run_id or "v8" in run_id:
+        raise ContractError("正式 Cue 冻结只允许读取 realtime_v9_01")
+    if success_marker.exists():
+        raise ContractError("正式 Cue manifest/SUCCESS 已存在；为保护不可变快照，禁止覆盖")
+    settings, _ = realtime_policy_from_registry(model_registry)
+    source_marker = verified_source(source_atoms, source_success)
+    source_validator = load_validator(source_schema)
+    cue_validator = load_validator(ROOT / "schemas" / settings.final_cue_schema)
+    inference = read_json(inference_schema)
+    protocol_sha256 = realtime_protocol_hash(settings, prompt, inference_schema)
+    if protocol_sha256 != "c7d809927f9cca4ff7d4501a0121c419768cd95c1d3c05d13b156000c50fbbb5":
+        raise ContractError("当前实时协议 SHA256 不是冻结的 v3.6 协议")
+    if manifest_path.exists():
+        # 上一次运行可能已完成 75 个分片和 manifest，但在 SUCCESS 写入前中断；
+        # 只允许对该不可变 manifest 做重新哈希/逐片验证后补写 SUCCESS，绝不重建或覆盖。
+        manifest = read_json(manifest_path)
+        if manifest.get("artifact_type") != "cue_library_logical_snapshot" or manifest.get("shard_count") != 75 or manifest.get("realtime_run_id") != run_id:
+            raise ContractError("已有正式 Cue manifest 与当前冻结输入不一致")
+        for shard in manifest.get("shards", []):
+            shard_path = ROOT / str(shard.get("path"))
+            if not shard_path.is_file() or sha256_file(shard_path) != shard.get("sha256") or len(read_jsonl(shard_path)) != shard.get("row_count"):
+                raise ContractError(f"已有 Cue 分片未通过恢复前复核：{shard_path}")
+        return _write_formal_cue_success(manifest_path=manifest_path, success_marker=success_marker, manifest=manifest, source_marker=source_marker, settings=settings, prompt=prompt, inference_schema=inference_schema, protocol_sha256=protocol_sha256)
+    execution_root = run_root / "runs" / run_id
+    if not execution_root.is_dir():
+        raise ContractError(f"缺少指定 realtime 运行目录：{execution_root}")
+
+    # 先建立只含稳定身份和行哈希的 Source 索引；这样既能独立核验 package 输入，
+    # 又不会把 Source 的大文本副本写入任何 Cue manifest 或审计文件。
+    source_hash_by_id: dict[str, str] = {}
+    source_ids: set[str] = set()
+    for atom in iter_jsonl(source_atoms):
+        validate_record(source_validator, atom, "Source Atom")
+        atom_id = atom.get("atom_id")
+        if not isinstance(atom_id, str) or atom_id in source_ids:
+            raise ContractError("Source Atom 存在空 ID 或重复 atom_id")
+        source_ids.add(atom_id)
+        source_hash_by_id[atom_id] = canonical_sha256(atom)
+    if len(source_ids) != 370799 or source_marker["sha256"] != "be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e":
+        raise ContractError("Source 条数或 SHA256 不符合冻结输入")
+
+    packages: list[dict[str, Any]] = []
+    coverage_by_atom: dict[str, dict[str, Any]] = {}
+    disposition_counts = {key: 0 for key in EXPECTED_DISPOSITION_COUNTS}
+    wave_audit: list[dict[str, Any]] = []
+    for wave_index in range(1, 9):
+        wave_dir = execution_root / f"wave_{wave_index:02d}"
+        coverage_path = wave_dir / "coverage_disposition.jsonl"
+        shard_manifest_path = wave_dir / settings.layout["realtime_shards_manifest"]
+        run_state_path = wave_dir / settings.layout["run_state_filename"]
+        run_ledger_path = wave_dir / settings.layout["run_ledger_filename"]
+        for required_path in (coverage_path, shard_manifest_path, run_state_path, run_ledger_path):
+            if not required_path.is_file():
+                raise ContractError(f"realtime_v9_01 缺少审计工件：{required_path}")
+        wave_seen: set[tuple[str, int, str]] = set()
+        for row in iter_jsonl(coverage_path):
+            required = {"run_id", "package_id", "item_index", "atom_id", "source_atoms_sha256", "cue_execution_protocol_sha256", "raw_response_saved", "disposition", "code", "path", "attempt", "request_identity"}
+            if set(row) != required or row["run_id"] != run_id or row["source_atoms_sha256"] != source_marker["sha256"] or row["cue_execution_protocol_sha256"] != protocol_sha256 or row["raw_response_saved"] is not False:
+                raise ContractError(f"覆盖账本字段或血缘不一致：wave_{wave_index:02d}")
+            key = (row["package_id"], row["item_index"], row["atom_id"])
+            if key in wave_seen or row["atom_id"] not in source_ids:
+                raise ContractError(f"覆盖账本存在重复或未知 Atom：wave_{wave_index:02d}")
+            if row["disposition"] not in disposition_counts:
+                raise ContractError(f"覆盖账本存在未知 disposition：{row['disposition']}")
+            wave_seen.add(key)
+            if row["atom_id"] in coverage_by_atom:
+                raise ContractError(f"跨 Wave 重复覆盖 Atom：{row['atom_id']}")
+            coverage_by_atom[row["atom_id"]] = row
+            disposition_counts[row["disposition"]] += 1
+        input_files = sorted(wave_dir.glob("packages/**/*.input.jsonl"))
+        if not input_files:
+            raise ContractError(f"Wave 没有 package 输入清单：wave_{wave_index:02d}")
+        for input_path in input_files:
+            rows = read_jsonl(input_path)
+            if len(rows) != 1:
+                raise ContractError(f"package 输入清单必须恰有一行：{input_path}")
+            manifest = rows[0]
+            if manifest.get("run_id") != run_id or manifest.get("transport") != "realtime_chat_completions" or manifest.get("cue_execution_protocol_sha256") != protocol_sha256 or manifest.get("source_atoms_sha256") != source_marker["sha256"]:
+                raise ContractError(f"package 清单血缘不一致：{input_path}")
+            package_id = manifest.get("package_id")
+            if not isinstance(package_id, str) or input_path.parent.name != package_id:
+                raise ContractError(f"package_id 与目录不一致：{input_path}")
+            atom_rows = manifest.get("atoms")
+            if not isinstance(atom_rows, list) or not atom_rows or len({item.get("atom_id") for item in atom_rows}) != len(atom_rows):
+                raise ContractError(f"package Atom 清单无效：{package_id}")
+            atom_ids = [item.get("atom_id") for item in atom_rows]
+            if any(not isinstance(atom_id, str) or atom_id not in source_ids or item.get("atom_sha256") != source_hash_by_id[atom_id] for item, atom_id in zip(atom_rows, atom_ids)):
+                raise ContractError(f"package Atom 哈希与冻结 Source 不一致：{package_id}")
+            package_coverage = [coverage_by_atom.get(atom_id) for atom_id in atom_ids]
+            if any(row is None or row["package_id"] != package_id for row in package_coverage):
+                raise ContractError(f"package 未形成逐 Atom coverage 闭合：{package_id}")
+            state = read_json(_formal_package_files(input_path)["state"])
+            if state.get("status") not in {"validated_success", "excluded_after_repair", "content_filtered"}:
+                raise ContractError(f"package 不是允许的终态：{package_id}")
+            packages.append({"manifest": manifest, "files": _formal_package_files(input_path), "state": state, "atom_ids": atom_ids})
+        wave_audit.append({
+            "wave_index": wave_index,
+            "coverage_disposition_path": _formal_relative_path(coverage_path),
+            "coverage_disposition_sha256": sha256_file(coverage_path),
+            "realtime_shards_manifest_path": _formal_relative_path(shard_manifest_path),
+            "realtime_shards_manifest_sha256": sha256_file(shard_manifest_path),
+            "run_state_sha256": sha256_file(run_state_path),
+            "run_ledger_sha256": sha256_file(run_ledger_path),
+            "package_count": len(input_files),
+        })
+    if len(coverage_by_atom) != len(source_ids) or set(coverage_by_atom) != source_ids:
+        raise ContractError("Source Atom 未做到恰有一个 disposition")
+    if disposition_counts != EXPECTED_DISPOSITION_COUNTS:
+        raise ContractError(f"disposition 统计不符合冻结输入：{disposition_counts}")
+    expected_package_count = sum(int(item["package_count"]) for item in wave_audit)
+    if len(packages) != expected_package_count or expected_package_count != 74160:
+        raise ContractError(f"realtime_v9_01 package 总数不符合冻结八波结果：{len(packages)}，期望 {expected_package_count}/74160")
+
+    by_task: dict[int, list[dict[str, Any]]] = {task: [] for task in FORMAL_CUE_TASK_INDEXES}
+    seen_cue_ids: set[str] = set()
+    total_cues = 0
+    for package in packages:
+        manifest = package["manifest"]
+        task_index = manifest.get("realtime_task_index")
+        if not isinstance(task_index, int) or task_index not in by_task:
+            raise ContractError(f"package task index 不在 000..074：{manifest.get('package_id')}")
+        result_path = package["files"]["result"]
+        cues: list[dict[str, Any]] = []
+        if package["state"]["status"] == "content_filtered":
+            if result_path.exists():
+                raise ContractError(f"content_filtered package 不得有 Cue 结果：{manifest['package_id']}")
+        else:
+            if not result_path.is_file():
+                raise ContractError(f"终态 package 缺少结果片段：{manifest['package_id']}")
+            by_atom = {atom_id: index for index, atom_id in enumerate(package["atom_ids"])}
+            for cue in iter_jsonl(result_path):
+                validate_record(cue_validator, cue, "Cue")
+                atom_id = cue.get("atom_id")
+                if cue.get("validation_status") != "accepted" or atom_id not in by_atom:
+                    raise ContractError(f"Cue 结果含非 accepted 或越界 Atom：{manifest['package_id']}")
+                expected_cue_id = f"cue_{atom_id.removeprefix('src_')}"
+                if cue.get("cue_id") != expected_cue_id or cue["cue_id"] in seen_cue_ids:
+                    raise ContractError(f"Cue ID 重复或未按 Atom 确定性派生：{manifest['package_id']}")
+                coverage = coverage_by_atom[atom_id]
+                if coverage["disposition"] != "accepted_cue":
+                    raise ContractError(f"excluded Atom 混入正式 Cue：{atom_id}")
+                seen_cue_ids.add(cue["cue_id"])
+                cues.append(cue)
+            cues.sort(key=lambda cue: by_atom[cue["atom_id"]])
+        by_task[task_index].append({"manifest": manifest, "cues": cues, "atom_ids": package["atom_ids"]})
+        total_cues += len(cues)
+    if total_cues != EXPECTED_DISPOSITION_COUNTS["accepted_cue"] or len(seen_cue_ids) != total_cues:
+        raise ContractError("accepted Cue 总数与 disposition 覆盖不一致")
+
+    shard_records: list[dict[str, Any]] = []
+    for task_index in FORMAL_CUE_TASK_INDEXES:
+        task_packages = sorted(by_task[task_index], key=lambda item: (item["manifest"]["realtime_shard_index"], item["manifest"]["package_index"]))
+        if not task_packages:
+            raise ContractError(f"task {task_index:03d} 缺少 package")
+        task_cues = [cue for package in task_packages for cue in package["cues"]]
+        task_atoms = [atom_id for package in task_packages for atom_id in package["atom_ids"]]
+        output_path = formal_dir / f"task_{task_index:03d}.jsonl"
+        digest, row_count, byte_count = _formal_cue_jsonl_write(output_path, task_cues)
+        if row_count != len(task_cues) or digest != sha256_file(output_path) or byte_count != output_path.stat().st_size:
+            raise ContractError(f"task 分片内部哈希验证失败：{output_path}")
+        accepted_ids = [cue["atom_id"] for cue in task_cues]
+        shard_records.append({
+            "path": _formal_relative_path(output_path),
+            "task_index": task_index,
+            "sha256": digest,
+            "row_count": row_count,
+            "byte_count": byte_count,
+            "order_key": ["realtime_shard_index", "package_index", "item_index"],
+            "coverage": {
+                "source_atom_count": len(task_atoms),
+                "accepted_cue_count": row_count,
+                "source_atom_id_first": task_atoms[0],
+                "source_atom_id_last": task_atoms[-1],
+                "accepted_atom_id_first": accepted_ids[0] if accepted_ids else None,
+                "accepted_atom_id_last": accepted_ids[-1] if accepted_ids else None,
+                "logical_shard_start": task_packages[0]["manifest"]["realtime_shard_index"],
+                "logical_shard_end": task_packages[-1]["manifest"]["realtime_shard_index"],
+            },
+            "source_atoms_sha256": source_marker["sha256"],
+            "cue_execution_protocol_sha256": protocol_sha256,
+            "realtime_run_id": run_id,
+        })
+    if sum(item["row_count"] for item in shard_records) != total_cues or len(shard_records) != FORMAL_CUE_TASK_COUNT:
+        raise ContractError("正式 Cue 分片总行数或分片数不一致")
+
+    manifest = {
+        "manifest_version": "v1.0.0",
+        "artifact_type": "cue_library_logical_snapshot",
+        "contract_version": CONTRACT_VERSION,
+        "governance_contract_version": GOVERNANCE_CONTRACT_VERSION,
+        "config_version": CONFIG_VERSION,
+        "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION, "source_video_atom": SOURCE_SCHEMA_VERSION},
+        "generated_at": utc_now(),
+        "source_atoms_sha256": source_marker["sha256"],
+        "cue_execution_protocol_sha256": protocol_sha256,
+        "realtime_run_id": run_id,
+        "shard_count": FORMAL_CUE_TASK_COUNT,
+        "cue_count": total_cues,
+        "source_atoms_processed_count": len(source_ids),
+        "disposition_counts": disposition_counts,
+        "upstream_hashes": {"source_atoms": source_marker["sha256"], "source_success": source_marker["sha256"], "coverage_disposition": canonical_sha256(wave_audit)},
+        "wave_audit": wave_audit,
+        "shards": shard_records,
+    }
+    atomic_write_json(manifest_path, manifest)
+    manifest_sha256 = sha256_file(manifest_path)
+    marker = {
+        "artifact_type": "cue_library_manifest",
+        "artifact_path": _formal_relative_path(manifest_path),
+        "sha256": manifest_sha256,
+        "manifest_sha256": manifest_sha256,
+        "row_count": total_cues,
+        "contract_version": CONTRACT_VERSION,
+        "governance_contract_version": GOVERNANCE_CONTRACT_VERSION,
+        "config_version": CONFIG_VERSION,
+        "schema_versions": {"cue_candidate": CUE_SCHEMA_VERSION},
+        "generated_at": utc_now(),
+        "upstream_hashes": {"source_atoms": source_marker["sha256"], "source_success": source_marker["sha256"], "cue_manifest": manifest_sha256, "coverage_disposition": canonical_sha256(wave_audit)},
+        "source_atoms_sha256": source_marker["sha256"],
+        "model_id": settings.model_id,
+        "prompt_version": settings.prompt_version,
+        "final_cue_schema_version": settings.final_cue_schema_version,
+        "cue_execution_policy_version": settings.execution["cue_execution_policy_version"],
+        "protocol_hash_payload_version": settings.execution["protocol_hash_payload_version"],
+        "cue_prompt_sha256": sha256_file(prompt),
+        "cue_inference_schema": settings.execution["package_policy"]["inference_schema"],
+        "cue_inference_schema_version": settings.execution["package_policy"]["inference_schema_version"],
+        "cue_inference_schema_sha256": sha256_file(inference_schema),
+        "cue_execution_protocol_sha256": protocol_sha256,
+        "realtime_transport": "realtime_chat_completions",
+        "realtime_run_id": run_id,
+        "realtime_shard_count": 742,
+        "realtime_shards_manifest_sha256": canonical_sha256([
+            {"wave_index": item["wave_index"], "path": item["realtime_shards_manifest_path"], "sha256": item["realtime_shards_manifest_sha256"]}
+            for item in wave_audit
+        ]),
+        "realtime_run_state_sha256": canonical_sha256([
+            {"wave_index": item["wave_index"], "sha256": item["run_state_sha256"]} for item in wave_audit
+        ]),
+        "realtime_run_ledger_sha256": canonical_sha256([
+            {"wave_index": item["wave_index"], "sha256": item["run_ledger_sha256"]} for item in wave_audit
+        ]),
+        "realtime_local_raw_response_storage": "forbidden",
+        "formal_shard_count": FORMAL_CUE_TASK_COUNT,
+        "accepted_cue_count": disposition_counts["accepted_cue"],
+        "excluded_no_cue_count": disposition_counts["excluded_no_cue"],
+        "excluded_after_repair_count": disposition_counts["excluded_after_repair"],
+        "excluded_content_filtered_count": disposition_counts["excluded_content_filtered"],
+        "source_atoms_processed_count": len(source_ids),
+        "coverage_disposition_sha256": canonical_sha256(wave_audit),
+        "usage_summary": {"package_count": len(packages), "attempt_count": 0, "successful_attempt_count": 0, "failed_attempt_count": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0, "missing_usage_count": 0, "retry_count": 0, "rate_limit_wait_seconds": 0.0},
+    }
+    # SUCCESS 必须最后写入；它绑定 manifest，而非可选的单文件便利缓存。
+    atomic_write_json(success_marker, marker)
+    return {"manifest_path": _formal_relative_path(manifest_path), "success_marker": _formal_relative_path(success_marker), "manifest_sha256": manifest_sha256, "shard_count": FORMAL_CUE_TASK_COUNT, "cue_count": total_cues, "disposition_counts": disposition_counts}
 
 
 def usage_summary(manifests: list[dict[str, Any]], run_root: Path, settings: Settings) -> dict[str, Any]:
@@ -3039,6 +3721,47 @@ def run(arguments: argparse.Namespace) -> int:
         raise ContractError("失败 package 重跑必须在独立授权与 T4 审阅后启用")
 
     settings, realtime_policy = realtime_policy_from_registry(arguments.model_registry)
+    if arguments.freeze_cue_library:
+        result = freeze_formal_cue_library(
+            source_atoms=arguments.source_atoms,
+            source_success=arguments.source_success,
+            source_schema=arguments.source_schema,
+            model_registry=arguments.model_registry,
+            prompt=arguments.prompt,
+            inference_schema=arguments.inference_schema,
+            run_id=arguments.run_id or "",
+            run_root=arguments.run_root,
+            formal_dir=arguments.formal_dir,
+            manifest_path=arguments.manifest_path,
+            success_marker=arguments.success_marker,
+        )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    # 并发/限流覆盖：只改变本次进程的运行时参数，不改动冻结配置与协议哈希，因此已完成的
+    # Wave/账本与授权绑定均不受影响。用于账号档位或 TPM 预留额度受限时把客户端限流压到
+    # 预留能持续供应的水平，避免服务端 429 排队拖慢或停掉整波。
+    if arguments.max_in_flight is not None:
+        if not isinstance(arguments.max_in_flight, int) or isinstance(arguments.max_in_flight, bool) or arguments.max_in_flight <= 0:
+            raise ContractError("--max-in-flight 必须是正整数")
+        realtime_policy = replace(realtime_policy, maximum_in_flight=arguments.max_in_flight)
+    if arguments.requests_per_minute is not None:
+        if not isinstance(arguments.requests_per_minute, int) or isinstance(arguments.requests_per_minute, bool) or arguments.requests_per_minute <= 0:
+            raise ContractError("--requests-per-minute 必须是正整数")
+        realtime_policy = replace(realtime_policy, requests_per_minute=arguments.requests_per_minute)
+    if arguments.tokens_per_minute is not None:
+        if not isinstance(arguments.tokens_per_minute, int) or isinstance(arguments.tokens_per_minute, bool) or arguments.tokens_per_minute <= 0:
+            raise ContractError("--tokens-per-minute 必须是正整数")
+        realtime_policy = replace(realtime_policy, tokens_per_minute=arguments.tokens_per_minute)
+    if arguments.repair_ledger_migration_package:
+        if arguments.confirmation != "MIGRATE_REALTIME_REPAIR_LEDGER":
+            raise ContractError("账本迁移需要显式 confirmation=MIGRATE_REALTIME_REPAIR_LEDGER")
+        result = migrate_repair_ledger_identity(arguments, realtime_policy)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
+    if arguments.close_realtime_wave_coverage:
+        result = close_realtime_wave_coverage(arguments, settings)
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True, indent=2))
+        return 0
     marker = verified_source(arguments.source_atoms, arguments.source_success)
     source_validator = load_validator(arguments.source_schema)
     # 即使当前只预检也加载冻结 Schema，确保成本核算不会建立在不存在或替换后的协议之上。
@@ -3123,6 +3846,9 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--run-root", type=Path, default=ROOT / "cues/realtime")
     parser.add_argument("--output", type=Path, default=ROOT / "cues/cue_library.jsonl")
     parser.add_argument("--success-marker", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
+    parser.add_argument("--freeze-cue-library", action="store_true", help="从唯一 realtime_v9_01 运行离线冻结 75 个正式 Cue task 分片")
+    parser.add_argument("--formal-dir", type=Path, default=ROOT / "cues/formal")
+    parser.add_argument("--manifest-path", type=Path, default=ROOT / "cues/cue_library_manifest.json")
     parser.add_argument("--run-id")
     parser.add_argument("--authorization", type=Path, help="本机未提交的执行授权 JSON")
     parser.add_argument("--wave-index", type=int, default=1, help="八波计划中的目标波次（1--8）")
@@ -3131,8 +3857,16 @@ def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true", help="提交首波 Batch；需授权文件和显式 confirmation")
     parser.add_argument("--receive", action="store_true", help="接收已提交 Batch 的结果；需独立确认和授权")
     parser.add_argument("--realtime-execute", action="store_true", help="实时生产保留入口；必须独立授权与显式 confirmation")
+    parser.add_argument("--repair-ledger-migration-package", help="仅离线迁移错误复用首轮 ID 的 attempt 3 修复 package")
+    parser.add_argument("--close-realtime-wave-coverage", action="store_true", help="仅离线生成已完成 Wave 的逐 Atom 覆盖终态账本")
     parser.add_argument("--poll-attempts", type=int, default=1, help="接收命令内的最多轮询次数；默认一次")
     parser.add_argument("--rerun-failed-packages", action="store_true")
+    parser.add_argument("--max-in-flight", type=int, default=None,
+                        help="仅覆盖本次进程的实时在飞 package 上限（不改变冻结配置/协议哈希）")
+    parser.add_argument("--requests-per-minute", type=int, default=None,
+                        help="仅覆盖本次进程的客户端 RPM 令牌桶容量（不改变冻结配置/协议哈希）")
+    parser.add_argument("--tokens-per-minute", type=int, default=None,
+                        help="仅覆盖本次进程的客户端 TPM 令牌桶容量，用于匹配 TPM 预留额度（不改变冻结配置/协议哈希）")
     return parser.parse_args(argv)
 
 

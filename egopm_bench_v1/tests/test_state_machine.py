@@ -79,7 +79,7 @@ def _seed(negative_type: str = "cancelled") -> dict[str, Any]:
             "run_id": "run_synth_t3",
             "model_id": "synthetic-fixture",
             "prompt_version": "fixture",
-            "schema_version": "v1.0.0",
+            "schema_version": "v1.1.0",
         },
     }
 

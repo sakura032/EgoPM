@@ -42,6 +42,14 @@ git diff --check
 
 上述均为无 API synthetic 测试：未读取 `DASHSCOPE_API_KEY`、未联网、未创建实时请求、未读取已取消 Batch 结果，未写正式 Cue 或 SUCCESS。
 
+## CR-016/017 正式 Cue QA 交接（2026-09-09）
+
+- T4 验证器已支持从 `cue_library_manifest.json` 读取 75 个正式 task 分片，并独立复算分片 SHA256、字节数、行数、Cue ID 唯一性、Cue→Source 血缘和四类 disposition 覆盖。
+- 正式输入固定为 `realtime_v9_01`、370799 个 Source Atom、294839 条 accepted Cue；`excluded_no_cue`、`excluded_after_repair`、`excluded_content_filtered` 只作为已闭合 coverage 审计终态，不得重跑。
+- Cue manifest SHA256 为 `a7ccd99e629d185911084bb654f79ca6891711b7874cd950c07b0bc7972fdf75`，协议 SHA256 为 `c7d809927f9cca4ff7d4501a0121c419768cd95c1d3c05d13b156000c50fbbb5`。
+- CR-017 的 Schema、Seed 生成器和检索输出 Schema 已升级；T4 应继续检查 `trigger_cue_id` 精确血缘、同组/跨组 lure、失败子句和候选快照内全局不复用。
+- 本次分支为 `main`，工作区未提交；尚未运行 API。BGE 固定依赖缺失时必须报告 blocker，不得把 lexical 检索当替代实现。
+
 ## 未解决问题、CR 状态与下一门
 
 - T2 必须使实时生产者的全局 manifest、package state、ledger 与 complete 字段严格匹配本交接；其中全局分片清单须包含 `realtime_shard_index`，每个 package 的 complete 须包含结果/账本/状态三份实际 SHA256。
