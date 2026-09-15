@@ -83,10 +83,10 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     assert registry["registry_version"] == "v1.6.0"
     assert registry["raw_response_policy"] == "forbidden"
     assert cue["model_id"] == "qwen3.7-flash"
-    assert cue["prompt_version"] == "cue_extractor_v3_5_compact"
+    assert cue["prompt_version"] == "cue_extractor_v3_6_compact"
     assert cue["schema_version"] == "v1.1.0"
-    assert execution["cue_execution_policy_version"] == "v3.5.0"
-    assert execution["protocol_hash_payload_version"] == "v3.5.0"
+    assert execution["cue_execution_policy_version"] == "v3.6.0"
+    assert execution["protocol_hash_payload_version"] == "v3.6.0"
     assert execution["mode"] == "explicit_realtime_execute_only"
     assert execution["shard_size_atoms"] == 500
     assert execution["max_retries"] == 2
@@ -104,7 +104,7 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
     }
     assert execution["controlled_field_policy"] == {
         "model_input_fields": ["item_index", "transcript", "dense_caption", "visible_text"],
-        "model_output_fields": ["n", "f", "start", "end", "p", "c", "v", "e", "s", "a", "r"],
+        "model_output_fields": ["n", "f", "x", "p", "c", "v", "e", "s", "a", "r"],
         "program_backfilled_fields": ["cue_id", "atom_id", "split", "source_text", "supporting_text_field", "model_id", "prompt_version", "schema_version", "run_id"],
         "raw_model_response_storage": "forbidden",
     }
@@ -112,7 +112,7 @@ def test_cue_execution_policy_freezes_v3_realtime_compact_contract() -> None:
         "cue_type_codes": {"T": "time", "P": "person", "L": "place", "O": "object", "A": "activity", "S": "state_change"},
         "supporting_text_field_codes": {"T": "transcript", "D": "dense_caption", "V": "visible_text"},
         "operator_codes": {"=": "eq", "!": "not_eq", "+": "present", "-": "absent", "^": "starts", "$": "ends", "~": "contains"},
-        "required_fields": ["n", "f", "start", "end", "p", "c", "v"],
+        "required_fields": ["n", "f", "x", "p", "c", "v"],
         "optional_defaults": {"e": [], "s": None, "a": None, "r": None},
         "confidence_scale": 100,
     }
@@ -170,5 +170,5 @@ def test_compact_cue_inference_schema_excludes_controlled_fields_and_stays_small
     assert controlled.isdisjoint(item["properties"])
     assert len(json.dumps(schema, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) <= 1100
     jsonschema.Draft202012Validator(schema).validate({
-        "items": [{"n": 0, "f": "V", "start": 0, "end": 4, "p": [["O", "+", "手机"]], "c": 90, "v": "A"}]
+        "items": [{"n": 0, "f": "V", "x": "手机", "p": [["O", "+", "手机"]], "c": 90, "v": "A"}]
     })

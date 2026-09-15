@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://egopm-bench.local/schema/v1.1.0/source_video_atom.schema.json",
+  "title": "EgoPM-Bench v1 Source Video Atom",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["atom_id", "atom_kind", "atom_stage", "participant_source_id", "source_day", "session_id", "source_group_id", "world_event_id", "source_srt_paths", "source_video_path", "video_mapping_status", "local_start_sec", "local_end_sec", "normalized_start_sec", "normalized_end_sec", "transcript_segment_ids", "dense_caption_segment_ids", "transcript", "dense_caption", "visible_text", "modality_coverage", "provenance", "split"],
+  "properties": {
+    "atom_id": {"type": "string", "pattern": "^src_[A-Za-z0-9_]+$"},
+    "atom_kind": {"const": "source_video_atom"},
+    "atom_stage": {"const": "final"},
+    "participant_source_id": {"type": "string", "minLength": 1},
+    "source_day": {"type": "string", "pattern": "^DAY[1-7]$"},
+    "session_id": {"type": "string", "minLength": 1},
+    "source_group_id": {"type": "string", "minLength": 1},
+    "world_event_id": {"type": ["string", "null"]},
+    "source_srt_paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["transcript", "dense_caption"],
+      "properties": {
+        "transcript": {"type": ["string", "null"], "minLength": 1},
+        "dense_caption": {"type": ["string", "null"], "minLength": 1}
+      },
+      "anyOf": [
+        {"properties": {"transcript": {"type": "string"}}},
+        {"properties": {"dense_caption": {"type": "string"}}}
+      ]
+    },
+    "source_video_path": {"type": ["string", "null"]},
+    "video_mapping_status": {"enum": ["pending", "verified", "unavailable"]},
+    "local_start_sec": {"type": "number", "minimum": 0},
+    "local_end_sec": {"type": "number", "exclusiveMinimum": 0},
+    "normalized_start_sec": {"type": "number", "minimum": 0},
+    "normalized_end_sec": {"type": "number", "exclusiveMinimum": 0},
+    "transcript_segment_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "dense_caption_segment_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+    "transcript": {"type": ["string", "null"]},
+    "dense_caption": {"type": ["string", "null"]},
+    "visible_text": {"type": "string", "minLength": 1},
+    "modality_coverage": {"enum": ["transcript_only", "dense_caption_only", "both"]},
+    "provenance": {"const": "egolife_srt"},
+    "split": {"enum": ["train", "dev", "test"]}
+  },
+  "allOf": [
+    {"if": {"properties": {"video_mapping_status": {"const": "pending"}}}, "then": {"properties": {"source_video_path": {"type": "null"}}}},
+    {"if": {"properties": {"modality_coverage": {"const": "both"}}}, "then": {"properties": {"transcript": {"type": "string", "minLength": 1}, "dense_caption": {"type": "string", "minLength": 1}}}}
+  ]
+}

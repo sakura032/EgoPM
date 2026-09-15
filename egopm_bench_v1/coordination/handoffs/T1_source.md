@@ -3,7 +3,7 @@
 - 分支：`main`。
 - Source 近重复精确索引修复提交：`f730cdf0bbac2995fd9c7d4d07f83d9af4ee41ef`。
 - 正式 Source 产物提交：`ada03ec12ef6a485e71e171f6121cf4bbfa907ab`。
-- 治理合同版本：`v1.1.0`；配置合同版本：`v1.1.0`；Source Atom 与草稿 Schema 版本：`v1.1.0`。
+- 交接时治理合同版本：`v1.1.0`（当前治理合同为 `v1.5.0`）；配置合同、Source Atom 与草稿 Schema 仍为 `v1.1.0`。
 
 ## 授权边界与执行内容
 

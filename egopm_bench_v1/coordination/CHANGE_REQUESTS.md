@@ -22,8 +22,10 @@
 | CR-2026-016 | 2026-09-09 | T0 | 正式产物存储与 SUCCESS 合同 | 将阶段完成定义为一个逻辑快照；Source/Cue 允许 manifest+分片，Seed/Frozen/Life Log 保持单文件，Decision/Evidence 延后按规模冻结 | 已冻结 Source 不重建；Cue 已将 75 个 task 物化并由顶层 manifest/SUCCESS 统一绑定，T4 Cue 专项零阻断 | 批准；实现与 T4 Cue QA 已完成 | 治理合同 `v1.2.0` | DONE |
 | CR-2026-017 | 2026-09-09 | T0 | Seed Schema、检索结果与审计规则 | 新增必填 `trigger_cue_id`；冻结 cue→atom/type/predicate 血缘、同组+跨组 lure 构成、失败子句和跨 Seed 禁止复用；后续模型统一 Plus | Schema/配置/06–08/T4 已升级；正式 BGE 权重缺失，Seed 仍不得启动 | 批准；无 API 实现已完成，待 BGE 检索与 T4 验证 | Seed 数据合同 `v1.1.0` | IN_PROGRESS |
 | CR-2026-018 | 2026-09-09 | T0 | Cue v1 语义资格与 Cue v2 Schema | V9 虽通过旧结构 QA，但出现 `time` 塌缩、字符串 `null`、人物进入时间槽、冗余字段全空和自报 confidence 失真；旧 Cue 撤销 Seed 上游资格，Cue v2 改为 clause-level predicate/evidence、仅 `all_of`、删除冗余逐行字段 | 破坏性 Cue Schema 变更；V9 保留不可变审计，不覆盖、不混入；Seed 及全部下游必须从 Cue v2 重建 | 方向批准；待 Schema、prompt、执行器和 T4 语义门实施 | Cue Schema `v2.0.0`、治理合同 `v1.3.0` | IN_PROGRESS |
-| CR-2026-019 | 2026-09-09 | T0 | Cue v2 候选选择与 WSL BGE-M3 | 不再全量生成 370799 条 Cue；先以固定 BGE-M3 对全量 Source 做 dense+sparse+多样性筛选，形成 8,000–12,000 个候选 Atom，再生成约 3,000–5,000 条高质量 Cue | CR-005 的模型 revision 与混合检索原则保留，但旧 Cue 驱动 query 序列化不再适用；需新建 Source→candidate selection 合同和导入门 | 方向批准；WSL 说明已建立，待 selection request、实现和 T4 验证 | Cue/检索合同后续版本 | IN_PROGRESS |
-| CR-2026-020 | 2026-09-09 | T0 | Seed 规模、模型、三账号并行、账本和分布报告 | Seed candidates 调整为 900–1,400，Frozen Seed 固定 480；Cue 抽取沿用同一 `qwen3.7-flash` 协议并允许三个阿里云账号处理静态分区；各 worker 独立授权/预算/账本，阶段 SUCCESS 绑定分布报告 manifest | 替代 CR-017 中后续统一 Plus、35–40 Seed 和小规模单文件假设；Seed/Life Log 布局需按新规模重新冻结；旧账本不迁入 | 方向批准；待配置、Schema、执行器、恢复工具和 QA 实施 | 治理合同 `v1.3.0` | IN_PROGRESS |
+| CR-2026-019 | 2026-09-10 | T0 | Cue v2 候选选择与 WSL BGE-M3 | 不再全量生成 370799 条 Cue；固定 BGE-M3 形成 10,000–12,000 条；六查询族无配额；v3.1 补齐两个必要 Schema、单 passage、Unicode 规则、近重复全序和 CP-SAT 精确求解 | 旧 v3 草案身份作废且尚无正式输出；v3.1 使用新 selection ID 与组件 SHA，不影响冻结 Source 或旧 V9 审计 | 方向与 v3.1 机器请求已冻结；待 WSL 实现、正式运行和 T4 proof/人工精度复核 | BGE selection protocol v3.1 | IN_PROGRESS |
+| CR-2026-020 | 2026-09-10 | T0 | Seed 规模、模型、三账号并行、账本和分布报告 | Seed candidates 调整为 900–1,400，Frozen Seed 固定 480；Cue 抽取沿用同一 `qwen3.7-flash` 协议并允许三个阿里云账号处理静态分区；各 worker 独立授权/预算/账本；阶段分布精简为机器报告、中文摘要、manifest、SUCCESS 四文件 | 替代 CR-017 中后续统一 Plus、35–40 Seed 和小规模单文件假设；Seed/Life Log 布局需按新规模重新冻结；旧账本不迁入 | 方向批准；待配置、Schema、执行器、恢复工具和 QA 实施 | 治理合同 `v1.4.0` | IN_PROGRESS |
+| CR-2026-021 | 2026-09-10 | T0 | Cue v2 主线切换批次 A 与全项目工件节制 | 建立旧 V9 只读审计边界和迁移矩阵；整个仓库每个落实单元默认最多新增 1 棵持久目录树和 5 种非分片机器工件，报告合并，正式目录测试必须断言文件集合恰好相等 | 适用于根目录、主流水线、WSL 包和 T0–T4 全部阶段；子合同只能收紧；不重排不可变历史产物 | 方向批准；批次 A 进行中 | 治理合同 `v1.4.2` | IN_PROGRESS |
+| CR-2026-022 | 2026-09-15 | T0 | 全流程事实边界、Cue 三层语义门与统一 Life Log 骨架 | Cue 固定为一个 predicate、1–3 个 `all_of` clause；依次验证字段内连续 span、value 直接支持和完整断言语义；简短 Cue 必须有可识别指向；统一每条 Life Log 的意图创建、生命周期控制、同一 trigger 与两条 lure | 破坏性收紧 Cue/Seed/Life Log 语义；不修改 Source/BGE 数据；Cue v2 尚未生产，无需重生成正式 v2；旧 V9 继续只读审计 | 设计批准；待批次 B/C 实现 Schema、prompt、代码、测试与协议验收 | 治理合同 `v1.5.0`、Cue Schema `v2.0.0` | IN_PROGRESS |
 
 > 注：`CR-2026-012` 继续保留为空号，未获得权威材料前不得补写语义；`CR-2026-013` 已按冻结的 v3.6 协议与 SHA 补录。
 
@@ -92,7 +94,17 @@ T4 新增 clause-level 语义门：证据必须来自指定原字段，value 必
 
 WSL2 使用专用 `.venv-bge-m3`、单 GPU 单编码进程和固定 `BAAI/bge-m3@5617a9f61b028005a4858fdac845db406aefb181`。候选 selection 由确定性资格过滤、dense 查询召回、sparse 查询召回、RRF 和 dense 多样性补足的并集组成；按 split、参与者、模态和 `source_group_id` 分层去重。BGE 只决定候选 Atom，不生成 predicate 或 accepted 判断。
 
-WSL 说明包位于 `wsl_BGE-M3_filter/`。正式返回 Windows 的 selection 进入 `cues/v2/source_selection/<selection_id>/`；embedding、稀疏权重和索引仍是 WSL 可重建缓存，不要求传回。导入门必须复算 Source SHA、模型 revision、参数哈希、候选唯一性和分布报告。
+WSL 执行包位于 `wsl_BGE-M3_filter/`。当前冻结 selection 为 `bge_m3_source_select_v3_1_20260910_01`，根请求 SHA256 为 `921024d8b4621fb8f8a8d600e191f4ba3d7406325bc4b5a17954863b7f435baa`。根请求不含自身 SHA；它直接绑定模型配置、48 行查询集、选择策略，以及两个必要 Schema。Source 行 Schema SHA256 为 `0d576ed34f4a4d19fa38294392bb277306bba145f0492015fe909709c8be92e4`，统一 artifact Schema SHA256 为 `283c6de2a0bf7ab3a222b76ab65ba6c1fa6010fe569b6b9dc1f9b08de4b0e3da`，选择策略 SHA256 为 `02f812f01a72fd50cda220c7fc31f49e0483be36980dd1bd208685a525508065`。不另建 schema manifest、Source SUCCESS Schema 或规范化测试文件。
+
+筛选先形成 10,000 条核心候选，再以稀有 cluster 轮转、新颖度严格大于 `0.08` 和每簇扩展软上限 12 补样，达到 12,000 或完整一轮无新增时停止。六查询族 `Person / Location / Object / Activity / State / Explicit-Time` 全部召回并报告，不设任何类别配额。核心至少 3,500 条 diversity 主选，其中至少 2,000 条不在 query union；同簇近重复阈值仍为 cosine distance `<=0.04`，每簇全局上限 20。
+
+全维 1024 维 BGE FP32 向量用于检索和最终距离；聚类使用固定稀疏随机投影至 256 维，并在 65,536 条确定性分层样本上训练 1,024 簇 MiniBatchKMeans。cluster ID 从规范 centroid 字节生成且只在 snapshot 内稳定。`visible_text` 不编码也不输出；视频/session 的 `event_timestamp` 不得变成未来 `temporal_condition`。
+
+Windows 回传恰有候选、`selection_proof.jsonl`、综合报告、manifest、SUCCESS 五个文件。T4 不重跑 BGE，从 proof 和 Source 复核 rank、RRF、归因、候选成员、离散约束与分布；全库 embedding/top-k/cluster 数值正确性和 CP-SAT 最优性由 WSL 本地完整审计承担并由 manifest 绑定审计根。
+
+每个 Atom 的 passage 固定按 transcript、dense caption 顺序组成一个字符串并只编码一次；资格规范化固定 Unicode 15.0.0，六个测试向量直接内嵌策略。近重复 survivor 使用不依赖 reservoir 的静态全序，随后才构造 reservoir。核心 10,000 条由固定单 worker OR-Tools CP-SAT 四阶段词典序求解，每阶段必须为 `OPTIMAL`，固定目标后重复两次的选中 Atom SHA 必须一致；否则阻断，不得用贪心失败宣称不可行。
+
+正式返回 Windows 的 selection 进入 `cues/v2/source_selection/<selection_id>/`。逐 Atom 全量 cluster assignment/原因、embedding、稀疏权重、索引、模型、checkpoint 和日志均留在 WSL 本地；精简 query/rank/score 与候选/cluster/shard/audit_sample 证明统一写入 `selection_proof.jsonl`。导入门必须复算 Source SHA、模型 revision、request/组件哈希、候选唯一性和综合分布报告。
 
 ### CR-2026-020
 
@@ -102,4 +114,4 @@ Cue v2 目标约 3,000–5,000 条 accepted Cue，但不以数量单独判成功
 
 阶段内只有一个固定生产模型，阶段间允许选择不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量审计。Seed 生成、Seed 审计和 Life Log 生成的最终模型在各自生产前另行冻结。
 
-所有阶段分布报告统一写入 `audit/distributions/<stage>/<snapshot_id>/`，至少包含 `by_model.json`、多账号阶段的 `by_worker.json`、`by_split.json`、`by_participant.json`、`by_modality.json`、`by_shard.jsonl`、阶段特有维度、语义门报告、manifest 和 `DISTRIBUTION_SUCCESS.json`。对应生产 SUCCESS 必须绑定 `distribution_manifest_sha256`。
+所有阶段分布报告统一写入 `audit/distributions/<stage>/<snapshot_id>/`，并严格收敛为 `distribution_report.json`、由其确定性渲染的中文摘要、manifest 和 `DISTRIBUTION_SUCCESS.json` 四文件。`by_model`、多账号阶段的 `by_worker`、`by_split`、`by_participant`、`by_modality`、`by_shard` 和阶段特有维度都作为报告内对象，不再各建 JSON。对应生产 SUCCESS 必须绑定 `distribution_manifest_sha256`。

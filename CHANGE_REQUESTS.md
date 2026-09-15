@@ -5,13 +5,52 @@
 
 编号、状态与精确参数的表格化登记以 `egopm_bench_v1/coordination/CHANGE_REQUESTS.md` 为准；本文件保留详细背景与迁移说明。两者冲突时必须停止执行并由 T0 修正文档，不得自行选择较宽松版本。
 
-## 2026-09-09 当前实施边界
+## 2026-09-15 当前实施边界
 
 - CR-2026-013/014/015 的 V9 实时运行、费用、覆盖账本和 CR-2026-016 的 75 个分片/manifest/SUCCESS 全部保持不可变，但 CR-2026-018 已因系统性内容语义问题撤销其 Seed 上游资格。旧数据只作审计，不得删除、覆盖、修复、重发或混入 Cue v2。
-- CR-2026-018/019/020 冻结 Cue/Seed v2 方向：WSL BGE-M3 先筛选 8,000–12,000 个候选 Atom；三个百炼账号用同一 `qwen3.7-flash` 协议并行抽取约 3,000–5,000 条高质量 Cue；生成 900–1,400 个候选 Seed，最终冻结 480 个 Seed 并派生 2,880 条 Life Log。
+- CR-2026-018/019/020 冻结 Cue/Seed v2 方向：WSL BGE-M3 先形成 10,000 条核心候选，再按稀有语义簇和新颖度确定性补样至 10,000–12,000 条；三个百炼账号用同一 `qwen3.7-flash` 协议并行抽取约 3,000–5,000 条高质量 Cue；生成 900–1,400 个候选 Seed，最终冻结 480 个 Seed 并派生 2,880 条 Life Log。
 - 同一生产阶段只允许一个固定模型，阶段间允许不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量高成本审计；不用 Max。
 - Cue v2、Seed 和 Life Log 的分布报告写入 `egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/`，并由对应阶段 SUCCESS 绑定其 manifest SHA。
-- 本文件后续旧章节若仍描述全量 Cue、35–40 Seed、约 60 候选或统一 Plus，均只作历史背景；正式实施以 `AGENTS.md` v1.3、协调登记册 CR-2026-018/019/020 和 `CUE_SEED_V2_PLAN.md` 为准。
+- CR-2026-022 冻结一个 predicate、1–3 个 clause、三层 Cue 语义门与统一 Life Log 骨架；任何简短 Cue 都必须有可识别指向，正负 Life Log 必须在同一 trigger 和 Source 观察上只改变 constructed 生命周期状态。
+- 本文件后续旧章节若仍描述全量 Cue、35–40 Seed、约 60 候选、统一 Plus、仅 span 即可验收或正负分支替换 trigger，均只作历史背景；正式实施以 `AGENTS.md` v1.5.0、协调登记册 CR-2026-018/019/020/021/022 和 `CUE_SEED_V2_PLAN.md` 为准。
+
+## CR-2026-022：事实性三层门与统一 Life Log 骨架
+
+**状态：设计批准；仅修改现有治理与方法文档，Schema、配置、Python 实现、测试和正式 API 运行仍待后续批次。**
+
+旧 V9 已证明“JSON 合法、span 存在、ID/血缘正确”不能保证内容真实：294,839 条 accepted Cue 中约 98.62% 塌缩为 `time`，38,179 个 clause 使用哨兵值，人物/场景/活动冗余字段全空，且大量错误仍带高 confidence。新版因此不再把格式成功当作语义成功，也不要求模型为每个 Atom 强行生成 Cue。
+
+Cue v2 的内容合同冻结为：一个 Atom 最多一条正式 Cue；一条 Cue 只含一个 predicate 和 1–3 个 `all_of` clause；每个 clause 使用完整词 `dimension/operator/value/evidence.field/evidence.span`。Cue 是可判断的观察条件，不要求完整主谓宾，“手机出现”“厨房”“Jake 正在说话”“门已打开”均可成立；但必须具有可识别的指向对象或状态承载者，无法在同一 span 与 Atom 元数据中解析的代词、泛指词、无对象活动和无承载者状态不得 accepted。
+
+质量判断必须依次执行三层：
+
+1. `evidence.span` 是同一 Atom 的单个 `transcript` 或 `dense_caption` 字段中的连续原文，禁止跨字段、跨 Atom、翻译、摘要、重排和拼接；
+2. `value` 由自己的 span 直接支持，最多只允许 Unicode 与空白规范化，不得删除实词、数字、单位、否定词或改变词序；
+3. `dimension + operator + value` 整体被 span 语义蕴含，并保留人物在场/说话/被提及的角色差异、主客体、否定、量词与范围、条件/假设、时态及时间语气。
+
+确定性程序执行全部第一、二层和可规则化的第三层检查；第三层无法可靠判定的指代、角色、范围和时间语气进入结构化人工审计。另一个模型只能提供意见，不能跳过前两层或自动生成金标。一个 Atom 无清楚事实时使用 `no_cue`；一个 accepted Cue 若含多个 clause，它们必须组成同一最小充分观察条件，不能堆叠无关事实。
+
+校准和扩量采用四段式：先以 BGE proof 的 350 条 audit sample 建立人工设计校准；最终协议另取 800–1,000 条验收集，其中至少 120 条三账号重叠，先跑约 500 条受控子波次；通过后正式处理约 1,500 条 checkpoint；质量与费用稳定后再扩展剩余候选。accepted 分层语义精确率门为不低于 97%，人物角色、地点关系、否定、范围和时间语气的事实失真为 0。每个请求最多携带 5 个独立 Atom（这是传输分包上限，不是 Cue 的 clause 数量）；每条 Cue 仍只允许 1–3 个 `all_of` clause，单项最多一次简化修复；强模型只用于 ambiguous、分层抽样和拟进入 Seed 的 trigger Cue。
+
+Life Log 的核心 2,880 条统一为：一条目标意图创建、一条 constructed 生命周期控制、两条真实 lure 和一条真实 trigger，目标相关 Source 观察数恒为 3。同一 family 的六条日志共享 trigger、lure 和背景 Source 序列；positive/negative 只替换一条位置相同的生命周期控制事件，使同一 trigger 上的 gold 从 `remind` 翻转为 `silent`。核心负分支只使用 `completed/cancelled/expired/already_reminded`；`never_created` 若研究，另作不混算的结构消融。
+
+short/medium/long 当前推荐固定为 12/36/72 个事件、0/2/5 个背景意图和 60/360/2,880 分钟虚拟跨度，最终值须在实现批次根据 token 统计一次性确认。同一难度事件数一致，成对正负日志 token 差异不得超过 5%。模型可见输入只含时间、原文观察或明确 constructed 文本及必要引用；trigger/lure、predicate、状态、分支、gold 和 oracle 理由全部隐藏。真实观察只可逐字使用或确定性截取 Source 原字段，Life Log 默认由程序与受控模板组装，不再让模型自由生成现实事实。
+
+本 CR 不新增机器工件或目录，不修改 Source/BGE 正式数据。其实现将进入后续批次 B/C：更新 Cue v2 Schema、prompt、T2/T4 三层 validator、协议验收、Seed/Life Log Schema 和确定性编排测试；在这些工作完成前不得启动正式 Cue v2 API。
+
+## CR-2026-021：Cue v2 主线切换批次 A 与全仓工件节制
+
+**状态：方向批准，批次 A 进行中；不修改配置、Schema、生产代码或正式数据。**
+
+当前仓库把旧 V9 的不可变审计产物、可执行旧协议、当前 Cue v2 计划和未来接口放在同一默认阅读与路径层，导致“历史可审计”容易被误解成“仍可作为正式上游”。批次 A 只建立退役边界和迁移清单：旧 V9 的正式分片、manifest、SUCCESS、执行/费用/coverage/disposition 账本原路径保留且只读；当前生产入口未来必须显式使用 `cues/v2/**`，不得兼容回退到旧 manifest；旧生产代码、prompt、fixture 和重复说明只有在引用归零、后继通过测试且审计能力保留后才可删除。
+
+本 CR 同时冻结覆盖根目录、主流水线、WSL 包及 T0–T4 全部阶段的工件节制规则。“一个落实单元”按一个 CR 或一个可独立审阅的功能/修复/实验/阶段改动计数，不能通过拆提交、snapshot 或脚本规避。每个落实单元默认最多新增 1 棵持久目录树和 5 种非分片机器工件；同一路径模板的多次运行实例算一种，正式分片族也算一种但须另获分片豁免。同类行记录合并为 JSONL，多维报告合并为一个 JSON；不得按维度、状态、request、Atom 或 attempt 制造一批小 JSON。
+
+新目录只允许表达生命周期、不可变快照、权限/并行隔离或不同保留策略；新根下默认最多两层固定语义目录。超过预算必须在实施前给出逐项工件预算、不能合并的原因、确定文件数/目录模板或分片规则及清理策略，并由 T0 通过 CR 批准。新增或修改阶段生产者时，测试必须断言正式目录文件集合与预算恰好相等；旧阶段首次被修改时必须同时盘点并收敛其工件。不可变历史产物不因本规则重排或重写，任何更具体的子目录合同只能收紧、不能放宽本规则。
+
+默认预算不推翻已经冻结的必要边界：BGE selection v3.1 的五文件快照、分布报告四文件快照、正式大数据分片，以及三个 Cue worker 的隔离 ledger/staging 均保持有效。worker/partition 文件属于执行隔离，不得被下游直接读取。相关记录形状优先合并在一个 Schema 的多个 `$defs` 中；只有生命周期、版本或复用边界确实不同才拆分 Schema，并由根请求或阶段 manifest 直接绑定，不再为绑定本身增设一层只含哈希的 JSON。
+
+批次 A 的具体处置矩阵、删除门与后续批次边界直接维护在 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`，不再为本次整理新建额外计划目录、清单 JSON 或状态文件。该治理变更发布为 `v1.4.2`；配置合同、Source Schema 和全部既有正式产物均不改变，也不要求重生成数据。BGE 尚未正式运行，其 v3.1 请求因 CR-2026-019 的互操作补全而使用新 selection ID 与新组件 SHA；旧草案身份不得执行。
 
 ## CR-2026-018/019/020：Cue/Seed v2 总体迁移
 
@@ -22,6 +61,10 @@ Cue v2 删除顶层 `cue_type`、`confidence`、空置 entities/scene/activity�
 三账号并行不允许共享追加账本。每个 worker 独立授权、预算、ledger、费用快照、租约和 staging；协调器只读聚合已关闭账本。request ID 绑定 campaign、worker、partition、package、Atom 集合 SHA 和 attempt。重复 ID、费用缺失、终态冲突或身份不一致一律阻断且禁止自动重发。
 
 WSL BGE-M3 使用专用 `.venv-bge-m3`、固定 revision、单 GPU 单编码进程。完整部署、缓存、恢复、输出和 Windows 导入合同见 `wsl_BGE-M3_filter/`。完整 Cue/Seed 生产、语义门、分布报告和 480 Seed 停止规则见 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`。
+
+CR-2026-019 的 selection v3 补充冻结：`visible_text` 只做 Source 派生一致性校验；查询族固定为 `Person / Location / Object / Activity / State / Explicit-Time` 且不设数量配额；全维 BGE 向量用于检索和精确距离，256 维投影/65,536 条确定性样本用于 MiniBatchKMeans；正式回传由四文件改为含 `selection_proof.jsonl` 的五文件。`event_timestamp` 不得推导 prospective-memory 的 `temporal_condition`。T4 从 proof 复核离散选择逻辑，但全库 BGE 数值和 cluster 指派仍由 WSL 完整审计负责。
+
+selection v3.1 进一步解决 WSL 实现歧义：根请求直接绑定两个必要 Schema；单 Atom 只编码一个固定字段顺序 passage；Unicode 15.0.0 规范化规则及测试向量内嵌在策略；近重复使用不依赖后续 reservoir 的静态全序；核心联合约束由固定单 worker CP-SAT 四阶段词典序求解，只接受 `OPTIMAL` 且重复求解 SHA 一致。当前唯一可执行身份为 `bge_m3_source_select_v3_1_20260910_01`，根请求 SHA256 `921024d8b4621fb8f8a8d600e191f4ba3d7406325bc4b5a17954863b7f435baa`。
 
 ## CR-2026-016：逻辑快照与大规模分片合同
 

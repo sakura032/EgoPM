@@ -1,75 +1,66 @@
-# EgoPM-Bench BGE-M3 WSL 独立执行包
+# EgoPM-Bench BGE-M3 WSL 执行包
 
-本目录是交给 WSL Codex 的完整工作空间。它不依赖父项目目录，也不要求 WSL Codex 知道 Windows 仓库结构。用户只需把本目录整体放入 WSL，并按 `TRANSFER_CONTRACT.md` 将三项输入放入本地 `input/`；WSL Codex 只在本目录中安装环境、下载固定模型、编写或运行筛选程序、保存缓存并形成交付输出。
+本包用固定 BGE-M3 对 370,799 条冻结 Source Atom 做 dense+sparse 召回、语义聚类和确定性多样性筛选，输出 10,000–12,000 个唯一 `atom_id`，供后续统一 `qwen3.7-flash` 协议抽取 Cue v2。
 
-## 一句话任务
+它只回答“哪些 Atom 值得进入 Cue 抽取”，不生成 predicate，不判断 `accepted/no_cue/ambiguous`，也不把视频时间戳解释成 prospective-memory 时间条件。
 
-使用固定 revision 的 `BAAI/bge-m3`，对冻结的 370,799 条 Source Atom 做可恢复、可复算的 dense+sparse 语义检索与多样性筛选，输出 8,000–12,000 个互不重复的候选 `atom_id`，供后续生成式模型抽取高质量 Cue v2。
+## 流水线位置
 
-这一步是**候选召回**，不是 Cue 判定：宁可保留有潜力但尚待判断的 Atom，也不能在这里生成 predicate、判断 `accepted/no_cue/ambiguous`，或把检索得分当成最终质量标签。
+```text
+370,799 Source Atom
+        ↓ 本包：BGE-M3 检索 + 聚类 + 去近重复 + 分层
+10,000–12,000 candidate Atom
+        ↓ 三个阿里云账号、同一 qwen3.7-flash 协议
+约 3,000–5,000 accepted Cue v2
+        ↓
+900–1,400 Seed candidates → 480 Frozen Seed → 2,880 Life Log
+```
 
-## 机器条件
+## 机器与专用环境
 
-- WSL2：Ubuntu 24.04.3，内核 6.6.87；
-- CPU：Intel Core Ultra 9 285H，16 线程；
-- 可用内存：约 11 GiB，Swap 3 GiB；
-- GPU：NVIDIA GeForce RTX 5060 Laptop/系列，显存约 8 GiB；
-- Windows 驱动：591.74，报告支持 CUDA 13.1；
-- WSL CUDA Toolkit：12.2，`nvcc` 可用；
-- WSL 根盘可用空间约 932 GiB。
+目标环境是 WSL2 Ubuntu 24.04.3、RTX 5060 Laptop 约 8 GiB、11 GiB 可用内存。系统 CUDA Toolkit 12.2 与驱动支持 CUDA 13.1 并不冲突；正式判据是所选 PyTorch wheel 的 CUDA runtime 能被当前驱动加载，并通过 `torch.cuda.is_available()`、GPU 运算和 BGE dense+sparse 小批编码。
 
-系统 CUDA Toolkit 与 PyTorch wheel 自带的 CUDA runtime 可以不同。不要仅因 `nvcc` 显示 12.2 而重装驱动或 Toolkit；必须以 `torch.cuda.is_available()`、实际 GPU 矩阵运算和 BGE-M3 小批编码为准。安装时使用 PyTorch 官方稳定 Linux wheel：[PyTorch 本地安装](https://pytorch.org/get-started/locally/)。
+必须创建 `.venv-bge-m3`。模型、依赖和缓存均放在 WSL Linux 文件系统，不在 `/mnt/c` 或 `/mnt/d` 上做高频读写。PyTorch 安装参考 [官方安装页](https://pytorch.org/get-started/locally/)，模型接口参考 [FlagEmbedding BGE-M3](https://github.com/FlagOpen/FlagEmbedding/blob/master/research/BGE_M3/README.md) 和 [BAAI/bge-m3 模型卡](https://huggingface.co/BAAI/bge-m3)。
 
-## 为什么建立独立虚拟环境
+## 文件导航
 
-必须在本目录创建 `.venv-bge-m3`：
+| 文件 | 只回答什么 |
+| --- | --- |
+| `AGENTS.md` | 不可违反的身份、边界和停止条件 |
+| `SELECTION_PROTOCOL.md` | 唯一算法定义与验证边界 |
+| `RUNBOOK.md` | 从接收到交付的执行顺序 |
+| `TRANSFER_CONTRACT.md` | 输入、五文件回传、字段去向 |
+| `input/README.md` | 输入目录和 SHA 绑定方式 |
 
-- Windows 的 Python 环境不能直接在 WSL Linux 中使用；
-- PyTorch、CUDA runtime、`transformers`、`FlagEmbedding` 和 `huggingface_hub` 必须单独冻结；
-- 避免污染系统 Python；
-- 便于记录完整依赖并复算同一 selection。
+本包刻意不再设置 `PROJECT_CONTEXT.md` 等重复说明；相同阶段、相似职责只保留一处权威定义。
 
-建议把整个目录放在 WSL Linux 文件系统，例如 `~/EgoPM_BGE-M3_filter/`。模型、embedding 和索引缓存也应留在 Linux 文件系统，避免通过 `/mnt/c` 或 `/mnt/d` 高频随机读写。
-
-## 包内目录
+## 目录
 
 ```text
 EgoPM_BGE-M3_filter/
 ├── AGENTS.md
 ├── README.md
-├── PROJECT_CONTEXT.md
 ├── SELECTION_PROTOCOL.md
 ├── RUNBOOK.md
 ├── TRANSFER_CONTRACT.md
-├── .venv-bge-m3/                 # WSL 创建，不交付
-├── input/                        # 用户提供，只读
-├── model/                        # 固定 revision 模型
-├── src/                          # WSL Codex 编写的本地执行程序
-├── cache/                        # 可恢复 embedding 与检索缓存
-├── work/                         # checkpoint、日志和诊断
-└── output/<selection_id>/        # 正式交付目录
+├── input/
+│   ├── README.md
+│   ├── source/               # 用户复制；只读；不提交
+│   ├── request/              # 三组件、根请求和旁路 SHA
+│   └── schema/               # Source 行与统一 artifact 两个必要 Schema
+├── src/                      # WSL Codex 实现；结束后回传工程材料
+├── model/                    # 本地模型；不回传
+├── cache/                    # embedding/索引；不回传
+├── work/                     # 审计/checkpoint/log；不回传
+└── output/<selection_id>/    # 恰有五个正式文件
 ```
 
-除本页列出的包内路径外，说明文件不依赖其他目录。若本目录之外还有项目文件，WSL Codex 也不得假定它们存在或可见。
+## 最短路径
 
-## 阅读与执行顺序
-
-1. 完整阅读六份包内说明；
-2. 检查 `input/` 的三项输入，确认身份与哈希；
-3. 按 `RUNBOOK.md` 创建环境并完成 GPU、模型和小批自检；
-4. 按 `SELECTION_PROTOCOL.md` 实现或检查筛选流程；
-5. 执行冻结的 `selection_request.json`；
-6. 生成报告、manifest 和正式候选；
-7. 通过全部门禁后写 SUCCESS；
-8. 将完整 `output/<selection_id>/` 交给用户，由用户负责导入主项目。
-
-## 本阶段不做什么
-
-- 不生成 Cue predicate、Seed、lure、Life Log 或 gold；
-- 不判断 `accepted/no_cue/ambiguous`；
-- 不调用千问、DeepSeek 或其他生成式 API；
-- 不修改或重新保存 Source；
-- 不把 embedding、模型权重或 Source 正文放入正式输出；
-- 不决定后续 API 分片、账号分配或最终 Cue SUCCESS。
-
-正式结果只回答一个问题：**哪些 Source Atom 值得进入下一阶段的 Cue v2 抽取池，并且该选择能否被确定性复算和科学审计。**
+1. 把 Source 与 Source SUCCESS 复制到 `input/source/`。
+2. 验证旁路根 SHA、组件 SHA、两个 Schema、Source/Source SUCCESS SHA 和严格键集合。
+3. 建立专用环境，下载固定 revision，冻结依赖与源码 manifest。
+4. 单 GPU 完成分片编码；CPU 完成检索、投影聚类、选择和本地完整验证。
+5. 生成候选、精简 proof、综合 report、manifest，最后写 SUCCESS。
+6. 把五文件正式目录交回 Windows；另把 `src/`、依赖锁和 `WSL_HANDOFF.md` 同步回本目录。
+7. Windows T4 从 Source + proof 独立复核离散选择逻辑并进行人工抽样，不重新跑 BGE。

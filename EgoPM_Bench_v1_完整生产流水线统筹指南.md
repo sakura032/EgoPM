@@ -1,11 +1,11 @@
 # EgoPM-Bench v1 完整生产流水线统筹指南
 
-> 版本：v1.3
-> 更新日期：2026-09-09
+> 版本：v1.5
+> 更新日期：2026-09-15
 > 数据定位：video-referenced, text-first, decision-first, counterfactual  
 > 本文面向第一次制作数据集的执行者，说明每一步为什么做、输入是什么、输出是什么、怎样判断可以进入下一步。
 
-> **v1.3 优先级说明**：Cue/Seed v2 的详细执行合同以 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md` 为准。本文中作为历史说明保留的旧 V9、约 60 个候选、35–40 个 Seed、统一 Plus 审计或全量 Cue 描述，不再授权正式生产。
+> **v1.5 优先级说明**：Cue/Seed v2、事实性三层门、统一 Life Log 骨架与 BGE selection v3.1 的详细执行合同以 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md` 为准。本文中作为历史说明保留的旧 V9、约 60 个候选、35–40 个 Seed、统一 Plus 审计、全量 Cue、仅凭 span 验收或正负分支替换 trigger 的描述，不再授权正式生产。
 
 ---
 
@@ -21,7 +21,7 @@ EgoPM-Bench v1 的研究对象不是“给视频写摘要”，而是：
 
 核心生产公式为：
 
-> 全量 Source → BGE-M3 筛出 8,000–12,000 个候选 Atom → Flash 形成约 3,000–5,000 条高质量 Cue → 生成 900–1,400 个候选 Reminder Seed → 审计冻结 480 个基础任务 → 每个任务生成 2 个反事实分支 × 3 个记忆难度 → 2,880 条 Life Log。
+> 全量 Source → BGE-M3 selection 形成 10,000 条核心候选并按新颖度补样至 10,000–12,000 条 → Flash 形成约 3,000–5,000 条高质量 Cue → 生成 900–1,400 个候选 Reminder Seed → 审计冻结 480 个基础任务 → 每个任务生成 2 个反事实分支 × 3 个记忆难度 → 2,880 条 Life Log。
 
 480 是预注册的正式目标，不允许通过降低质量门凑数。候选通过数不足时扩大 Cue/Seed 候选池；达到各层覆盖门且至少 576 个候选通过机器门后，才允许停止扩充并进入全部人工终审。数据时长必须同时报告 manifest 引用时长、去重真实来源时长和虚拟时间跨度。
 
@@ -72,7 +72,7 @@ Life Log 每到达一个规定决策点，就产生一次模型输入和 gold ac
 | Cue v2 候选抽取 | `qwen3.7-flash` | 同一固定协议；JSON Schema | 三个百炼账号只扩展静态分区吞吐，不改变模型语义 |
 | Reminder Seed、trigger predicate、lure 与生命周期候选生成 | 待阶段 CR 冻结；首选候选为 `qwen3.7-plus-2026-05-26` | 思考；中等推理；JSON Schema | 900–1,400 个候选需要单独核算质量、成本和并发 |
 | Cue/Seed 独立模型审计 | Plus 为低成本主审；DeepSeek 仅少量争议第三意见 | 分层抽检；结构化输出 | 不对全量候选使用昂贵模型，人工仍独立终审 |
-| Life Log 语言生成 | 待阶段 CR 冻结 | 单 campaign 单模型 | 可以选其他中国厂商，但不得在同一阶段混用 |
+| Life Log 组装 | 确定性编排与受控 constructed 模板为默认；模型仅可选用于模板润色 | 不得改写 Source 事实、引入新现实实体或决定状态/gold |
 | SRT 解析、时间对齐、去重、划分、状态转移与 gold | Python 确定性脚本 | 不调用大模型 | 必须可复现，不能让模型猜 |
 | 相似 trigger/lure 检索 | `BAAI/bge-m3` 固定修订 | 稠密+稀疏混合检索；确定性 RRF | 比词面 Jaccard 更适合跨表达语义；v1 不增加 reranker |
 
@@ -452,8 +452,8 @@ T1 通过后，T0 冻结 SOURCE_ATOMS_SUCCESS 哈希。若 T4 报错，只退回
 
 依赖顺序是先 Cue、后检索、再 Seed，不能让三个对话各自生成一份：
 
-1. 在 WSL2 中用固定 BGE-M3 对全量 Source 单进程编码，形成 8,000–12,000 个候选 Atom selection；
-2. T4 在 Windows 导入并验证 selection manifest、Source SHA、模型 revision 和分布报告；
+1. 在 WSL2 中用固定 BGE-M3 对全量 Source 单进程编码，执行冻结的 10,000–12,000 个候选 Atom selection；
+2. T4 在 Windows 导入五文件快照，从 proof 与 Source 验证离散选择逻辑、manifest、模型 revision、分布和人工样本；不重跑 BGE；
 3. 协调器把候选 Atom 静态分给三个阿里云 worker；
 4. 三个 worker 使用同一 `qwen3.7-flash` Cue v2 协议并行写各自 staging 和独立账本；
 5. 协调器闭合 ambiguous、运行 clause 语义门并生成约 3,000–5,000 条 accepted Cue 的正式分片、manifest 和 SUCCESS；
@@ -564,7 +564,7 @@ coordination/STATUS.md 只由 T0 更新，建议使用：
 | Contract v1 | T0 | TODO | — | — | freeze schemas |
 | Source atoms | T1 | BLOCKED | — | Contract v1 | implement 01–04 |
 | Source QA | T4 | BLOCKED | — | Source atoms | validate |
-| BGE candidate selection | T2/WSL | BLOCKED | — | Cue/Seed v2 实现 | 生成 8,000–12,000 个候选 Atom |
+| BGE candidate selection | T2/WSL | BLOCKED | selection v3.1 request/查询/策略/两个必要 Schema 已冻结 | WSL 实现、运行与导入 QA | 生成并验证 10,000–12,000 个候选 Atom 和 proof |
 | Cue v2 library | T2 | BLOCKED | — | BGE selection + 三账号协议 | 生成约 3,000–5,000 条高质量 Cue |
 | Seed candidates | T2 | BLOCKED | — | Cue v2 library | 生成 900–1,400 个候选 |
 | Seed audit | T0/T4 | BLOCKED | — | Candidates | audit |
@@ -703,16 +703,20 @@ source_start_sec/source_end_sec 必须说明是文件内相对秒、session 相�
 
 ### 1. Cue 的 clause dimension
 
-一个 Atom 最多形成一个正式 Cue；该 Cue 可以包含多个由各自原字段证据直接支持的合取 clause：
+一个 Atom 最多形成一个正式 Cue；一条 Cue 只含一个 predicate，并包含 1–3 个由各自原字段证据直接支持的 `all_of` clause：
 
-- time：只允许原字段中明确出现的时间、频率、期限或时间关系；
+- explicit_time：只允许 Source 文本中明确出现且可逐字引用的日期、时刻、频率、期限或先后关系；视频/session 时间戳不是该证据；
 - person：某人出现、离开、靠近、开始交互；
-- place：进入或处于某地点；
+- location：进入或处于某地点；
 - object：某物体出现、拿起、放下、缺失或改变状态；
 - activity：开始、持续、结束或切换某活动；
-- state_change：可观察的环境、人物或物体状态变化。
+- state：可观察的环境、人物或物体状态成立、否定或变化。
 
-Cue v2 不再保存顶层 `cue_type`，需要统计时从 clauses 的 dimension 确定性派生。虚拟时间不属于 Source Cue，只能由后续 Seed/Rule 构造。最终分布以真实通过语义门的内容为准；配额用于发现缺口，不能迫使模型制造某类 Cue。
+Cue v2 不再保存顶层 `cue_type`，需要统计时从 clauses 的 dimension 确定性派生。`event_timestamp` 只表示 Source 视频/session 的位置，用于定位和事件顺序；未来提醒使用独立 `temporal_condition`，只能由后续 Seed/Rule 的冻结模板和确定性规则构造并人工审计。最终分布以真实通过语义门的内容为准；审计用于发现缺口，不能迫使模型制造某类 Cue。
+
+Current dimension 只使用 `person/location/object/activity/state/explicit_time`。旧版 `place/state_change/time` 不作为同义枚举继续保留，BGE 查询族也不能直接当作模型标签。operator 必须按 dimension 设合法组合，至少区分人物在场/说话/被提及、地点被提及/进入/处于、活动开始/持续/结束、状态成立/否定/变化，以及显式时间被陈述/计划/假设；不能只用通用 `eq/not_eq` 掩盖关系和语气。
+
+Cue 是可判断的观察条件，不要求完整主谓宾。“手机出现”“厨房”“Jake 正在说话”“门已打开”可以成立；“他”“那里”“东西”“正在做”“发生变化”等没有可识别指向对象或状态承载者的表达不能成立。一个明确实体或地点通常用一条 clause；主体/对象与动作或状态通常用两条；只有第三个条件确实用于消歧时才使用三条。禁止把不相关事实拼进一个 Cue，也禁止把一个事实重复拆成多个 clause。
 
 ### 2. 千问 Flash 的工作
 
@@ -726,7 +730,28 @@ Cue v2 不再保存顶层 `cue_type`，需要统计时从 clauses 的 dimension 
 
 模型输出只是候选。正式 Cue 不保存 `confidence`、顶层类型、重复 Source 正文、可派生 split 或逐行模型/run/Schema 元数据。程序必须验证每个 clause 的 value 被自己的 span 直接支持，阻断错槽、字符串 `null`、跨字段/跨 Atom 拼接和释义。ambiguous 复核后只能进入 accepted、no-cue 或 excluded-ambiguous 终态。
 
-### 3. Cue Library 的输出
+### 3. 每条候选必须通过三层判断
+
+第一层检查证据位置：`evidence.field` 只能是同一 Atom 的 `transcript` 或 `dense_caption`，`evidence.span` 必须是该字段中的连续原文。程序从 Source 重新读取字段验证，不能相信模型回显文本；禁止跨字段、跨 Atom、翻译、摘要、重排或拼接。
+
+第二层检查 value：`value` 必须能由自己的 span 直接支持，最多只允许 Unicode 和空白规范化。它可以是 span 中较短但完整的实体，例如“我拿着手机”中的“手机”；不能删除否定词、改变数字/单位、改写词序或用常识补全。空串、`null/none/unknown/n/a` 和无法解析的纯代词/泛指词直接拒绝。
+
+第三层检查完整语义：验证 `dimension + operator + value` 是否真的由 span 蕴含。必须检查人物是在场、说话还是仅被提到；活动的主体/对象；状态的承载者；否定、量词和范围；条件、假设、将来、疑问和不确定语气；显式时间是被陈述、计划还是已经到达。看到“冰箱”不能推断厨房，“Alice 被提到”不能推断 Alice 在场，“没拿手机”不能生成手机出现，“如果三点开会”不能生成三点已经到达。
+
+前两层和部分第三层由 T2/T4 独立程序全量执行。程序不能可靠判断的人物角色、指代、范围和时间语气进入结构化人工审计，不得让另一模型的一句“同意”自动转为金标。稳定错误码至少区分 span 不连续、value 无支持、dimension 错置、operator 极性错误、人物角色错误、范围错误、时间语气错误、指向对象不可解析和跨字段借证。
+
+### 4. 校准、验收和扩量顺序
+
+1. 先复用 BGE proof 的 350 条 audit sample，人工标注 `no_cue`、dimension、operator、span、value、人物角色、否定/范围/时间语气和 Seed 可执行性，用于写 prompt、Schema、validator 和历史失败回归测试；
+2. 最终协议另取 800–1,000 条验收 Atom，其中至少 120 条由三个账号重叠处理；先执行约 500 条子波次，若修改协议则整套验收重新开始；
+3. 验收要求 span 与 value 两层硬门为 100%，accepted 分层语义精确率不低于 97%，事实角色/关系/否定/范围/时间语气失真为 0，Schema 有效率不低于 99.5%；
+4. 正式生产先运行约 1,500 条 checkpoint，核对质量、dimension/operator 分布、worker 漂移、吞吐和每千条费用，再处理剩余候选；
+5. 每个请求最多携带 5 个带稳定 `item_index` 的 Atom，各项独立验证。单项失败最多一次只含该 Atom 的简化修复，仍失败即排除，不循环重付；
+6. 强模型只审计 ambiguous、分层样本和拟进入 Seed 的 trigger Cue。全部最终 Seed 由人工终审，Life Log 的事实观察不再调用模型生成。
+
+约 3,000–5,000 条 accepted Cue 是规划范围而非配额。数量不足时检查 selection 和 prompt，不能通过放宽真实性门或强制 dimension 平衡凑数。
+
+### 5. Cue Library 的输出
 
 Cue v2 使用 `cues/v2/formal/part_N.jsonl`、`cues/v2/cue_library_manifest.json` 和一个 `cues/v2/CUE_LIBRARY_SUCCESS.json`。正式行只包含 `cue_id`、`atom_id` 和 clause-level predicate/evidence。模型、prompt、Schema、run、worker、预算和账本写入 manifest/provenance，不在每行重复。旧 `cues/formal/` 的 V9 分片永久只作审计。单文件导出若存在，只是可重建缓存。
 
@@ -764,11 +789,11 @@ Cue v2 使用 `cues/v2/formal/part_N.jsonl`、`cues/v2/cue_library_manifest.json
 | 主 clause dimension | 设计要求 | 预期 |
 | --- | ---: | --- |
 | person | 报告覆盖和集中度，不设强制比例 | 需要真实人物证据 |
-| place | 报告进入/离开/处于覆盖 | 防止仅靠场景词触发 |
+| location | 报告进入/离开/处于覆盖 | 防止仅靠场景词触发 |
 | activity | 报告 starts/ends/contains 覆盖 | 适合主动触发，但需排除泛化动作 |
 | object | 报告 present/absent/状态覆盖 | 需要防止仅靠关键词判断 |
-| time | 只使用 Source 显式时间证据 | 虚拟时间另在 Rule 构造 |
-| state_change | 单独报告高淘汰率 | 宁缺毋滥，不接受推断状态 |
+| explicit_time | 只使用 Source 显式时间证据 | 虚拟时间另在 Rule 构造 |
+| state | 单独报告高淘汰率 | 宁缺毋滥，不接受推断状态 |
 
 这些是覆盖维度，不是最终类别配额。一个 Seed 可以有多个合取 clause。只有各层覆盖门满足且至少 576 个候选通过机器门后，才可停止扩充；最终冻结数为 480。
 
@@ -783,7 +808,9 @@ Cue v2 使用 `cues/v2/formal/part_N.jsonl`、`cues/v2/cue_library_manifest.json
 7. 人工删除不自然、不可观察、无法状态机化或当前画面直接泄露答案的候选；
 8. 每个 Seed 保存 accept/revise/reject 状态与理由。
 
-`lexical_jaccard_v1` 只保留作历史 fixture/对照，不得出现在正式生产路径。Source→Cue 候选筛选的 passage 按 transcript、dense_caption、visible_text 固定排序，不加入人物、日期、组别或 split 元数据。冻结查询族分别进行 dense、sparse 和 RRF 召回，并加入 dense 语义簇多样性样本，避免查询模板决定全部候选。精度、batch、排序和缓存合同以 `wsl_BGE-M3_filter/` 为准。
+`lexical_jaccard_v1` 只保留作历史 fixture/对照，不得出现在正式生产路径。Source→Cue 候选筛选先校验 `visible_text` 是 transcript/dense_caption 的派生字段，再只按独立 transcript、dense_caption 构造 passage；不得编码 visible_text，也不得加入人物、日期、组别、split 或视频时间戳元数据。查询族固定为 `Person / Location / Object / Activity / State / Explicit-Time`，六族全部进行 dense、sparse 和 RRF 召回、全部报告且不设配额。
+
+全维 1024 维 BGE 向量用于检索与候选距离；粗粒度 diversity 使用固定投影至 256 维、65,536 条确定性分层样本和 1,024 簇 MiniBatchKMeans。核心 10,000 条至少有 3,500 条 diversity 主选、2,000 条不在 query union；随后按稀有簇与新颖度门补样，达到 12,000 或一整轮无新增时停止。具体精度、聚类、cluster ID、排序和缓存合同以 `wsl_BGE-M3_filter/` 为准。
 
 BGE embedding 与索引是绑定 Source SHA、Cue manifest SHA、模型修订、序列化版本、依赖版本和参数哈希的可重建缓存，不是正式基准数据；正式检索结果保存稠密 rank、稀疏 rank 与 RRF 分数。若不复用或同组/跨组约束导致候选不足，应按固定排名扩大检索深度或更换 trigger，不能放宽规则；统计报告必须披露这类缺口。
 
@@ -791,7 +818,7 @@ BGE embedding 与索引是绑定 Source SHA、Cue manifest SHA、模型修订、
 
 真实 trigger atom：人物进入厨房并开始准备食物。  
 构造意图：下次开始做饭时提醒我把冷藏药品拿出来。  
-trigger predicate：place=kitchen AND activity_start=cooking。  
+trigger predicate：`location/at/kitchen` AND `activity/starts/cooking`。
 lure 1：人物在厨房聊天，但没有开始做饭。  
 lure 2：人物在餐桌吃饭，但地点和活动都不满足。  
 negative history：这项任务此前已取消。  
@@ -825,7 +852,7 @@ negative history：这项任务此前已取消。
 - revise：保留核心，但需要修改 predicate、lure 或 lifecycle；
 - reject：不可观察、不可解、泄露、无合格 lure、规则含糊或跨 split。
 
-目标是冻结 480 个。若少于 480 个，按预注册排序扩大 Cue/Seed 候选池；不得降低可观察性、lure、状态机、反事实或 split 标准，也不得强行保留不清晰 state_change。
+目标是冻结 480 个。若少于 480 个，按预注册排序扩大 Cue/Seed 候选池；不得降低可观察性、lure、状态机、反事实或 split 标准，也不得强行保留不清晰 state。
 
 ### 3. 冻结后不得随意改
 
@@ -875,8 +902,8 @@ else:
 - 使用完全相同的当前 trigger atom；
 - 使用相同的核心意图文本与 trigger predicate；
 - 只改变一个足以翻转动作的历史条件；
-- 负分支从 never_created、completed、cancelled、expired、already_reminded 中选择；
-- 除必要差异外，尽量匹配事件数、token 数、背景意图和干扰 atom；
+- 负分支从 completed、cancelled、expired、already_reminded 中选择；核心统一数据不使用 never_created；
+- 除位置相同的一条 constructed 生命周期控制事件外，Source Atom、事件数、trigger/lure 位置和背景序列全部相同，成对 token 差异不超过 5%；
 - 由 validator 检查正分支为 remind、负分支为 silent。
 
 不同 family 应轮换负例类型，不能全部只用 cancelled。
@@ -889,9 +916,11 @@ else:
 
 | 难度 | 建议事件数 | 背景意图 | 干扰密度 | 建议虚拟跨度 |
 | --- | ---: | ---: | --- | --- |
-| short | 12–20 | 0–1 | 低 | 30–90 分钟 |
-| medium | 35–60 | 2–4 | 中 | 2–8 小时 |
-| long | 90–150 | 5–10 | 高 | 12–48 小时，可跨日 |
+| short | 12 | 0 | 低 | 60 分钟 |
+| medium | 36 | 2 | 中 | 360 分钟 |
+| long | 72 | 5 | 高 | 2,880 分钟，可跨日 |
+
+这些是进入批次 B/C 和 token 校准的推荐单值，不得在不同样本中随意从旧区间取值。若校准表明某个值会导致 token 超限，只允许在正式生成前统一调整该难度的单值；生产开始后不能按样本改变事件数。
 
 三种版本必须保持：
 
@@ -928,7 +957,19 @@ Seed A
 └─ negative-long
 ~~~
 
-每个事件至少需要：
+每条 Life Log 固定服务一个目标意图，并且固定包含：
+
+- 一条目标意图创建事件；
+- 一条 constructed 生命周期控制事件；
+- 两条真实 lure 观察，其中一条同 source group、一条跨 source group；
+- 一条真实 trigger 观察；
+- 固定数量的背景 Source 观察与背景意图。
+
+同一 family 的六条日志共享完全相同的 trigger、两条 lure 和背景 Source Atom 序列。positive/negative 成对日志只替换生命周期控制事件：positive 表示意图仍有效，negative 表示已完成、已取消、已过期或已经提醒；最终出现的是同一个 trigger，因此 gold 的变化只能来自记忆状态。核心 2,880 条不使用 `never_created`，因为统一骨架已经包含意图创建；该类型如需研究只能另作结构消融。
+
+推荐在 token 校准后把 short/medium/long 固定为 12、36、72 个事件，背景意图分别为 0、2、5，虚拟跨度候选为 60、360、2,880 分钟。同一难度事件数完全相同，正负配对 token 差异不超过 5%。目标相关 Source 观察始终为三条，即一个 trigger 加两个 lure；难度只能通过背景量、时间跨度和干扰接近度变化。
+
+主记录中的每个事件至少需要：
 
 - event_id；
 - family_id；
@@ -948,12 +989,17 @@ Seed A
 
 event_role 可包括 intention_creation、background、lure、trigger、completion、cancellation、expiry、reminder_history。该字段属于构建审计信息，正式模型输入中必须移除，避免泄露答案。
 
+模型可见事件进一步精简为 `event_id`、顺序、`virtual_time`、观察文本、provenance 和必要的 `atom_id`。真实观察只能使用 Source 原字段或包含完整证据的确定性连续窗口；超过文本上限时更换 Atom 或按固定窗口截取，不得由模型概括改写。Cue ID、predicate、event_role、状态前后值、反事实分支、gold、Evidence Set 和 oracle 理由全部留在隐藏标注。
+
 组装约束：
 
 - 优先保持同一 Life Log 的场景和人物组合合理；
 - 跨 participant 组合必须避免暗示其为同一真实人物经历；
 - 构造桥接事件只能表达意图和生命周期，不能伪造 EgoLife 视觉事实；
 - 同 family 共用 trigger 和核心 lure；
+- 正负分支共用同一 trigger、lure、背景 Source 序列和对应位置，只允许一条生命周期控制事件不同；
+- 构造意图和生命周期文本优先使用受控模板；即使使用语言模型润色，也只能修改 constructed 文本并锁定实体占位符；
+- constructed 文本中的现实人物、地点、物体和关系必须来自已验证 Cue/Source，不得自由添加；
 - 每个正式 log 记录 referenced_source_seconds；
 - 重复引用同一 atom 可以计入 manifest_referenced_hours，但不能重复计入 unique_source_hours。
 
@@ -1072,7 +1118,7 @@ egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/
 | A. 原始清点 | 全部 SRT | 文件 inventory | srt_inventory.csv | 无漏扫、错误可追踪 |
 | B. 原子建库 | SRT inventory | 解析、对齐、宽松保留 | source_video_atoms.jsonl | schema、来源、时间全通过 |
 | C. 来源冻结 | atom 库 | 去重、分组、split | source_split_map.jsonl | 无跨 split 泄漏 |
-| D. BGE 候选筛选 | atom 库 | WSL 单 GPU 的 dense+sparse+多样性筛选 | 8,000–12,000 个候选 Atom + manifest + SUCCESS | 固定 revision、Source SHA、分布和候选唯一性通过 |
+| D. BGE 候选筛选 | atom 库 | WSL 单 GPU 的 dense+sparse+多样性筛选 | 10,000–12,000 个候选 Atom + proof + 综合报告 + manifest + SUCCESS | 固定 revision、Source/request SHA、WSL 数值审计、T4 离散 proof/分布/人工样本通过 |
 | E. Cue v2 建库 | BGE selection | 三个百炼账号、同一 Flash 协议、程序语义门 | 约 3,000–5,000 条 Cue 分片 + manifest + SUCCESS | 每个 clause 有原字段证据，语义与分布门通过 |
 | F. Seed 候选 | Cue v2 manifest | 固定单一模型决策优先生成 | 900–1,400 个 candidates | 每个有唯一 Cue 血缘、同组+跨组 lure、全局不复用与 terminal |
 | G. Seed 冻结 | candidates | 低成本模型意见 + 人工终审 | 480 个 frozen Seeds | 全部可状态机化且血缘/组别/不复用检查通过 |
@@ -1091,7 +1137,7 @@ egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/
 
 1. 按 CR-2026-018/019/020 实现 Cue Schema v2、selection contract、三账号账本/租约和 T4 语义门；
 2. 将 `wsl_BGE-M3_filter/` 复制到 WSL，创建专用 `.venv-bge-m3`；
-3. 冻结 `selection_request.json` 后运行 BGE-M3，导入并验证 8,000–12,000 个候选 Atom；
+3. 执行已拆分并冻结的 BGE selection v3.1（根 request、模型配置、48 行查询集、选择策略、两个必要 Schema），导入并验证 10,000–12,000 个候选 Atom 及精简 proof；
 4. 将候选静态分给三个阿里云账号，使用同一 `qwen3.7-flash` 协议写隔离 staging；
 5. 协调器生成 Cue v2 正式分片、分布报告、manifest 和 SUCCESS；
 6. 选择并冻结 Seed 生成模型，生成 900–1,400 个 candidates；

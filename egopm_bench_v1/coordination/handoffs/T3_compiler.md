@@ -1,10 +1,10 @@
 # T3 确定性基准编译器交接
 
-> **2026-09-09 v1.3 接续说明**：最终规模改为 480 个 Frozen Seed 和 2,880 条六路 Life Log。Life Log 正式布局、生成模型和协议参数必须在生产前另开 CR；T3 在 Cue v2、Seed candidates、人工审计、T4 Seed QA 和 `SEEDS_FROZEN_SUCCESS` 完成前只能使用 synthetic fixture，不得读取旧 V9 Cue 启动正式编译。
+> **历史交接说明（2026-09-09，v1.3）**：最终规模后来改为 480 个 Frozen Seed 和 2,880 条六路 Life Log；本文件其余治理/数据版本和 Wave 1 参数均是当时记录，不能覆盖当前 `AGENTS.md` v1.5.0 与 CR-2026-022。Life Log 正式布局、生成模型和协议参数必须在生产前另开 CR；T3 在 Cue v2、Seed candidates、人工审计、T4 Seed QA 和 `SEEDS_FROZEN_SUCCESS` 完成前只能使用 synthetic fixture，不得读取旧 V9 Cue 启动正式编译。
 
 ## 合同与提交状态
 
-- 治理合同版本：`v1.1.0`。
+- 交接时治理合同版本：`v1.1.0`（当前治理合同为 `v1.5.0`；本文件只记录历史 fixture 实现）。
 - 数据合同版本：`v1.0.0`。
 - 分支：`codex/t3-wave1-compiler`。
 - Wave 1 实现提交：`ba3eb30504a9005d140fadb9e83ba68ec368b7c7`（本交接的提交补充在该提交之后）。
@@ -12,7 +12,7 @@
 
 ## Wave 1 已完成内容
 
-- `08_freeze_seed_audit.py`：只接受完整人工审计 CSV 中明确的 `accept`，要求审计覆盖所有候选并验证 35–40 个接受 Seed、Seed Schema、触发窗口和泄漏审查字段。通过后原子写入冻结 Seed、规则银行、状态机策略，最后才写入 `SEEDS_FROZEN_SUCCESS.json`。
+- `08_freeze_seed_audit.py`：历史 Wave 1 实现曾要求审计覆盖 35–40 个接受 Seed；该数量已被 CR-2026-020/022 的 900–1,400 候选、480 个 Frozen Seed 目标取代。通过后原子写入冻结 Seed、规则银行、状态机策略，最后才写入 `SEEDS_FROZEN_SUCCESS.json`。
 - `09_build_lifelog_families.py`：在重新验证冻结 Seed 与 source atom SUCCESS 标记及哈希、且协议数值参数已经冻结后，确定性派生每个 Seed 的 `positive/negative × short/medium/long` 六条 Life Log、family spec 与反事实配对清单。正负分支共用同一当前 trigger atom。
 - `10_run_oracle.py`：逐事件调用状态机编译 decision 和 evidence。gold 只由冻结 atom、有效窗口、生命周期和提醒历史决定，绝不调用模型或从自由文本判断触发；同时强制同 pair 的 `remind`/`silent` 翻转。
 - `rules/state_machine.py`：实现唯一的生命周期转移、虚拟时间、有效窗口、trigger 匹配与 gold 决策。`never_created`、`completed`、`cancelled`、`expired`、`already_reminded` 均确定性产生 `silent`。

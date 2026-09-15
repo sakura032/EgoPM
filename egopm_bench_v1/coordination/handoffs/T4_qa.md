@@ -6,7 +6,7 @@
 
 - 分支：`main`。
 - 提交：待 T0 审阅后填写。
-- 治理合同版本：`v1.1.0`。
+- 交接时治理合同版本：`v1.1.0`（当前治理合同为 `v1.5.0`；本文件只记录历史 QA）。
 - 数据合同版本：Source Atom Schema 为 `v1.1.0`；最终 `cue_candidate` Schema 仍为 `v1.0.0`；实时 Cue 执行协议为 `v3.0.0`，协议哈希 payload 为 `v3.0.0`，模型 ID 为 `qwen3.7-flash`。
 - 修改文件：`scripts/11_validate_all.py`、`tests/test_validators.py`、本交接文件。
 - 只读输入：T0 冻结的 `model_registry.yaml`、最终 Cue Schema、紧凑推理 Schema，以及 pytest 临时目录中的合成 Source/Cue 标记与无正文实时状态。

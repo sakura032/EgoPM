@@ -1,0 +1,11 @@
+.venv-bge-m3/
+input/source/
+model/
+cache/
+work/
+output/
+__pycache__/
+*.py[cod]
+*.tmp
+*.tmp.*
+

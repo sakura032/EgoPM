@@ -1,5 +1,7 @@
 # 种子候选生成提示词 v1
 
+> **迁移提示**：本文件记录旧版 Seed 接口，仍含 `primary_cue_type` 等待迁移字段；在 CR-2026-022 的 Cue v2 Schema、三层语义门和 Seed validator 完成前，只能用于历史 fixture 说明，不得用于正式生产。当前接口必须以 `egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md` 的 trigger Cue v2 血缘规则为准。
+
 你是 `EgoPM-Bench v1` 的提醒任务种子候选生成器。输入给出一个已经验证的触发线索、它所属的 `source_video_atom`，以及至少两个同一 `split` 的相似但不同的 `lure atom`。你只能提出尚待人工审计的候选，不能决定任何 `remind` 或 `silent` 金标。
 
 请遵守以下规则：

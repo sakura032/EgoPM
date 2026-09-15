@@ -1,51 +1,41 @@
 # WSL BGE-M3 独立任务约束
 
-本目录是一个**完全自包含的 WSL 执行包**。在 WSL 中工作的 Codex 只能看见本目录，因此不得假定任何父目录、Windows 仓库、历史对话或外部项目文档可见。除模型下载与依赖安装外，任务所需的规则、输入和交付要求都必须从本目录取得。
+本目录可独立复制到 WSL2。不要假定 Windows 父仓库或历史对话可见。开始前依次完整阅读 `README.md`、`SELECTION_PROTOCOL.md`、`RUNBOOK.md`、`TRANSFER_CONTRACT.md`、`input/README.md` 和 `input/request/` 全部冻结文件。
 
-开始工作前必须依次完整阅读：
+规则优先级：Windows 根仓库 `AGENTS.md` 的全项目治理与工件节制规则最高，且本目录不得放宽；在不冲突的 WSL 任务细节中以本文件为准。算法以 `SELECTION_PROTOCOL.md` 为准；字段和回传以 `TRANSFER_CONTRACT.md` 为准；具体参数以根请求绑定的机器配置为准。缺信息即停止，不得猜测。
 
-1. `AGENTS.md`：不可变边界与停止条件；
-2. `README.md`：入口、目录结构与任务概览；
-3. `PROJECT_CONTEXT.md`：项目背景、术语和本阶段在全流程中的位置；
-4. `SELECTION_PROTOCOL.md`：候选筛选的算法合同与验收门；
-5. `RUNBOOK.md`：环境、模型、编码、恢复和执行步骤；
-6. `TRANSFER_CONTRACT.md`：本目录输入、输出和交付合同。
+## 工件节制继承
 
-若上述文件互相冲突，以本文件为最高优先级；若任务所需输入、字段说明或已冻结参数在本目录内缺失，必须停止并向用户报告缺口，禁止到不可见目录猜测、引用或自行补造。
+- 本目录属于根合同的全项目约束范围。不得按查询族、cluster、shard、处理状态或脚本阶段增加 JSON 文件或子目录，也不得预建空目录和占位工件。
+- 当前 selection v3.1 已批准的正式回传只有 `output/<selection_id>/` 一棵目录模板和恰好五个文件；缓存、checkpoint、日志与本地完整审计不得进入正式回传。任何新增正式文件、目录模板或机器报告键拆分都必须先由 Windows T0 通过 CR 修改工件预算。
+- WSL 本地 JSON/JSONL 只允许 `cache/cache_manifest.jsonl`、`work/run_ledger.jsonl` 和 `work/run_report.json`；禁止 per-query、per-cluster、per-shard、per-error 或 per-checkpoint JSON。大型向量、索引与模型按已批准缓存分片族保留，不回传。
+- 实现测试和正式闭合检查必须断言输出目录文件集合恰好等于冻结五文件集合；多文件、少文件、残留 `*.tmp` 或未声明子目录均为 blocker。
 
-## 不可变边界
+## 不可变身份
 
-- 本任务只生产 Cue v2 的候选 Source Atom selection，不生成 Cue、Seed、Life Log、Decision、Evidence 或 gold。
-- Source Atom 只读；不得改写、重新切分、重新分配 split、修订正文或创建替代 Source。
-- 固定 Source 行数为 370,799，文件 SHA256 为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`。
-- 模型固定为 `BAAI/bge-m3`，revision 固定为 `5617a9f61b028005a4858fdac845db406aefb181`。实际 revision 不匹配必须停止。
-- 禁止以 `lexical_jaccard_v1`、BM25 或纯词面相似度替代正式 BGE-M3 dense+sparse 检索；词面规则只能承担确定性格式过滤或诊断。
-- 正式运行参数只能来自本目录 `input/selection_request.json`。该文件缺失、未标记冻结或哈希不符时，只能完成环境与小型自检，不能开始全量编码或写正式结果。
-- WSL 必须使用本目录独立虚拟环境 `.venv-bge-m3`。所有 Python、pip 和任务命令都必须先激活该环境，或显式调用其中的 Python。
-- 单 GPU 只允许一个 BGE-M3 模型进程。不得从多个终端重复加载模型或并行启动正式筛选。
-- 所有生成文件先写 `*.tmp`，通过本地校验后原子改名；不得手改生成的 JSONL、manifest、哈希或 SUCCESS。
-- 不读取、不请求、不保存任何 API Key；本阶段不调用生成式 API。
-- 不下载、复制或处理原始 MP4；不把 Source 正文、模型权重、embedding 或缓存提交到 Git。
-- 只有在全部合同门通过且不存在未解决 blocker 时，协调器才可写 `BGE_FILTER_SUCCESS.json`。
+- 只生产 Cue v2 的 Source 候选 selection，不生产 Cue、Seed、Life Log 或 gold。
+- Source 只读：370,799 行，SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`。
+- 模型固定为 `BAAI/bge-m3` revision `5617a9f61b028005a4858fdac845db406aefb181`。
+- selection ID 固定为 `bge_m3_source_select_v3_1_20260910_01`；根请求 SHA256 固定为 `921024d8b4621fb8f8a8d600e191f4ba3d7406325bc4b5a17954863b7f435baa`。
+- 候选数由冻结停止规则决定，必须在 10,000–12,000 之间。
+- 禁止用 `lexical_jaccard_v1`、BM25 或其他词面算法替代 BGE-M3 dense+sparse。
 
-## 允许的并行
+## 执行边界
 
-- GPU 编码：单进程、单线控制，可在进程内部使用批处理和安全的数据加载 worker。
-- 编码前的确定性输入检查与清洗：可按预先静态分片使用 CPU worker，但只能写互不重叠的临时文件。
-- embedding 完成后的只读统计、哈希和分片检索：可使用 CPU 并行，但不得同时创建第二个 GPU 模型进程。
-- manifest 与 SUCCESS：只能由一个协调器写。
+- 必须使用本目录专用 `.venv-bge-m3`；全部 Python、pip 和任务命令在该环境执行。
+- 单 GPU 只运行一个 BGE-M3 模型进程。CPU 验证可并行，但写入分区必须互斥。
+- 生成文件先写 `*.tmp`，内部验证后原子替换；禁止手改 JSONL、manifest、哈希和 SUCCESS。
+- 不读取或保存 API Key，不调用生成式 API，不处理 MP4。
+- `visible_text` 只做 Source 派生一致性校验，不编码、不输出。
+- `selection_request.json` 直接绑定 `source_video_atom.schema.json` 与统一的 `bge_selection_artifacts.schema.json`；不得从数据样本猜字段。Source SUCCESS 按冻结原始字节 SHA 验证，不再复制冗余 Schema。
+- passage 固定为 transcript/dense caption 组成的单一字符串并只编码一次；Unicode 规范化只用于资格和审计，不改变模型输入。
+- 核心联合约束必须由固定单 worker OR-Tools CP-SAT 求得并证明四阶段 `OPTIMAL`；不得以贪心失败冒充不可行。
+- `candidate_atoms.jsonl` 每行只含 `atom_id`；T4 所需离散证据写入 `selection_proof.jsonl`。
+- 正式 `output/<selection_id>/` 恰有候选、proof、report、manifest、SUCCESS 五个文件。
+- embedding、索引、模型、checkpoint、全量审计、Source 正文和日志只留 WSL 本地。
 
-## 强制停止条件
+## 硬停止条件
 
-出现以下任一情况必须停止，不得自动降级或带病继续：
+出现任一情况必须阻断：输入或请求哈希不符；未知/缺失/占位字段；模型 revision 或 GPU 不可证明；NaN/Inf；运行中修改代码、参数或依赖；联合约束不可行；核心不足 10,000；候选超过 12,000；候选重复或无法回查；proof/report 无法闭合；正式目录多文件；仍有写进程、`.tmp` 或 blocker。
 
-- Source 行数、SHA256、SUCCESS 身份或 `atom_id` 唯一性不符；
-- `selection_request.json` 缺失、参数未冻结、Schema 不合格或其声明的 Source/模型身份不符；
-- 模型 revision 无法证明、GPU 实际算子失败、embedding 出现 NaN/Inf；
-- 正式 campaign 中途改变模型、精度、`max_length`、序列化规则、查询集、配额或随机种子；
-- checkpoint 身份不一致、正式分片重叠、候选重复或回查 Source 失败；
-- 目标候选数、覆盖门或分布报告未达到 `SELECTION_PROTOCOL.md` 与 `selection_request.json` 的共同要求。
-
-## 交付最低报告
-
-交付前必须在本目录 `output/<selection_id>/` 内报告：环境版本、GPU 自检、模型 revision、模型文件清单、Source SHA、参数哈希、查询集哈希、候选数、各检索通道贡献、每个 split/参与者/模态/来源组分布、缓存清单、正式输出 SHA、恢复记录和未解决问题。
+不得自动降级、放宽阈值、复用 Atom 或凑数。只有唯一协调器在全部门通过后才可最后写 `BGE_FILTER_SUCCESS.json`。

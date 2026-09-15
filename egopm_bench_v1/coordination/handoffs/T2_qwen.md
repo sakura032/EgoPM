@@ -81,7 +81,7 @@ git diff --check
 | 分支 | `main` |
 | T2 代码提交 | `c9cc106920de178c2079c44ec7088f6c957e1ada` |
 | T2 交接提交 | `a47b409` |
-| 治理合同版本 | `v1.1.0` |
+| 交接时治理合同版本 | `v1.1.0`（当前为 `v1.5.0`） |
 | 配置合同版本 | `v1.1.0` |
 | 最终 Cue Schema | `v1.0.0` |
 | 紧凑推理 Schema | `cue_inference_batch_compact_v1.schema.json` / `v1.0.0` |
