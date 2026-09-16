@@ -1,0 +1,436 @@
+# 9.16 代码整理
+
+> [代码整理与去治理优化执行方案.md](./代码整理与去治理优化执行方案.md)  项目现在已经变成了屎山代码，一大堆之前废弃不可用的东西，层层的各种冻结、哈希、审计、版本限制，各类冲突，我现在花费大量时间在这些不必要的工作上，同时这些也限制了我在发现局部问题做出灵活调整，我想改个小东西，但总被提醒冻结，这严重浪费了我的token，同时制约了我的执行、纠正，我想进行一次优化和整理、归档、清除废物冗余，  我尝试列个md文档来指导清洁工作，但是现在文档也成了屎山有进入了牛角尖的死循环，我实在是受够了，本身是一件很简单的事情，
+> 核心是：我们当前只完成了从Egolife中提取atom，在wsl中利用BEG模型筛选出10000个atom，下一步正在打算用这些atom来构造cue，后续依次构造seed和lifelog。
+> 我们这个项目仅仅是要为论文的benchmark做好处理数据的前置工作，我想将代码框架彻底的清理一次。
+>
+> 我现在的想法是，文档写的太复杂了，考虑的太多，我是否可以先把所有关于冻结、哈希、审计、版本限制，各类冲突直接全部删除，保留有效的egolife源数据、atom，wsl洗过的atom；然后将除了现在已实现核心之外的所有代码全删除，其中旧版本构造cue（全量atom构造，cue语义失真，弄混t的那一版）我们只保留可复用代码，剩下内容全部删除，在可复用内容基础上，改写得到新的筛选后atom构造cue（新版必须吸取旧版的历史教训，做好优化），非代码的md说明文档，第一轮清洁先中先暂时保留，关于seed、lifelog我们现在仅以文档中的设计描述和少量json设计为主，没必要现在就实现代码。
+>
+> 也就是说，我只想保留详细的处理数据的整套思路和每一步骤的设计和处理方法细节以及我们当前仍然有效可复用的成果，剩下的我想彻底大胆清除掉，你认为这套方案如何，是否可以落实？你不要现在去实施，只给出建议和具体实施设计措施
+
+
+> 我先只做只读盘点：核对这份清理方案、当前目录结构、有效数据边界和旧/新 Cue 代码的实际耦合，再给你一套能真正落地、但不会把可复用成果误删的精简方案。本轮不会修改、移动或删除任何文件。
+>初步判断已经很明确：你的方向是对的，真正的问题不是“检查太多”，而是把研究事实约束、发布追溯、运行恢复、多人审批四种完全不同的东西揉成了一套日常开发硬门。接下来我会把它们拆成“必须保留的科学正确性”和“可以彻底退出当前主线的治理负担”，并核实哪些现有代码真有复用价值。
+>当前仓库的工程复杂度已经远远超过论文数据准备本身。我建议把“全部删除冻结、哈希、审计、版本限制”稍微改成：从当前开发主线彻底移除治理机制，只保留科学正确性检查、运行安全和一次性恢复能力。
+
+不要再对现有 [清理方案](./代码整理与去治理优化执行方案.md) 做增量补丁。它已经有约 84 KB，并重新形成了阶段、门禁、冲突清单和完成条件，本质上正在复制旧治理系统。
+
+## 我看到的实际情况
+
+当前代码确实已经到了适合重建主线、而不是继续修补的程度：
+
+- [05_extract_cues.py](./egopm_bench_v1/scripts/05_extract_cues.py:1) 超过 4,600 行，把 Cue v2 验证、协议验收、旧 V9、实时 API、八波执行、账本、恢复、冻结和分片混在一起。真正的当前入口只是一段只读预检，还不能生产 Cue。
+- [11_validate_all.py](./egopm_bench_v1/scripts/11_validate_all.py:1) 约 2,600 行，主要验证旧 SUCCESS、哈希、75 分片和 realtime 体系。
+- [06_retrieve_trigger_lures.py](./egopm_bench_v1/scripts/06_retrieve_trigger_lures.py:131) 和 [07_generate_seed_candidates.py](./egopm_bench_v1/scripts/07_generate_seed_candidates.py:249) 仍然围绕旧 Cue manifest、SUCCESS 和 75 个分片设计，不能直接消费新版 Cue。
+- 旧 realtime 目录约有 37.6 万个文件、约 0.98 GiB；旧 V9 Cue 有 75 个分片、约 0.23 GiB。
+- 当前 10,000 个 BGE 候选文件只有 `atom_id`，必须与 Source Atom 联结后才能使用。
+- 更重要的是：当前 BGE 五文件位于未跟踪的新路径，现有 Git tag 不能保护它们。
+- `wsl_BGE-M3_filter` 在 Windows 仓库里只有协议、配置、Schema 和依赖说明，没有实际执行筛选的源代码。如果 WSL 中还有唯一实现，清理前必须决定是复制保留实现，还是明确把这次筛选当作一次性结果。
+- 当前工作区有大量未提交改动。因此第一次动作不能是删除，必须先保护当前有效成果。
+
+## 应该保留什么
+
+建议只保留四类东西。
+
+### 1. 不可替代的数据
+
+必须保留：
+
+- 原始 EgoLife SRT。
+- `source_video_atoms.jsonl`。
+- `source_split_map.jsonl`，至少在确认 Source 行中的 `split` 足够前保留。
+- 10,000 条 `candidate_atoms.jsonl`。
+- BGE 五文件先整体备份；之后活动主线只需要候选 ID，其他四个可移出仓库。
+- 如果 WSL 中存在未入库的真实筛选程序，保留一份程序和运行环境说明。
+
+`source_video_atoms_draft.jsonl`、`raw_srt_segments.jsonl` 属于可重建缓存，可以稍后删除，但不是第一批。
+
+### 2. 已经验证有效的生产代码
+
+保留：
+
+- `01_inventory_srt.py` 至 `04_make_source_splits.py`。
+- 与 Source 解析、时间对齐、split 有关的有效测试。
+- 旧 Cue 代码中少量真正通用的内容，例如：
+  - API 请求和超时处理；
+  -结构化响应解析；
+  - exact span 检查；
+  - JSON Schema 校验；
+  - 原子文件替换；
+  - token、费用统计。
+
+这些代码应当“摘取后重写”，不要把原有 4,600 行文件裁剪成新入口。旧文件的内部耦合太重，继续手术很容易把历史假设带回来。
+
+### 3. 科学设计
+
+这些不是治理，应继续保留：
+
+- Cue 只能来自同一 Atom 的 `transcript` 或 `dense_caption`。
+- evidence span 必须是连续原文。
+- BGE 查询族不等于 Cue dimension。
+- 人物被提及、说话和实际在场必须区分。
+- 不跨 Atom 消解代词。
+- 否定、假设、将来、不确定话语不能改写成已发生事实。
+- 一个 Atom 最多一条 Cue；一个 predicate 使用最少且充分的 1–3 个 clause。
+- 无法确认时输出 `no_cue`，不能猜。
+- constructed 内容只能从 Seed/Life Log 开始。
+- 最终 gold 由确定性状态机产生。
+
+### 4. 运行安全
+
+只保留很薄的一层：
+
+- API Key 只从环境变量读取。
+- 必须显式 `--execute`。
+- 必须有有限的 `--limit`、超时、重试次数和费用上限。
+- 不把原始模型响应提交 Git。
+- 支持中断恢复，但不再使用 worker ledger、SUCCESS、协议哈希链和审批短语。
+
+## 可以退出当前主线的内容
+
+完成一次恢复性备份后，可以大胆清除或移出活动仓库：
+
+- 根目录和 coordination 下的 CHANGE_REQUEST、状态板、handoff 和角色分工。
+- T0–T4 所有权制度。
+- contract/config/schema 版本相等检查。
+- SUCCESS、manifest、上游哈希作为读取门禁的全部逻辑。
+- 旧 V9 Cue 分片、manifest 和 SUCCESS。
+- realtime 的八波、package、账本、receipt、进度、租约、授权文件和恢复状态。
+- 旧 Cue prompt、旧 compact Schema、旧 fixture。
+- `test_contract_freeze.py` 以及旧 realtime/manifest 测试。
+- 当前尚未投入真实生产的 Seed/Life Log 脚本，包括 `06`–`10`。有价值的状态机思想可以留下，但不必保留整套尚未适配 Cue v2 的生产外壳。
+- 旧的全仓验证器和统计器。未来按真实需求重新写小型验证函数。
+
+历史恢复主要依靠 Git tag 和仓库外压缩包，不要在活动仓库里再建一个庞大的 `legacy/`。
+
+## 推荐的新主线
+
+目录不要一步到位大搬家。第一轮先保留 Source 和候选数据原路径，只精简代码：
+
+```text
+egopm_bench_v1/
+├─ source/
+│  ├─ source_video_atoms.jsonl
+│  └─ source_split_map.jsonl
+├─ cues/
+│  ├─ selected_atom_ids.jsonl
+│  └─ runs/<run_id>/
+│     ├─ cue_results.jsonl
+│     └─ run.json
+├─ prompts/
+│  └─ cue_extractor.md
+├─ schemas/
+│  └─ cue.schema.json
+├─ scripts/
+│  ├─ 01_inventory_srt.py
+│  ├─ 02_parse_srt.py
+│  ├─ 03_align_modal_text.py
+│  ├─ 04_make_source_splits.py
+│  └─ 05_build_cues.py
+└─ tests/
+   ├─ test_source.py
+   └─ test_cue.py
+```
+
+`cue_results.jsonl` 建议同时记录全部 10,000 个 Atom 的终态：
+
+```json
+{"atom_id":"...","status":"accepted","cue":{...}}
+{"atom_id":"...","status":"no_cue","reason":"UNRESOLVED_REFERENT"}
+{"atom_id":"...","status":"failed","reason":"API_TIMEOUT"}
+```
+
+这样不需要 accepted、excluded、ledger、coverage、manifest 分成多套文件。完整性只需检查：
+
+- 10,000 个输入 ID 是否各出现一次；
+- 是否有重复 ID；
+- 是否还有 `failed`；
+- accepted Cue 是否通过事实验证。
+
+`run.json` 只记录模型、生成时间、输入路径、输入数、accepted/no_cue/failed 数量和费用汇总。它是运行说明，不是读取门禁，也不需要版本号或哈希链。
+
+## 新版 Cue 应怎样吸取旧版教训
+
+新版 `05_build_cues.py` 应从零开始，控制在数百行级别，分成四个清晰部分：
+
+1. 读取候选 ID，并从 Source 中联结对应 Atom。
+2. 调用模型生成 `accepted` 或 `no_cue`。
+3. 做确定性验证：
+   - evidence 字段合法；
+   - span 是连续原文；
+   - clause 数量为 1–3；
+   - dimension/operator 合法；
+   - 禁止空值、泛指词和明显未解析代词；
+   - 否定和时间语气没有被反转。
+4. 保存终态并支持恢复。
+
+需要承认一个重要边界：第三层“完整语义是否被 span 支持”不能仅靠字符串验证器完全解决。合理方法是：
+
+- 程序完成第一层和大部分第二层；
+- prompt 严格约束第三层；
+- 对 pilot 和正式结果做分层人工抽查；
+- 争议项直接 `no_cue`，而不是再建复杂的多模型审计流水线。
+
+先用 50–100 个覆盖典型陷阱的 Atom 做 pilot。确认人物角色、否定、地点、状态和时间语气后，再处理 10,000 条。发现问题时直接改 prompt、Schema 和代码，然后重跑受影响部分，不再开版本合同。
+
+## 推荐执行顺序
+
+1. 保护当前成果
+   单独保存未提交工作区、BGE 五文件以及可能只存在于 WSL 的筛选实现。确认能恢复后再动刀。
+
+2. 重写极简规则
+   把 `AGENTS.md` 缩短到协作、安全、中文文档和数据事实边界。取消 T0–T4、CR、冻结、哈希、SUCCESS 和目录预算。
+
+3. 建立最小“保留清单”
+   只列路径和去留，不再写几十页理由。未列入保留清单的内容默认归档或删除。
+
+4. 摘取少量可复用函数
+   从旧 `05` 中复制真正通用的网络、解析和 span 验证逻辑到新文件；不引用旧模块，不保留 fallback。
+
+5. 删除旧代码和治理测试
+   此时旧历史仍可从 Git/归档恢复，因此可以一次性移出主线。
+
+6. 实现并验证新版 Cue
+   先 fixture，再 pilot，最后处理 10,000 条。
+
+7. 暂停 Seed/Life Log 实现
+   只在一个简短 `DESIGN.md` 中保留数据结构、lure 约束、六路 Life Log 和状态机设计。等 Cue 稳定后再写代码。
+
+8. 最后清理可重建大文件
+   再决定是否删除 Source draft、raw segments、缓存和旧 realtime 数据。
+
+## 对现有清理文档的建议
+
+不要继续完善它。将来最多保留一份两三页的临时清单，只包含：
+
+- 当前真实状态；
+- 必须保留；
+- 可以删除；
+- 五个执行批次；
+- 完成定义。
+
+文件级大小、引用数量和 Git 状态应在执行时临时生成，不应永久写进方案，否则每次变化都会诱发新一轮文档维护。
+
+总的结论是：这次不应当叫“重构旧系统”，而应当叫“保留数据资产，重建最小当前主线”。你可以删除绝大多数治理、历史代码和未落地阶段；唯一不能一起删掉的是事实性约束、API 安全和恢复当前有效数据的能力。本轮我只做了只读检查，没有修改任何文件。
+
+> 我认为研究事实约束需保留，而发布追溯、运行恢复、多人审批完全可以删除对吗？看看我的20条注释，要做一个关键区分：
+
+- 研究事实约束：保留。
+- 发布追溯、多人审批、版本冻结、哈希读门：全部删除。
+- 旧式运行恢复体系：全部删除。
+- Cue API 的轻量断点续跑：建议保留，避免网络中断后重复付费；它只是一个本地 checkpoint，不是 ledger、manifest 或治理系统。
+
+你同意保留的科学边界保持不变，包括 Source-grounded、连续 evidence span、人物角色、否定和时间语气、单 Atom 最多一条 Cue、1–3 个 clause、无法确认则 `no_cue`，以及 constructed 只能从 Seed/Life Log 开始。:codex-annotation{index="10"}
+
+API Key、显式 `--execute`、请求上限、超时、有限重试和费用上限也继续保留。不过“支持恢复”应缩减为一个简单 checkpoint；worker、wave、lease、ledger、receipt、SUCCESS 和协议哈希全部取消。:codex-annotation{index="11"}
+
+## 相比上轮的主要调整
+
+### 1. Source 不再重构，只做阶段归档
+
+上轮建议还带有“摘取 Source 通用代码”的倾向。现在调整为：
+
+- `01`–`04` 已经完成任务，不再重写。
+- 原样移动到 `scripts/source/`，保持可运行但不继续开发。
+- Source 测试移动到 `tests/source/`，保留现有少量有效测试。
+- 当前开发精力完全转到 `scripts/cues/`。
+- `scripts/seeds/` 和 `scripts/lifelogs/` 暂时不放实现代码。
+
+测试也按同样的阶段结构组织，而且只做少量关键核验，不再建设覆盖旧治理体系的大型测试套件。:codex-annotation{index="9"} :codex-annotation{index="16"} :codex-annotation{index="17"}
+
+### 2. `05_extract_cues.py` 不再裁剪，改为拆除后重建
+
+旧 [05_extract_cues.py](./egopm_bench_v1/scripts/05_extract_cues.py:1) 不值得继续手术。新版 Cue 代码放入 `scripts/cues/`，控制为两到三个职责清楚的文件：:codex-annotation{index="2"} :codex-annotation{index="20"}
+
+```text
+scripts/cues/
+├─ prepare_inputs.py   # 用 10,000 个 atom_id 联结 Source，生成可审查输入
+├─ generate_cues.py    # API 调用、费用限制、轻量 checkpoint、结果写入
+└─ validate_cues.py    # span、clause、字段、否定和完整性检查
+```
+
+如果实现足够短，可以合并前两个；但不要重新形成一个几千行的总入口。
+
+旧文件中的 V9、八波、Batch、worker、账本、冻结、协议验收和 75 分片代码全部删除。只允许人工摘取少量无历史耦合的通用函数。
+
+### 3. `11_validate_all.py` 基本整文件删除
+
+不保留这个全仓总验证器，也不把它改造成新版验证器。:codex-annotation{index="3"}
+
+新版只在各阶段旁边保留小型验证：
+
+- Source：沿用现有少量测试。
+- Cue：`scripts/cues/validate_cues.py`。
+- Seed/Life Log：未来真正实现时再分别增加。
+
+不再检查：
+
+- SHA256；
+- SUCCESS；
+- manifest；
+- 合同或 Schema 版本相等；
+- 75 个分片；
+- realtime 账本；
+- worker、wave、receipt、lease。
+
+### 4. `06`–`10` 不再立即改写，现有代码全部删除
+
+这里你的注释存在一个先后调整：
+
+- 第一条希望重写 `06`、`07`，保留 trigger/lure 逻辑。:codex-annotation{index="1"}
+- 后续又明确 Seed 和 Life Log 当前保持为空，并且 `06`–`10` 可以全删。:codex-annotation{index="13"}
+
+综合后，最终方案应以后者为准：
+
+- 现在不重写 `06`、`07`。
+- 删除现有 `06`–`10`。
+- 把有价值的逻辑写入简短的 Seed 设计说明：
+  - Cue 作为 trigger；
+  - lure 必须同 split；
+  - 至少一个同 `source_group_id`；
+  - 至少一个跨 `source_group_id`；
+  - 每个 lure 明确指出未满足的 predicate clause。
+- 将来开始 Seed 阶段时，在 `scripts/seeds/` 从零实现，并直接读取新版 `cue_results.jsonl`。
+
+这避免为了尚未启动的阶段继续维护失效代码。
+
+### 5. 旧 V9 和 realtime 可以进入直接清理批次
+
+旧 realtime 的约 37.6 万个文件、旧 V9 的 75 个 Cue 分片，以及相关 manifest、SUCCESS、账本和恢复状态，都不再需要留在活动工作区。:codex-annotation{index="4"}
+
+你也确认了整套旧治理对象均可退出主线，包括 CHANGE_REQUEST、handoff、T0–T4、版本检查、旧 prompt、旧 Schema、旧 fixture、旧测试和全仓统计器。:codex-annotation{index="12"}
+
+现在的处理原则可以更激进：
+
+- Git 中已有的历史由提交记录恢复；
+- ignored 的 realtime 数据既然确定无研究价值，可以直接删除；
+- 不再等待新版 Cue 全量完成后才清理；
+- 不在仓库内建立 `legacy/` 副本。
+
+### 6. WSL 边界已经明确
+
+由于 WSL 端已经完整保留筛选实现，Windows 仓库不再承担 BGE 筛选程序的恢复责任，可以大胆清理现有 `wsl_BGE-M3_filter` 中多余的治理说明。:codex-annotation{index="6"}
+
+但你要求在 Cue 阶段内保留 WSL 返回物，因此更新后的结构包含：:codex-annotation{index="14"}
+
+```text
+cues/wsl_BGE/
+├─ WSL_HANDOFF.md
+├─ requirements-bge-m3.lock
+├─ candidate_atoms.jsonl
+├─ selection_proof.jsonl
+├─ selection_report.json
+├─ selection_manifest.json
+└─ BGE_FILTER_SUCCESS.json
+```
+
+这里的 `selection_manifest.json` 和 `BGE_FILTER_SUCCESS.json` 只是“原始五文件的一部分”，保持原样保存；新版代码不得把它们当作运行门禁。
+
+原始 EgoLife SRT、Source Atom、split、10,000 个候选和 WSL 五文件继续保留。:codex-annotation{index="8"}
+
+### 7. 增加一个真正适合 Cue 使用和人工审查的输入文件
+
+原始 WSL `candidate_atoms.jsonl` 只有 `atom_id`，这一点要在 Cue 指导文档中醒目标明：
+
+> BGE 文件只是 10,000 个候选 ID，不包含 Cue 所需事实文本，禁止直接送入模型；必须先按 `atom_id` 与 `source_video_atoms.jsonl` 联结。
+
+:codex-annotation{index="5"}
+
+由 `prepare_inputs.py` 生成：
+
+```text
+cues/inputs/selected_atoms.jsonl
+```
+
+每行只包含包含：
+
+```json
+{
+  "atom_id": "...",
+  "transcript": "...",
+  "dense_caption": "...",
+  "source_group_id": "...",
+}
+```
+
+
+### 8. Prompt 从单文件改为可扩充的小型集合
+
+`prompts/` 不再强制只有一个文件，也不把全部规则塞进一个超长文档。按职责拆分，但避免一条规则一个文件。:codex-annotation{index="15"}
+
+建议：
+
+```text
+prompts/cues/
+├─ extraction.md       # 核心任务、输出结构、no_cue 原则
+├─ factual_rules.md    # 人物、否定、时间、证据和指代边界
+├─ examples.md         # 少量正反例
+└─ repair.md           # 仅在确实需要局部修复时使用
+```
+
+文件数量可以继续增长，但拆分依据必须是职责，不是机械控制行数。每份应能完整表达一个主题，避免几行的小碎片和几十 KB 的新巨型 prompt。
+
+### 9. Cue 仍采用单一终态结果文件
+
+这一点维持上轮建议：:codex-annotation{index="19"}
+
+```text
+cues/runs/<run_id>/
+├─ cue_results.jsonl
+└─ run.json
+```
+
+`cue_results.jsonl` 覆盖全部 10,000 个 Atom：
+
+```json
+{"atom_id":"...","status":"accepted","cue":{...}}
+{"atom_id":"...","status":"no_cue","reason":"UNRESOLVED_REFERENT"}
+{"atom_id":"...","status":"failed","reason":"API_TIMEOUT"}
+```
+
+不再另外创建 accepted、excluded、coverage、ledger、manifest 和 SUCCESS。下游只需筛选 `status == "accepted"`。
+
+`run.json` 只是方便你查看模型、时间、行数、费用和终态统计，不带哈希，也不作为读取门禁。
+
+
+## 更新后的目标结构
+
+```text
+egopm_bench_v1/
+├─ source/
+│  ├─ source_video_atoms.jsonl
+│  └─ source_split_map.jsonl
+├─ cues/
+│  ├─ wsl_BGE/
+│  │  ├─ WSL_HANDOFF.md
+│  │  ├─ requirements-bge-m3.lock
+│  │  └─ 原始五文件
+│  ├─ inputs/
+│  │  └─ selected_atoms.jsonl
+│  └─ runs/
+│     └─ <run_id>/
+│        ├─ cue_results.jsonl
+│        └─ run.json
+├─ scripts/
+│  ├─ source/
+│  │  └─ 原 `01`–`04`，不重写
+│  ├─ cues/
+│  │  ├─ prepare_inputs.py
+│  │  ├─ generate_cues.py
+│  │  └─ validate_cues.py
+│  ├─ seeds/
+│  └─ lifelogs/
+├─ tests/
+│  ├─ source/
+│  │  └─ 现有少量 Source 测试
+│  ├─ cues/
+│  │  └─ 少量事实边界与结果完整性测试
+│  ├─ seeds/
+│  └─ lifelogs/
+├─ prompts/
+│  └─ cues/
+└─ schemas/
+   └─ cues/
+```
+
+最终调整可以概括为：Source 阶段封存不重写，WSL 结果纳入 Cue 目录，旧 Cue/realtime/治理整体删除，新 Cue 拆成两到三个小模块，Seed 和 Life Log 暂时只留设计、不留代码，测试数量压到最低必要水平。发布追溯和多人审批可以彻底删除；运行恢复只留下防止重复付费的轻量 checkpoint。
