@@ -2,9 +2,11 @@
 
 v1 是面向流式第一视角观察、视频可追溯且文本优先的前瞻记忆基准。正式数据只使用可回查的 Source 文本；synthetic fixture 仅用于测试，v1 不读取或复制原始视频。
 
-当前开发主线是 Cue v2。第 05 步的默认入口只读取 Source 与 `candidate_atoms.jsonl`，其唯一默认配置在 `egopm_bench_v1/config/model_registry.yaml` 的 `cue_v2_extraction` 中，CLI 可显式覆盖。开发态不把 proof、manifest、SUCCESS 或哈希作为读门；真实 API 小样本、checkpoint/finalize 和下游 Seed 联调在相应阶段逐步加入。
+## 当前进度
 
-本次路径切换和后续清理顺序见[代码整理与去治理优化执行方案](代码整理与去治理优化执行方案.md)。WSL 本地 BGE-M3 部署与传输说明见 [WSL BGE-M3 执行包](wsl_BGE-M3_filter/README.md)。
+- **已完成**：原始 SRT 清点与解析；Source Atom 建库（`source_video_atoms.jsonl`，370,799 行）与 split；WSL 用 BGE-M3 从 Source 中筛出 10,000 个候选 Atom（`cues/wsl_BGE/`）。
+- **下一步**：新版 Cue 生产器，放在 `scripts/cues/`，**尚未实现**。
+- **尚未开始**：Seed 与 Life Log，目前只有设计，见 `egopm_bench_v1/DESIGN.md`。
 
 ## Python 虚拟环境
 
@@ -22,34 +24,64 @@ Git Bash：
 source .venv/Scripts/activate
 ```
 
-## 正式产物布局
+## 目录结构
 
-- Cue v2 仅表达单个 Source Atom 可直接支持的观察。每个 predicate 为 1–3 个 `all_of` clause；每个 clause 必须保留连续 evidence span、直接支持的 value，以及能说明状态承载者、持有者或指向对象的 `anchor`。
-- 当前日常输入是 BGE selection `bge_m3_source_select_v3_1_20260914_02` 中的 `candidate_atoms.jsonl`。proof、report 等只保留为可选 provenance；`sample_index` 在各 `sample_stratum` 内编号不是错误。
-- `event_timestamp` 只定位或排序 Source 事件，不能直接变成未来提醒条件。constructed 内容仅从 Seed/Life Log 阶段出现并显式标记。
-- Seed 的 trigger 与 lures 必须同 split，至少包含一个同 `source_group_id` 和一个跨 `source_group_id` 的 lure；每个 lure 都要记录未满足的 predicate clause。Life Log 的 paired 分支只改变一条 constructed 生命周期控制事件，gold 由确定性状态机生成。
-- 旧 V9 realtime、75 分片、旧 manifest 与账本只作为隔离历史，当前 05/06/07 默认路径不会读取它们；在新 Cue 与 Seed 接口稳定并取得用户确认前，不归档也不删除。
-
-项目目录
-
+```text
 D:\scientific\EgoPM\
-├─ Egolife\raw\                 原始 EgoLife SRT，只读，不修改
+├─ raw\EgoLifeCap\              原始 EgoLife SRT（Transcript 402 + DenseCaption 406），只读，不进 Git
 ├─ egopm_bench_v1\
-│  ├─ config\                   全项目统一规则
-│  ├─ schemas\                  每类 JSON 必须有哪些字段
-│  ├─ prompts\                  千问的固定提示词
-│  ├─ scripts\                  12 个按顺序运行的脚本
-│  ├─ source\                   SRT 解析后的真实视频原子
-│  ├─ cues\                     从原子中抽取的触发线索
-│  ├─ seeds\                    900–1,400 个候选提醒任务、审计结果、480 个冻结任务
-│  ├─ rules\                    状态机与提醒规则
-│  ├─ lifelogs\                 生成的虚拟生活记录
-│  ├─ benchmark\                最终模型评测输入、gold、证据集
-│  ├─ audit\                    验证错误、人工审核、统计报告
-│  ├─ logs\model_runs\          千问调用日志，不放 API Key
-│  ├─ tests\                    自动测试
-│  └─ coordination\             多对话交接、状态板、变更申请
-├─ AGENTS.md                    所有对话都要遵守的协作规则
-├─ wsl_BGE-M3_filter\           可复制到 WSL 的 BGE-M3 部署、运行与传输说明
-├─ pyproject.toml               Python 依赖与测试命令
-└─ .gitignore                   不把密钥、大模型日志和大原始数据提交进 Git
+│  ├─ config\
+│  │  ├─ source.yaml            Source 阶段（01–04）的配置，此后不再修改
+│  │  ├─ cue.yaml               新版 Cue 阶段的配置
+│  │  └─ split_policy.yaml      split 规则，01–04 依赖
+│  ├─ schemas\
+│  │  ├─ source_video_atom.schema.json
+│  │  ├─ source_video_atom_draft.schema.json
+│  │  └─ cues\                  Cue Schema（待写）
+│  ├─ prompts\cues\             Cue 提示词（待写）
+│  ├─ scripts\
+│  │  ├─ source\                01–04，Source 建库，已完成并封存
+│  │  └─ cues\                  新版 Cue（尚未实现）
+│  ├─ source\                   Source Atom 与 split，大文件不进 Git
+│  ├─ cues\
+│  │  ├─ wsl_BGE\               WSL BGE 筛选的原始五文件 + 交接说明 + 依赖锁，进 Git
+│  │  ├─ inputs\                selected_atoms.jsonl，由程序生成，不进 Git
+│  │  └─ runs\                  Cue 结果与 checkpoint，不进 Git
+│  ├─ tests\
+│  │  ├─ source\                Source 流水线测试
+│  │  └─ cues\                  Cue 测试（待写）
+│  ├─ FACT_RULES.md             十条事实边界，事实正确性的唯一权威
+│  └─ DESIGN.md                 Seed / Life Log / 状态机设计
+├─ AGENTS.md                    协作规则：协作方式、安全与费用、中文文档、数据事实边界
+├─ pyproject.toml               Python 依赖与测试配置
+├─ .gitignore / .gitattributes   忽略规则与行尾规范（统一 LF）
+└─ 论文选题.md                   研究定义
+```
+
+## 运行 Source 流水线
+
+`01`–`04` 已完成建库，正常情况下不需要重跑；重跑会覆盖 `source/` 下的产物。
+
+```bash
+cd /d/scientific/EgoPM
+python egopm_bench_v1/scripts/source/01_inventory_srt.py      # 清点 SRT，写 srt_inventory.csv
+python egopm_bench_v1/scripts/source/02_parse_srt.py          # 解析字幕块，写 raw_srt_segments.jsonl
+python egopm_bench_v1/scripts/source/03_align_modal_text.py   # 时间对齐，写草稿原子
+python egopm_bench_v1/scripts/source/04_make_source_splits.py # 验证草稿，写正式 Atom 与 split
+```
+
+四个脚本默认读取 `egopm_bench_v1/config/source.yaml`，可用 `--config` 显式覆盖。
+
+测试：
+
+```bash
+python -m pytest -q
+```
+
+## 不进 Git 的文件
+
+原始语料与媒体、Source 大文件（`source_video_atoms.jsonl`、`source_split_map.jsonl`、草稿原子、raw segments）、`cues/inputs/`、`cues/runs/`、模型原始响应，都只保留在本机。具体规则见 `.gitignore`。
+
+## Cue 的事实边界
+
+写 Cue 相关的 prompt、Schema 或代码之前，先读 `egopm_bench_v1/FACT_RULES.md`。那十条是全流程事实正确性的唯一权威，任何一处改动的理由都必须能落在其中某一条上。
