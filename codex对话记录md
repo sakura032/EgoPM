@@ -1,13 +1,12 @@
 # EgoPM 代码清理执行指导（重建最小主线版）
 
-> 定稿日期：2026-09-16
-> 本文档取代原 `codex对话记录md`（原始问答记录）。原始版本可通过 Git 历史恢复：
-> `git show HEAD:codex对话记录md`（该文件在提交 `a6712a2 codex9.16 简化清理版` 中已被跟踪）。
-> 也取代 `代码整理与去治理优化执行方案.md`（84 KB，不再增量维护，见批次 3）。
+> 定稿 2026-09-16（第二版）。本版按执行评审修正了五处会真实卡住执行的问题：Git 状态过时、`AGENTS.md` 精简次序太晚、`paths.yaml` 不能直接精简、状态机与删除计划冲突、`.gitignore` 缺新路径；并补全了 Cue Schema、checkpoint 格式与运行状态语义。
+> 本文档取代原 `codex对话记录md`（原始问答记录），可用 `git show a6712a2:codex对话记录md` 取回原文。
+> 也取代 `代码整理与去治理优化执行方案.md`（84 KB，本版按批次 4 直接删除，由 Git 历史恢复）。
 
 ---
 
-## 0. 使用说明与硬性前提
+## 0. 怎么用这份文档
 
 这份文档是**执行手册**，不是讨论稿。往下读到底、照着批次做，不要再派生新的阶段、门禁、合同或验收体系。
 
@@ -26,17 +25,52 @@
 
 本项目的定位：**只为论文 benchmark 做数据处理前置工作**。当前已完成到「WSL 用 BGE 从 370,799 个 Source Atom 中筛出 10,000 个候选」，下一步是用这些候选构造 Cue。Seed 与 Life Log 尚未开始。
 
+### 0.1 每个批次的工作流
+
+固定照这个循环走，不要跳步：
+
+```text
+执行一个批次
+→ 检查结果（跑该批次的验收命令）
+→ 确认没有误删（git status 逐行看）
+→ 提交本批次（一个批次一个提交）
+→ 检查 git status 与 git log
+```
+
+每个批次都单独提交，这样回滚粒度就是批次，不必依赖 `reset --hard`。
+
+### 0.2 危险命令警告
+
+| 命令 | 风险 | 替代做法 |
+| --- | --- | --- |
+| `git reset --hard <ref>` | 直接丢弃当前所有未提交的已跟踪文件修改 | 回滚某个批次用 `git revert <批次提交>`；只撤某几个文件用 `git checkout <ref> -- <路径>` |
+| `git clean -fd` | 删除**未跟踪**的文件和目录，包括刚写好的新代码、候选数据、临时结果 | 不使用。需要清理时逐条 `rm` 明确路径 |
+| `git checkout .` | 丢弃全部未提交修改（含行尾规范化后的状态） | 指定路径：`git checkout -- <路径>` |
+
+**本方案在任何批次里都不使用 `git clean`，也不把 `reset --hard` 当作首选回滚手段。**
+
+### 0.3 关于行尾（先读，能省掉很多困惑）
+
+仓库当前没有 `.gitattributes`，`core.autocrlf` 未设置，磁盘上是 CRLF、已提交的是 LF。
+结果是 `git status` 常年显示 20 多个「已修改」文件，但 `git diff --stat` 的增删行数完全相等——那是**纯行尾差异，零内容变更**。实测见 1.3 节。
+
+这带来两条直接后果：
+
+1. 不要把 CRLF 噪音误当成「有大量未提交工作」而不敢动刀，也不要为了清掉它去跑 `reset --hard` 或 `clean`。
+2. 批次 5 会补 `.gitattributes` 彻底消除这个噪音（可选，但推荐，否则后面每次 `git status` 都要重新判断一次）。
+
 ---
 
-## 1. 当前真实状态（2026-09-16 实测）
+## 1. 当前真实状态
 
 ### 1.1 已经有效的成果
 
-- 原始 EgoLife SRT：`raw/EgoLifeCap/`（Transcript 402 + DenseCaption 406，只读）。
+- 原始 EgoLife SRT：`raw/EgoLifeCap/`（Transcript 402 + DenseCaption 406，只读；`raw/` 整个被忽略）。
 - Source 建库完成：`egopm_bench_v1/source/source_video_atoms.jsonl` 共 370,799 行。
 - split 完成：`egopm_bench_v1/source/source_split_map.jsonl`。
 - BGE 筛选完成：`egopm_bench_v1/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/` 下五个文件，候选 10,000 行，proof 59,465 行。
 - Source 阶段脚本 `01`–`04` 已跑通并可复跑。
+- 清理指导文档本身已提交为 `50c05a0 docs: 重建最小主线清理指导`。
 
 ### 1.2 复杂度与体积（实测）
 
@@ -46,24 +80,37 @@
 | `scripts/11_validate_all.py` | 162 KB（约 2,600 行），主要验证旧 SUCCESS、哈希、75 分片和 realtime 体系 |
 | `scripts/06` / `07` | 25 KB / 32 KB，仍围绕旧 Cue manifest、SUCCESS 和 75 分片设计，无法消费新版 Cue |
 | `scripts/08`–`10` / `12` | 11–21 KB，属尚未落地或已废弃的阶段 |
-| `cues/realtime/` | 约 37.6 万个文件、约 0.98 GiB（量级取自对话记录，本次遍历超时未能实测，以批次 1.5 的实测结果为准）。**被 .gitignore 排除，删除后不可从 Git 恢复** |
-| `cues/formal/` | 75 个 `task_*.jsonl`，旧 V9 Cue 分片（Git 中已跟踪，可恢复） |
+| `cues/realtime/` | 约 37.6 万个文件、约 0.98 GiB（量级取自对话记录，本次遍历超时**未实测**，以批次 1 的实测结果为准）。**被 .gitignore 排除，删除后不可从 Git 恢复** |
+| `cues/formal/` | 75 个 `task_*.jsonl`，旧 V9 Cue 分片（Git 已跟踪，可恢复） |
 | `source/source_video_atoms.jsonl` | 501 MB |
 | `source/source_split_map.jsonl` | 101 MB |
 | `source/raw_srt_segments.jsonl` | 350 MB（可重建缓存） |
 | `source/source_video_atoms_draft.jsonl` | 509 MB（可重建缓存） |
-| 未提交改动 | 25 个文件（含 `AGENTS.md`、`codex对话记录md`、`scripts/07`–`12`、多个测试） |
 
-### 1.3 当前实际阻断点（进入 Cue 生产前必须消掉）
+### 1.3 Git 状态（实测 2026-09-16，执行时以重新实测为准）
 
-1. `AGENTS.md` 仍是完整合同（T0–T4 所有权、SUCCESS 哈希门、工件与目录节制硬门禁），并把 Cue v2 正式布局写成 `cues/v2/formal/` + 正式分片 + 阶段 SUCCESS，与本方案的单 run + 轻量 checkpoint 直接冲突。
-2. `config/model_registry.yaml` 的 `cue_v2_extraction.runs_root` 指向不存在的 `../cues/v2/runs`，并带 `run_manifest_required_fields`；`config/paths.yaml` 仍带 `success_markers` 与 `atomic_write.success_marker_required_fields`。
-3. 两份旧 Cue v2 Schema 未对齐三种终态：inference 的 `non_accepted.disposition` 含 `unsupported`，artifacts 的 `base.status` 含 `needs_review` / `deferred_unsupported`；且 `tests/test_cue_v2_current.py` 用断言锁死了这些旧值。
-4. `05_extract_cues.py` 仍含整套 900/120 验收计划（`build_protocol_acceptance_plan`、`preflight_bge_selection_snapshot`、`partition_cue_v2_candidates`、`_cue_v2_calibration_records`），只被 `tests/test_qwen_contracts.py` 引用。
-5. `05` 的 CLI 缺 `--max-requests` / `--max-cost-cny` / `--timeout-seconds` / `--batch-size` / `--resume` / `--finalize` / `--retry-failed`。
-6. `06` / `07` / `11` 默认仍消费 `cue_library_manifest` 与 `cue_candidate.schema.json`。
+**不要照抄数字，批次 1 会重新生成一遍。** 但要把下面四条差异记住，它们和老方案写的完全不同：
 
-**结论：这套代码应当拆除重建，而不是继续修补。**
+1. **24 个「已修改」文件没有任何真实内容变更。**
+   `git diff --stat` 显示 `24 files changed, 5761 insertions(+), 5761 deletions(-)`，增删完全相等；`git diff --stat --ignore-cr-at-eol` 输出为**空**。即 24 个文件全是 CRLF 行尾差异。
+   → 所以批次 1 **不需要**「提交 24/25 个改动」，那份工作不存在。
+2. **`main` 领先 `origin/main` 3 个提交**（不是 2 个）：`50c05a0`、`a6712a2`、`3da764c`。远端为 `https://github.com/sakura032/EgoPM.git`。
+3. **`cleanup-pre-20260916-01` tag 不存在**，必须新建。
+4. **残留 5 个 `codex/*` 分支与 4 个活动 worktree**（`codex/t0`、`codex/t1`、`codex/t2`、`codex/t3-wave1-compiler`、`codex/t4`；其中 4 个被 worktree 实际占用，指向 `C:/Users/20474/.codex/worktrees/*/EgoPM`，另有 1 个 locked worktree）。
+   这是旧 T0–T4 治理的实物残留，但**不在本次代码清理范围内**：这些分支均未合并进 `main` 且仍被 worktree 占用，清理它们是独立任务。**本方案不执行 `git worktree prune`、`git worktree remove` 或任何分支删除。**
+
+### 1.4 当前实际阻断点（进入 Cue 生产前必须消掉）
+
+1. `AGENTS.md` 仍是完整合同（T0–T4 所有权、SUCCESS 哈希门、工件与目录节制硬门禁），并把 Cue v2 正式布局写成 `cues/v2/formal/` + 正式分片 + 阶段 SUCCESS，与本方案的单 run + 轻量 checkpoint 直接冲突。**它同时还在约束清理动作本身**——这是它必须最先被精简的原因。
+2. `config/model_registry.yaml` 的 `cue_v2_extraction.runs_root` 指向不存在的 `../cues/v2/runs`，并带 `run_manifest_required_fields`。
+3. `config/paths.yaml` 带 `contract_version`、`config_version`、`success_markers`、`atomic_write`——**但其中大部分仍被封存的 Source 脚本真实读取**，不能直接删（见 3.3 与批次 5）。
+4. 两份旧 Cue v2 Schema 未对齐三种终态，且 `tests/test_cue_v2_current.py` 用断言锁死了 `unsupported` / `deferred_unsupported`。
+5. `05_extract_cues.py` 仍含整套 900/120 验收计划，只被 `tests/test_qwen_contracts.py` 引用。
+6. `tests/test_state_machine.py` 会在导入时加载 `08`/`09`/`10` 三个脚本，并读取 `lifelog.schema.json` 与 `decision_instance.schema.json`——**删除这些文件后它会在测试收集阶段直接失败**（见 3.4）。
+
+### 1.5 结论
+
+这套代码应当**拆除重建**，而不是继续修补。
 
 ---
 
@@ -73,9 +120,9 @@
 
 | 类别 | 处置 | 说明 |
 | --- | --- | --- |
-| 研究事实约束 | **保留** | Source 回查、连续 evidence span、人物角色、否定与时间语气、单 Atom 最多一条 Cue、1–3 个 clause、无法确认则 `no_cue`、constructed 只能从 Seed/Life Log 开始 |
+| 研究事实约束 | **保留** | Source 回查、连续 evidence span、人物角色、否定与时间语气、单 Atom 最多一条 Cue、1–3 个 clause、无法确认则 `no_cue` |
 | API 安全与费用上限 | **保留** | Key 只读环境变量、显式 `--execute`、请求上限、超时、有限重试、费用上限 |
-| Cue 断点续跑 | **保留（缩为最薄一层）** | 只是一个本地 checkpoint，防止网络中断后重复付费；**不是** ledger / manifest / 治理体系 |
+| Cue 断点续跑 | **保留（缩为最薄一层）** | 一个本地 `checkpoint.sqlite`，防网络中断后重复付费；**不是** ledger / manifest / 治理体系 |
 | 发布追溯 | **删除** | manifest、SUCCESS、上游哈希读门、版本相等检查 |
 | 多人审批 | **删除** | T0–T4 所有权、CHANGE_REQUEST、handoff、状态板、角色分工 |
 | 版本冻结 | **删除** | 合同版本、Schema 版本相等、冻结流程、授权文件 |
@@ -83,10 +130,10 @@
 
 ### 2.1 四类必须保留
 
-1. **不可替代的数据**：原始 EgoLife SRT、`source_video_atoms.jsonl`、`source_split_map.jsonl`、10,000 条 `candidate_atoms.jsonl`（及 BGE 五文件整体备份）、`srt_inventory.csv`。
+1. **不可替代的数据**：原始 EgoLife SRT、`source_video_atoms.jsonl`、`source_split_map.jsonl`、10,000 条 `candidate_atoms.jsonl`（及 BGE 五文件）、`srt_inventory.csv`。
 2. **已验证有效的生产代码**：`01`–`04`，以及与 Source 解析、时间对齐、split 有关的有效测试。
-3. **科学设计**：Cue 事实边界（见第 5 节全文）、最终 gold 由确定性状态机产生。
-4. **运行安全**：上面表格中的「API 安全」与「最薄 checkpoint」。
+3. **科学设计**：Cue 事实边界（第 5 节全文）、确定性 gold 状态机设计（只保留设计，不保留代码，见 3.4）。
+4. **运行安全**：上表中的「API 安全」与「最薄 checkpoint」。
 
 ### 2.2 可以彻底退出主线
 
@@ -96,29 +143,42 @@
 - 旧 V9 Cue 分片、manifest、SUCCESS（`cues/formal/`、`cues/cue_library_manifest.json`、`cues/CUE_LIBRARY_SUCCESS.json`）。
 - realtime 的八波、package、账本、receipt、进度、租约、授权文件与恢复状态。
 - 旧 Cue prompt、旧 compact Schema、旧 fixture。
-- `tests/test_contract_freeze.py` 及旧 realtime / manifest 测试。
-- 尚未投入真实生产的 Seed / Life Log 脚本（`06`–`10`）。状态机思想留下，生产外壳不留。
+- 尚未投入真实生产的 Seed / Seed 审计 / Life Log / Oracle 脚本（`06`–`10`）与其状态机实现。
 - 旧全仓验证器与统计器（`11`、`12`）。
-- `wsl_BGE-M3_filter/` 中重复的治理说明（WSL 端已完整保留筛选实现，Windows 仓库不再承担恢复责任）。
+- `wsl_BGE-M3_filter/` 中重复的治理说明（WSL 端已完整保留筛选实现）。
 
-历史恢复依靠 Git tag 与仓库外压缩包，**不要在活动仓库里再建庞大的 `legacy/`**。
+> **明确不在范围内**：`codex/*` 分支与 `C:/Users/20474/.codex/worktrees/*/EgoPM` 下的 worktree。它们未合并进 `main` 且仍被实际占用，清理属于独立任务，本方案一律不碰。
+
+历史恢复依靠 Git 与仓库外备份，**不要在活动仓库里再建 `legacy/` 或 `_archive/`**。
+
+### 2.3 一条重要的限定：不要为了「grep 干净」破坏封存的 Source
+
+`01`–`04` 是**封存但可复跑**的阶段。它们仍然会写 `SOURCE_ATOMS_SUCCESS.json` 和 SHA256，Source 测试也仍然验证这些。这**可以接受**：那是已完成阶段的内部实现，不是全仓读门。
+
+新版 Cue 完全不读它们。所以：
+
+- 保留 Source 侧的哈希与 SUCCESS 写入；
+- 保留 `source.yaml` 中 Source 真正需要的旧字段；
+- 只在**新代码、新配置、README、AGENTS** 层面要求「不再出现治理词汇」。
+
+第 8 节完成定义已按此限定改写。
 
 ---
 
-## 3. 目标结构（一步到位）
+## 3. 目标结构
 
 ### 3.1 目标目录树
 
 ```text
 egopm_bench_v1/
-├─ source/                          # 数据资产，原路径不动（体积大、被 .gitignore 排除）
+├─ source/                          # 数据资产，原路径不动
 │  ├─ source_video_atoms.jsonl      # 370,799 行
 │  ├─ source_split_map.jsonl
 │  ├─ srt_inventory.csv
 │  ├─ atom_build_report.json
-│  ├─ SOURCE_ATOMS_SUCCESS.json     # 仅 Source 阶段自检，不再作为下游读门
-│  ├─ raw_srt_segments.jsonl        # 可重建缓存（批次 6 再处理）
-│  └─ source_video_atoms_draft.jsonl# 可重建缓存（批次 6 再处理）
+│  ├─ SOURCE_ATOMS_SUCCESS.json     # Source 阶段自检，保留但不再作为下游读门
+│  ├─ raw_srt_segments.jsonl        # 可重建缓存（批次 8 再处理）
+│  └─ source_video_atoms_draft.jsonl# 可重建缓存（批次 8 再处理）
 ├─ cues/
 │  ├─ wsl_BGE/                      # WSL 返回物，原样保存；代码不得当作运行门禁
 │  │  ├─ candidate_atoms.jsonl      # 10,000 行，只有 atom_id
@@ -128,13 +188,14 @@ egopm_bench_v1/
 │  │  ├─ BGE_FILTER_SUCCESS.json
 │  │  ├─ WSL_HANDOFF.md
 │  │  └─ requirements-bge-m3.lock
-│  ├─ inputs/                       # 由 prepare_inputs.py 生成
+│  ├─ inputs/                       # 由 prepare_inputs.py 生成（不进 Git）
 │  │  └─ selected_atoms.jsonl
-│  └─ runs/<run_id>/
+│  └─ runs/<run_id>/                # 不进 Git
 │     ├─ cue_results.jsonl
+│     ├─ checkpoint.sqlite
 │     └─ run.json
 ├─ scripts/
-│  ├─ source/                       # 原 01–04，原样封存，不再开发
+│  ├─ source/                       # 原 01–04，封存，只允许改 --config 默认路径
 │  │  ├─ 01_inventory_srt.py
 │  │  ├─ 02_parse_srt.py
 │  │  ├─ 03_align_modal_text.py
@@ -143,11 +204,9 @@ egopm_bench_v1/
 │     ├─ prepare_inputs.py
 │     ├─ generate_cues.py
 │     └─ validate_cues.py
-├─ rules/
-│  └─ state_machine.py              # 保留：确定性 gold 状态机（见 3.3）
 ├─ config/
-│  ├─ model_registry.yaml           # 精简：只留模型 ID 与基础参数
-│  ├─ paths.yaml                    # 精简：只留 01–04 所需路径
+│  ├─ source.yaml                   # 由 paths.yaml 精简而来，保留 01–04 所需字段
+│  ├─ cue.yaml                      # 新 Cue 的模型、端点、批量与费用参数
 │  └─ split_policy.yaml             # 01–04 依赖，保留
 ├─ prompts/
 │  └─ cues/
@@ -156,20 +215,20 @@ egopm_bench_v1/
 │     ├─ examples.md
 │     └─ repair.md                  # 仅在确实需要局部修复时使用
 ├─ schemas/
-│  ├─ source_video_atom.schema.json        # 03/04 依赖，必须保留
+│  ├─ source_video_atom.schema.json        # 03/04/测试依赖，必须保留
 │  ├─ source_video_atom_draft.schema.json  # 03/04/测试依赖，必须保留
 │  └─ cues/
 │     └─ cue.schema.json
+├─ DESIGN.md                        # Seed / Life Log 设计与状态机设计（只写设计）
 └─ tests/
    ├─ source/
    │  └─ test_source_pipeline.py    # 搬移后修正路径
-   ├─ cues/
-   │  ├─ test_cue_facts.py
-   │  └─ test_cue_results.py
-   └─ test_state_machine.py         # 保留原样，不搬移
+   └─ cues/
+      ├─ test_cue_facts.py
+      └─ test_cue_results.py
 ```
 
-**明确不预建**：`scripts/seeds/`、`scripts/lifelogs/`、`tests/seeds/`、`tests/lifelogs/`、`benchmark/`、`logs/`。这些阶段真正开始时再加，不为「预留扩展」提前建目录。
+**明确不预建**：`scripts/seeds/`、`scripts/lifelogs/`、`tests/seeds/`、`tests/lifelogs/`、`benchmark/`、`logs/`、`rules/`。这些阶段真正开始时再加。
 
 ### 3.2 路径映射表（旧 → 新）
 
@@ -183,65 +242,137 @@ egopm_bench_v1/
 | `egopm_bench_v1/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/*` | `egopm_bench_v1/cues/wsl_BGE/*` | `git mv`（五个文件） |
 | `WSL_HANDOFF.md`（仓库根） | `egopm_bench_v1/cues/wsl_BGE/WSL_HANDOFF.md` | `git mv` |
 | `requirements-bge-m3.lock`（仓库根） | `egopm_bench_v1/cues/wsl_BGE/requirements-bge-m3.lock` | `git mv` |
+| `egopm_bench_v1/config/paths.yaml` | `egopm_bench_v1/config/source.yaml` | `git mv` + 精简 |
 | `egopm_bench_v1/source/*` | 不变 | 保持原路径 |
 
 > 注：仓库根的 `WSL_HANDOFF.md` / `requirements-bge-m3.lock` 与 `wsl_BGE-M3_filter/src/` 下的同名文件内容一致（均 5141 / 1669 字节），取任一份即可。
 
-### 3.3 `rules/` 的处置
+### 3.3 配置拆分：`source.yaml` 与 `cue.yaml`
 
-- `rules/state_machine.py`（8.9 KB）**保留**：确定性单意图状态机，实现「最终 gold 由确定性状态机产生」这条科学要求，不依赖任何旧治理。
-- `rules/compiler_io.py`（10.5 KB）**删除**：其文档注释明确写着「受门禁 I/O 工具……验证哈希和 Schema……写入最终标记」，是 SUCCESS/哈希/Schema 门禁的实现本体。
-- `rules/__init__.py` **改写**：去掉「阶段 08–10 共享」的表述，只说明本包提供确定性规则实现。
-- `tests/test_state_machine.py` 保留原样，不搬移、不改。
+**不能**按上一版那样直接精简 `paths.yaml`。实测 `01`–`04` 真实读取的键如下，删掉任何一个都会让「Source 封存但可复跑」立刻失效：
+
+| 脚本 | 实际读取的键 |
+| --- | --- |
+| `01_inventory_srt.py` | `transcript_root`、`dense_caption_root`、`raw_root`、`artifacts` |
+| `02_parse_srt.py` | `raw_root`、`artifacts` |
+| `03_align_modal_text.py` | `contract_version`、`config_version`、`schema_dir`、`source_build`、`artifacts` |
+| `04_make_source_splits.py` | `contract_version`、`config_version`、`schema_dir`、`success_markers`、`artifacts` |
+| `04`（额外） | 同目录下的 `split_policy.yaml` |
+
+其中 `artifacts` 只用到这六个子键：`source_inventory`、`raw_srt_segments`、`source_atoms_draft`、`source_atoms`、`source_split_map`、`source_report`。
+`success_markers` 只用到 `source_atoms`。
+`atomic_write` **没有任何 Source 脚本或 Source 测试读取**，可以删。
+`path_anchor` / `project_root` / `benchmark_root` 也不被 `01`–`04` 读取（它们按 `config` 文件所在目录解析相对路径）。
+
+因此拆成两个文件：
+
+```text
+config/
+├─ source.yaml    # 保留 01–04 当前所需的旧字段，此后不再修改
+└─ cue.yaml       # 新 Cue 的模型、端点、批量和费用参数
+```
+
+`source.yaml` 保留：`contract_version`、`config_version`、`raw_root`、`transcript_root`、`dense_caption_root`、`schema_dir`、`source_build`、`success_markers.source_atoms`、`artifacts` 的上述六个 source_* 条目。
+`source.yaml` 删除：`cues_dir`/`seeds_dir`/`rules_dir`/`lifelogs_dir`/`benchmark_dir`/`audit_dir`/`logs_dir`/`coordination_dir`、`artifacts` 中的 cue/seed/lifelog/benchmark/audit 条目、`success_markers` 其余六条、`atomic_write`。
+
+`cue.yaml` 承接原 `model_registry.yaml` 中真正有用的部分（模型 ID、接口基址、基础采样参数），并新增批量与费用参数。`model_registry.yaml` 与 `benchmark_protocol.yaml` 在本轮删除。
+
+**做法上不要一次删到位**：先复制成 `source.yaml`，再按上面清单删，**每删一段就跑一次 `python -m pytest egopm_bench_v1/tests/source -q`**，一旦报错就把刚删的键加回来。以测试结果为准，不要以本表的字面为准。
+
+### 3.4 状态机处置：`rules/` 整体删除
+
+上一版建议保留 `rules/state_machine.py`，这是错的。实测 `tests/test_state_machine.py` 在第 37–39 行通过 `importlib` 加载 `08_freeze_seed_audit.py`、`09_build_lifelog_families.py`、`10_run_oracle.py`，并在第 168、175 行读取 `schemas/lifelog.schema.json` 与 `schemas/decision_instance.schema.json`。
+
+所以批次 4 删掉 `08`–`10` 和那两个 Schema 之后，这个测试会在**收集阶段直接失败**——「保留测试原样」与「预期 11 条通过」不可能同时成立。
+
+最终处置：
+
+- **删除** `rules/state_machine.py`、`rules/compiler_io.py`、`rules/__init__.py`（整个 `rules/` 目录）。
+- **删除** `tests/test_state_machine.py`。
+- 把状态转移设计写进 `DESIGN.md`：状态集合、生命周期转移、remind / silent 判定规则、有效窗口。将来进入 Seed / Life Log 阶段时，按**最终定的 Seed Schema 与 Life Log 事件结构**重写状态机，并另写两三条直接测试状态机的小测试。
+
+理由：当前状态机仍绑定旧 Seed 字段、旧 Life Log 事件角色和旧 `10_run_oracle.py`，不是一个真正独立的通用资产。删掉它与「Seed / Life Log 当前完全不实现」才自洽。
+
+> 如果你以后改主意要保留 `state_machine.py`，那就必须同时删掉旧测试、另写两三条只测状态机的小测试——**不能「保留测试原样」**。
 
 ---
 
 ## 4. 执行批次
 
-所有命令在仓库根目录 `D:\scientific\EgoPM` 下执行（Git Bash 或 WSL 均可）。
+所有命令在 **Windows 侧的 Git Bash** 中执行，工作目录为仓库根 `D:\scientific\EgoPM`。
+本项目在 Windows 侧执行，**不要用 WSL、cmd 或 PowerShell 跑这些命令**：命令里的 `/d/scientific/EgoPM`、`{source,bge}` 花括号展开、`python - <<'PY'`  heredoc 都是 Git Bash 写法，在别的 shell 里会直接报错或行为不同。
+
 `R=egopm_bench_v1` 为下文简写。
 
-> 执行节奏：**一个批次做完、通过验收、再进下一批**。不要跳批，不要在批次之间顺手改别的东西。
-> 批次之间发生的新问题，直接改代码或改本文档的「附录 C 临时清单」，不要再开新的阶段或合同。
+**批次顺序说明**：`AGENTS.md` 精简排在批次 2，即**在搬迁和删除之前**。原因是当前 `AGENTS.md` 仍明确禁止随意删除治理、Schema、配置和正式工件；不先把它降级，批次 3、4 的每一步都会同时受新旧两套规则约束。
 
 ---
 
-### 批次 1：保护当前成果（唯一不可跳过的一步）
+### 批次 1：保护成果、建立清理分支
 
-**目标**：任何删除动作之前，先保证现在能恢复。
+**目标**：拿到恢复点，并把后续工作隔离到一个分支上。本批次**不做任何删除**。
 
 ```bash
 cd /d/scientific/EgoPM
 R=egopm_bench_v1
 
-# 1.1 记录现状（留档，不进仓库）
+# 1.1 重新实测状态（不要照抄文档数字）
 git status --short
 git log --oneline -5
+git rev-list --count origin/main..main
+git tag
 
-# 1.2 把 25 个未提交改动落成一个提交，避免后面搬迁时丢失
-git add -A
-git commit -m "cleanup: 清理前工作区快照"
+# 1.2 确认「24 个已修改文件」确实没有内容变更
+git diff --stat | tail -3
+git diff --stat --ignore-cr-at-eol     # 期望：输出为空
+```
 
-# 1.3 打恢复点 tag
+**1.3 判断分支**：如果 1.2 的第二条命令输出为空，说明那批「修改」全是行尾差异，**直接忽略，不要提交、不要 reset**。如果它有输出，说明存在真实内容变更，先逐个看过再决定是否提交：
+
+```bash
+git diff --ignore-cr-at-eol            # 逐个确认真实改动
+```
+
+**1.4 提交本手册、创建并推送恢复点**：
+
+```bash
+# 1.4a 本手册自身若还有未提交修改，先提交
+git status --short codex对话记录md
+git add codex对话记录md
+git commit -m "docs: 清理执行指导第二版（按执行评审修正）"
+
+# 1.4b 建立恢复点并推送
 git tag cleanup-pre-20260916-01
+git push origin main                       # 推送全部本地提交（数量以 1.1 实测为准）
+git push origin cleanup-pre-20260916-01    # 推送恢复 tag
+git switch -c cleanup/minimal-mainline     # 后续所有批次都在此分支
+```
 
-# 1.4 仓库外备份（不可从 Git 恢复的部分）
-mkdir -p ../_egopm_backup_20260916/{source,bge,realtime_manifest}
-cp $R/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/*.jsonl ../_egopm_backup_20260916/bge/
-cp $R/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/*.json     ../_egopm_backup_20260916/bge/
-cp $R/source/source_video_atoms.jsonl        ../_egopm_backup_20260916/source/
-cp $R/source/source_split_map.jsonl          ../_egopm_backup_20260916/source/
-cp $R/source/raw_srt_segments.jsonl          ../_egopm_backup_20260916/source/
-cp $R/source/source_video_atoms_draft.jsonl  ../_egopm_backup_20260916/source/
-cp $R/source/srt_inventory.csv               ../_egopm_backup_20260916/source/
+**1.5 记录 realtime 体量**（它不进 Git，删了就没了，所以要留一份记录）：
 
-# 1.5 删除 realtime 之前先记录体积与文件数（它不进 Git，删了就没有了）
+```bash
+mkdir -p ../_egopm_backup_20260916/realtime_manifest
 du -sh $R/cues/realtime > ../_egopm_backup_20260916/realtime_manifest/size.txt
 find $R/cues/realtime -type f | wc -l >> ../_egopm_backup_20260916/realtime_manifest/size.txt
 ls $R/cues/realtime/runs > ../_egopm_backup_20260916/realtime_manifest/run_ids.txt
 ```
 
-**1.6 校验 10,000 个候选都能与 Source 联结**（这是后面 Cue 阶段的前提）：
+> realtime 已确认为**直接删除、不备份内容**，此处只记录文件数与体积。
+
+**1.6 仓库外备份数据资产**：
+
+```bash
+mkdir -p ../_egopm_backup_20260916/{source,bge}
+cp $R/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/*.jsonl ../_egopm_backup_20260916/bge/
+cp $R/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/*.json  ../_egopm_backup_20260916/bge/
+cp $R/source/source_video_atoms.jsonl        ../_egopm_backup_20260916/source/
+cp $R/source/source_split_map.jsonl          ../_egopm_backup_20260916/source/
+cp $R/source/raw_srt_segments.jsonl          ../_egopm_backup_20260916/source/
+cp $R/source/source_video_atoms_draft.jsonl  ../_egopm_backup_20260916/source/
+cp $R/source/srt_inventory.csv               ../_egopm_backup_20260916/source/
+```
+
+**1.7 校验 10,000 个候选都能与 Source 联结**（Cue 阶段的前提）：
 
 ```bash
 python - <<'PY'
@@ -260,38 +391,62 @@ print("缺失样例:", list(want - hit)[:5])
 PY
 ```
 
-**验收**：`git tag` 能看到 `cleanup-pre-20260916-01`；仓库外备份目录大小与源一致；上一步输出「候选行数: 10000 唯一: 10000」且「缺失: 0」。
+**验收**：`git tag` 里有 `cleanup-pre-20260916-01`；`origin/main` 与本地 `main` 同步；当前分支为 `cleanup/minimal-mainline`；1.7 输出「候选行数: 10000 唯一: 10000」且「缺失: 0」。
 
-**回滚**：`git reset --hard cleanup-pre-20260916-01`。
-
-**⚠️ 执行前需你确认**：`cues/realtime/`（约 37.6 万文件 / 0.98 GiB，量级待批次 1.5 实测）被 `.gitignore` 排除，删除后**无法从 Git 恢复**。确认它确实无研究价值后，才在批次 3 执行 `rm -rf`。
+**回滚**：`git switch main`（尚未做任何破坏性动作）。
 
 ---
 
-### 批次 2：建立新骨架并搬迁数据资产
+### 批次 2：先把 `AGENTS.md` 精简为最小规则
 
-**目标**：先把「要保留的」全部搬到新位置，再考虑删除。这样即使中途出错，也只是多了一堆旧文件。
+**目标**：解除旧合同对后续批次的约束。**这一步必须在搬迁和删除之前做。**
+
+改造 `AGENTS.md`，只保留四节，总长不超过一页：
+
+1. **协作**：单人或双人协作，可以直接改代码；不再有 T0–T4、角色分工与合并审批。
+2. **安全**：API Key 只读环境变量；调用模型必须显式 `--execute`；必须有 `--limit`、超时、有限重试与费用上限；不把原始模型响应提交 Git。
+3. **中文文档**：Markdown 正文与 Python 模块说明/关键注释用中文；字段名、命令、路径、模型 ID 等专名除外。
+4. **数据事实边界**：直接引用本文档第 5 节的十条，不再复述。
+
+删除：T0–T4 所有权、CR 流程、冻结、哈希、SUCCESS、目录预算、合同版本、工件节制硬门禁、Cue v2 正式布局（`cues/v2/formal/` + 分片 + 阶段 SUCCESS）的规定。
+
+```bash
+# 改完后
+grep -inE "T0|T1|T2|T3|T4|冻结|门禁|合同|SUCCESS|哈希" AGENTS.md   # 期望：无匹配
+git add AGENTS.md
+git commit -m "docs: AGENTS.md 精简为最小协作规则"
+```
+
+**验收**：`AGENTS.md` ≤ 1 页；上面的 grep 无匹配。
+
+**回滚**：`git checkout cleanup-pre-20260916-01 -- AGENTS.md`。
+
+---
+
+### 批次 3：搬迁 Source、Source 测试与 WSL 返回物
+
+**目标**：先把「要保留的」全部搬到新位置，再考虑删除。
 
 ```bash
 cd /d/scientific/EgoPM
 R=egopm_bench_v1
 
-# 2.1 建立新骨架（不建 seeds/lifelogs/benchmark/logs）
+# 3.1 建立新骨架（不建 seeds/lifelogs/rules/benchmark/logs）
 mkdir -p $R/scripts/source $R/scripts/cues
 mkdir -p $R/tests/source $R/tests/cues
 mkdir -p $R/prompts/cues $R/schemas/cues
 mkdir -p $R/cues/wsl_BGE $R/cues/inputs
 
-# 2.2 Source 脚本搬迁
-git mv $R/scripts/01_inventory_srt.py   $R/scripts/source/01_inventory_srt.py
-git mv $R/scripts/02_parse_srt.py       $R/scripts/source/02_parse_srt.py
-git mv $R/scripts/03_align_modal_text.py $R/scripts/source/03_align_modal_text.py
+# 3.2 Source 脚本搬迁
+git mv $R/scripts/01_inventory_srt.py     $R/scripts/source/01_inventory_srt.py
+git mv $R/scripts/02_parse_srt.py         $R/scripts/source/02_parse_srt.py
+git mv $R/scripts/03_align_modal_text.py  $R/scripts/source/03_align_modal_text.py
 git mv $R/scripts/04_make_source_splits.py $R/scripts/source/04_make_source_splits.py
 
-# 2.3 Source 测试搬迁
+# 3.3 Source 测试搬迁
 git mv $R/tests/test_source_pipeline.py $R/tests/source/test_source_pipeline.py
 
-# 2.4 WSL 返回物搬入 cues/wsl_BGE（原样，不改内容）
+# 3.4 WSL 返回物搬入 cues/wsl_BGE（原样，不改内容）
 B=$R/cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02
 for f in candidate_atoms.jsonl selection_proof.jsonl selection_report.json selection_manifest.json BGE_FILTER_SUCCESS.json; do
   git mv "$B/$f" "$R/cues/wsl_BGE/$f"
@@ -300,19 +455,16 @@ git mv WSL_HANDOFF.md "$R/cues/wsl_BGE/WSL_HANDOFF.md"
 git mv requirements-bge-m3.lock "$R/cues/wsl_BGE/requirements-bge-m3.lock"
 ```
 
-**2.5 搬家后必须做的两处路径修正**（这是「原样搬迁」唯一允许的改动）：
+**3.5 搬家后必须做的两处路径修正**（这是「原样搬迁」唯一允许的改动）：
 
-- `scripts/source/01_inventory_srt.py`、`02_parse_srt.py`、`03_align_modal_text.py`、`04_make_source_splits.py`
-  各有一处 `--config` 默认值，从 `parents[1]` 改成 `parents[2]`：
+- `scripts/source/01`–`04`：各自一处 `--config` 默认值，从 `parents[1]` 改成 `parents[2]`：
 
   ```python
   # 改前
   default=Path(__file__).resolve().parents[1] / "config" / "paths.yaml",
-  # 改后
+  # 改后（批次 5 会把 paths.yaml 改名为 source.yaml，届时文件名也一并改掉）
   default=Path(__file__).resolve().parents[2] / "config" / "paths.yaml",
   ```
-
-  （等价做法：不改代码，每次显式传 `--config egopm_bench_v1/config/paths.yaml`。二者选一，不要两边都做。）
 
 - `tests/source/test_source_pipeline.py`：
 
@@ -325,192 +477,227 @@ git mv requirements-bge-m3.lock "$R/cues/wsl_BGE/requirements-bge-m3.lock"
   SCRIPTS = ROOT / "scripts" / "source"
   ```
 
-**验收**：
-
 ```bash
-python $R/scripts/source/01_inventory_srt.py --help          # 正常输出帮助
-python -m pytest egopm_bench_v1/tests/source -q              # 3 passed
-ls $R/cues/wsl_BGE                                           # 7 个文件齐全
+python $R/scripts/source/01_inventory_srt.py --help      # 正常输出帮助
+python -m pytest $R/tests/source -q                      # 3 passed
+git add -A && git commit -m "refactor: 搬迁 Source 脚本、测试与 WSL 返回物"
 ```
 
-**回滚**：`git reset --hard cleanup-pre-20260916-01 && git clean -fd`。
+**验收**：上面两条命令符合预期；`ls $R/cues/wsl_BGE` 有 7 个文件。
 
-> 说明：`01`–`04` 目前会写 `SOURCE_ATOMS_SUCCESS.json` 与哈希。**封存期内保留不动**——它是 Source 阶段自己的自检，只是不再被当作下游读门。同样，`test_source_pipeline.py` 中现有的 SUCCESS / 哈希断言也保留，因为 Source 已封存；新版 Cue 与未来阶段**不得**再读它们。
+**回滚**：`git revert HEAD`。
+
+> 说明：`01`–`04` 仍会写 `SOURCE_ATOMS_SUCCESS.json` 与哈希，`test_source_pipeline.py` 也仍验证它们。**保留不动**——理由见 2.3。
 
 ---
 
-### 批次 3：删除旧代码与治理
+### 批次 4：删除旧代码、旧状态机与治理
 
-**目标**：把整个旧治理体系与失效阶段一次移出主线。此时历史都能从 Git / 仓库外备份恢复。
+**目标**：把旧治理体系与失效阶段一次移出主线。
 
 ```bash
 cd /d/scientific/EgoPM
 R=egopm_bench_v1
 
-# 3.1 删除失效阶段脚本（05–12 全部）
+# 4.1 失效阶段脚本（05–12 全部）
 git rm $R/scripts/05_extract_cues.py $R/scripts/06_retrieve_trigger_lures.py \
        $R/scripts/07_generate_seed_candidates.py $R/scripts/08_freeze_seed_audit.py \
        $R/scripts/09_build_lifelog_families.py $R/scripts/10_run_oracle.py \
        $R/scripts/11_validate_all.py $R/scripts/12_build_statistics.py
 
-# 3.2 删除治理测试与旧 fixture
+# 4.2 治理测试、旧状态机测试与旧 fixture
 git rm $R/tests/test_contract_freeze.py $R/tests/test_cue_v2_current.py \
-       $R/tests/test_qwen_contracts.py $R/tests/test_validators.py
+       $R/tests/test_qwen_contracts.py $R/tests/test_validators.py \
+       $R/tests/test_state_machine.py
 git rm -r $R/tests/fixtures
 
-# 3.3 删除门禁 I/O 与旧规则外壳
-git rm $R/rules/compiler_io.py
+# 4.3 整个 rules/（含状态机与门禁 I/O）
+git rm -r $R/rules
 
-# 3.4 删除协作治理目录
+# 4.4 协作治理目录
 git rm -r $R/coordination
 
-# 3.5 删除旧 V9 Cue 分片与治理标记
+# 4.5 旧 V9 Cue 分片与治理标记
 git rm -r $R/cues/formal
 git rm $R/cues/cue_library_manifest.json $R/cues/CUE_LIBRARY_SUCCESS.json
 
-# 3.6 删除旧 prompt
+# 4.6 旧 prompt
 git rm $R/prompts/cue_extractor_v1.md $R/prompts/cue_extractor_v2.md \
        $R/prompts/cue_extractor_v3_compact.md \
        $R/prompts/seed_auditor_v1.md $R/prompts/seed_generator_v1.md
 
-# 3.7 删除旧 Schema（保留 source_video_atom / source_video_atom_draft 两个）
+# 4.7 旧 Schema（保留 source_video_atom 与 source_video_atom_draft 两个）
 git rm $R/schemas/cue_candidate.schema.json $R/schemas/cue_inference_batch_v1.schema.json \
        $R/schemas/cue_inference_batch_compact_v1.schema.json \
        $R/schemas/cue_v2_inference.schema.json $R/schemas/cue_v2_artifacts.schema.json \
        $R/schemas/trigger_lure_set.schema.json $R/schemas/decision_instance.schema.json \
        $R/schemas/lifelog.schema.json $R/schemas/reminder_seed.schema.json
 
-# 3.8 删除治理配置
+# 4.8 治理配置
 git rm $R/config/benchmark_protocol.yaml $R/config/CUE_EXECUTION_AUTHORIZATION.example.json
 
-# 3.9 删除 WSL 端重复说明（WSL 已完整保留筛选实现）
+# 4.9 WSL 端重复说明（WSL 已完整保留筛选实现）
 git rm -r wsl_BGE-M3_filter
 
-# 3.10 未跟踪 / 被忽略的目录
+# 4.10 84 KB 旧清理方案：直接删，不建 _archive/
+git rm 代码整理与去治理优化执行方案.md
+
+# 4.11 未跟踪 / 被忽略的目录
 rm -rf $R/audit $R/benchmark $R/lifelogs $R/seeds $R/logs
 rm -f  $R/cues/CUE_EXECUTION_AUTHORIZATION.json
-rm -rf $R/cues/realtime          # ⚠️ 见批次 1 的确认项
-rm -rf $R/cues/v2                # 五文件已搬走后剩下的空目录
+rm -rf $R/cues/realtime            # 已确认删除，不备份内容
+rm -rf $R/cues/v2                  # 五文件搬走后的空目录
+
+# 4.12 未跟踪 / 被忽略的目录
+rm -rf $R/audit $R/benchmark $R/lifelogs $R/seeds $R/logs
+rm -f  $R/cues/CUE_EXECUTION_AUTHORIZATION.json
+rm -rf $R/cues/realtime            # 已确认删除，不备份内容
+rm -rf $R/cues/v2                  # 五文件搬走后的空目录
 ```
 
-**3.11 精简 `config/model_registry.yaml`**
-
-- 删除 `cue_v2_extraction.runs_root`（指向不存在的 `../cues/v2/runs`）。
-- 删除 `run_manifest_required_fields`。
-- 删除 `worker_resources`、`ledger_path`、`realtime_*` 等治理键。
-- 只保留：模型 ID（Cue 抽取用 `qwen3.7-flash`）、接口基址、基础采样参数。
-
-**3.12 精简 `config/paths.yaml`**
-
-- 删除 `success_markers` 整段。
-- 删除 `atomic_write.success_marker_required_fields`。
-- 删除 `cue_v2` 整段（Cue 阶段路径由 `scripts/cues/` 内部常量与 CLI 决定）。
-- 删除 `benchmark_protocol` / `contract_version` 之类引用。
-- 只保留 `01`–`04` 实际读取的键：`transcript_root` / `dense_caption_root` / `source_build`（含 `schema_dir`、各输出路径）、指向 `split_policy.yaml` 的目录等。
-
-**3.13 精简 `pyproject.toml`**
-
-```toml
-# 删除 markers 中的 legacy_v36 与 cue_v2
-# 删除 addopts 里的 "-m 'not legacy_v36'"，只留 "-ra"
-[tool.pytest.ini_options]
-testpaths = ["egopm_bench_v1/tests"]
-addopts = "-ra"
-python_files = ["test_*.py"]
-
-# 删除整个 [tool.egopm] 段（contract_version / full_validation_command 指向已删除的 11_validate_all.py）
-```
-
-**3.14 处置仓库根的非代码文档**
-
-按你「第一轮先暂时保留非代码 md」的要求，本批次**不删**，只在附录 A 标注去向。但 `代码整理与去治理优化执行方案.md`（84 KB）已经完成使命且你已决定不再维护它，建议直接搬到 `_archive/`：
+> **本批次不做分支与 worktree 清理。** `codex/*` 分支均未合并进 `main`，且 4 个仍被 `C:/Users/20474/.codex/worktrees/*/EgoPM` 下的 worktree 实际占用（另有 1 个 locked worktree）。清理它们是一个需要单独判断的独立任务，**不要在本批次执行 `git worktree prune`、`git worktree remove` 或任何 `git branch -d/-D`**。代码清理不应与 worktree 清理混在一起。
 
 ```bash
-mkdir -p _archive
-git mv 代码整理与去治理优化执行方案.md _archive/代码整理与去治理优化执行方案.md
+git add -A && git commit -m "chore: 删除旧代码、旧状态机与治理体系"
 ```
 
 **验收**：
 
 ```bash
-python -m pytest -q                      # 全绿；现基线 13 passed，减去被删的 test_cue_v2_current(2) → 11 passed
-git status --short                       # 无残留 D 状态
-grep -rn "SUCCESS\|manifest\|sha256\|冻结\|门禁\|T0\|CHANGE_REQUEST" \
-     egopm_bench_v1/scripts/cues egopm_bench_v1/config
-                                         # 无匹配（scripts/source 与 wsl_BGE 允许保留，见批次 2 说明）
-ls egopm_bench_v1                       # 只剩 source cues scripts rules config prompts schemas tests
+python -m pytest -q          # 期望 3 passed（只剩 tests/source）
+git status --short           # 无残留 D 状态
+ls $R                        # 只剩 source cues scripts config prompts schemas tests
 ```
 
-**回滚**：`git reset --hard cleanup-pre-20260916-01 && git clean -fd`，再从 `../_egopm_backup_20260916/` 恢复数据文件。
+> 删掉 `test_state_machine.py`（8 条）与 `test_cue_v2_current.py`（2 条）后，基线从 13 条降到 **3 条**，即 `tests/source` 的三条。这才是本批次应有的数字。
+
+**回滚**：`git revert HEAD`。
 
 ---
 
-### 批次 4：重写规则与极简清单
+### 批次 5：拆分配置，更新 `.gitignore` 与行尾
 
-**目标**：把「指导日常开发」的唯一文档压到一页以内。
+**目标**：把配置按用途分开，让新 Cue 有干净配置，同时不让行尾噪音继续干扰。
 
-**4.1 重写 `AGENTS.md`**，只保留四节，总长不超过一页：
+**5.1 拆分配置**
 
-1. 协作：单人或双人协作，可以直接改代码；不再有 T0–T4、角色分工与合并审批。
-2. 安全：API Key 只读环境变量；如需调用模型必须显式 `--execute`；必须有 `--limit`、超时、有限重试与费用上限；不把原始模型响应提交 Git。
-3. 中文文档：Markdown 正文与 Python 模块说明/关键注释用中文；字段名、命令、路径、模型 ID 等专名除外。
-4. 数据事实边界：直接引用本文档第 5 节的十条，不再复述。
+```bash
+cd /d/scientific/EgoPM
+R=egopm_bench_v1
+git mv $R/config/paths.yaml $R/config/source.yaml
+```
 
-明确删除：T0–T4 所有权、CR 流程、冻结、哈希、SUCCESS、目录预算、合同版本、工件节制硬门禁。
+然后按 3.3 的清单精简 `source.yaml`，并同步把 `01`–`04` 的 `--config` 默认值文件名改成 `source.yaml`。**每删一段跑一次**：
 
-**4.2 建立最小保留清单**（一两页，只列路径与去留，不写几十页理由）。直接用本文档附录 A，执行时导出为独立文件即可。
+```bash
+python -m pytest $R/tests/source -q
+```
 
-**4.3 更新 `README.md`**：写清当前进度（已完成 Source + BGE 筛选，下一步 Cue）、如何跑 `scripts/source/`、如何跑 `scripts/cues/`、数据文件都在哪里、哪些文件不进 Git。
+报错就把刚删的键加回来。以测试结果为准。
 
-**验收**：`AGENTS.md` 长度 ≤ 1 页；`grep -i "T0\|T1\|T2\|T3\|T4\|冻结\|门禁\|合同" AGENTS.md` 无匹配。
+新建 `config/cue.yaml`，承接原 `model_registry.yaml` 中有用的部分（模型 ID、接口基址、采样参数），并加批量与费用参数。然后：
 
-**回滚**：`git checkout cleanup-pre-20260916-01 -- AGENTS.md`。
+```bash
+git rm $R/config/model_registry.yaml
+```
+
+**5.2 更新 `.gitignore`**
+
+新增两条（`selected_atoms.jsonl` 含 EgoLife 原文，绝不能进 Git；Cue 结果与 checkpoint 也不默认提交）：
+
+```gitignore
+# Cue 阶段：含 EgoLife 原文与新生成结果，只留本机
+egopm_bench_v1/cues/inputs/*.jsonl
+egopm_bench_v1/cues/runs/
+```
+
+删除已失效条目：`egopm_bench_v1/cues/CUE_EXECUTION_AUTHORIZATION.json`、`egopm_bench_v1/cues/batch/`、`egopm_bench_v1/cues/realtime/`。
+同时把「正式 Source 派生产物保留本机，以 SUCCESS 哈希追溯」这类治理措辞改写为中性表述（例如「正式 Source 派生产物保留本机，不进入代码仓库」）。
+
+`cues/wsl_BGE/` 的七个文件继续由 Git 跟踪，**不要**加进忽略。
+
+**5.3 补 `.gitattributes` 消除行尾噪音**（推荐）
+
+```bash
+printf '* text=auto eol=lf\n' > .gitattributes
+git add .gitattributes
+git add --renormalize .          # 若这条产生大量非行尾改动，先停下用 git diff 检查
+git status --short
+```
+
+**验收**：`python -m pytest -q` 仍是 3 passed；`git status --short` 干净；`git diff --stat --ignore-cr-at-eol` 无输出。
+
+```bash
+git add -A && git commit -m "chore: 拆分 source.yaml/cue.yaml 并更新 gitignore 与行尾规则"
+```
+
+**回滚**：`git revert HEAD`。
 
 ---
 
-### 批次 5：实现并验证新版 Cue
+### 批次 6：更新 `README.md`，建立 `DESIGN.md`
 
-**目标**：得到唯一一个能跑完 10,000 条的正式 Cue 生产器。详细规格见第 5、6 节。
+**6.1 `README.md`**：写清当前进度（已完成 Source + BGE 筛选）、`scripts/source/` 怎么跑、数据文件都在哪里、哪些文件不进 Git。
 
-**5.1 摘取少量可复用函数，不要裁剪旧文件。**
-旧 `05_extract_cues.py` 已在批次 3 删除，需要时从 Git 取回参考（`git show cleanup-pre-20260916-01:egopm_bench_v1/scripts/05_extract_cues.py`）。只允许**人工重写**以下通用能力，不 import 旧模块、不保留 fallback：
+> **本批次 Cue 代码还不存在**，所以 README 里 `scripts/cues/` 一节只能写「尚未实现」。真正的运行命令在批次 7 完成后补写，不要提前编造命令。
 
-- API 请求与超时处理；
-- 结构化响应解析；
-- exact span 检查；
-- JSON Schema 校验；
-- 原子文件替换；
-- token / 费用统计。
+**6.2 `DESIGN.md`**：只写设计，不写代码，覆盖：
 
-**5.2 写三个文件**（见 6.1），总量控制在数百行级别。若 `prepare_inputs.py` 足够短，可与 `generate_cues.py` 合并。
+- Seed：Cue 作为 trigger；lure 必须同 split；至少一个同 `source_group_id`；至少一个跨 `source_group_id`；每个 lure 明确指出未满足的 predicate clause。
+- Life Log：六路数据结构。
+- 状态机：状态集合、生命周期转移、remind / silent 判定规则、有效窗口；gold 只能由确定性状态机产生。
+- 状态机代码在进入该阶段时按最终 Seed / Life Log 结构重写（见 3.4）。
 
-**5.3 写 prompt 集合**（见 6.4）。
+```bash
+git add -A && git commit -m "docs: 更新 README 并新增 DESIGN.md"
+```
 
-**5.4 定稿 `schemas/cues/cue.schema.json`**（见 6.5）。
+**回滚**：`git revert HEAD`。
 
-**5.5 先 fixture，再 pilot，最后全量。**
+---
 
-1. 用少量手写 fixture 跑通 `validate_cues.py`。
-2. 用 50–100 个覆盖典型陷阱的 Atom 做 pilot：人物角色、否定、地点、状态、时间语气。
-3. pilot 通过后，**同一个 run_id 直接续跑到 10,000**。首批 N 条就是正式生产的一部分——同样的模型/prompt/Schema/参数/目录/checkpoint/run_id，不叫 smoke，不另建独立目录或独立测试。
+### 批次 7：实现并验证新版 Cue
 
-**验收**：见第 8 节完成定义。
+**目标**：得到唯一一个能跑完 10,000 条的正式 Cue 生产器。规格见第 5、6 节。
+
+**7.1 摘取少量可复用函数，不要裁剪旧文件。**
+旧 `05_extract_cues.py` 已在批次 4 删除，需要时从 Git 取回参考：
+
+```bash
+git show cleanup-pre-20260916-01:egopm_bench_v1/scripts/05_extract_cues.py > /tmp/old_05.py
+```
+
+只允许**人工重写**以下通用能力，不 import 旧模块、不保留 fallback：API 请求与超时、结构化响应解析、exact span 检查、JSON Schema 校验、原子文件替换、token / 费用统计。
+
+**7.2 写三个文件**（见 6.1），总量控制在数百行级别。若 `prepare_inputs.py` 足够短，可与 `generate_cues.py` 合并。
+
+**7.3 写 prompt 集合**（见 6.7）与 `schemas/cues/cue.schema.json`（见 6.3）。
+
+**7.4 顺序**：先 fixture → 再 pilot（50–100 条）→ 再全量 10,000。pilot 与正式 run 的关系见 6.8。
+
+**7.5 补写 README** 中 `scripts/cues/` 的运行命令。
+
+```bash
+git add -A && git commit -m "feat: 新版 Cue 生产器（prepare/generate/validate）"
+```
+
+**验收**：第 8 节的 Cue 部分全部成立。
 
 **回滚**：Cue 阶段没有不可恢复动作；删掉 `cues/runs/<run_id>/` 重跑即可（注意会产生新的 API 费用）。
 
 ---
 
-### 批次 6（暂缓，最后再做）：清理可重建大文件
+### 批次 8（暂缓，最后再做）：清理可重建大文件
 
 确认新版 Cue 全量跑通、且不再需要回溯 draft 之后，再处理：
 
 - `source/raw_srt_segments.jsonl`（350 MB，可由 `02` 重建）
 - `source/source_video_atoms_draft.jsonl`（509 MB，可由 `03` 重建）
-- 各类缓存与构建产物：`egopm_bench_v1/**/__pycache__/`、`.pytest_cache/`、`egopm_bench.egg-info/`
+- 缓存与构建产物：`egopm_bench_v1/**/__pycache__/`、`.pytest_cache/`、`egopm_bench.egg-info/`
 
 ```bash
 cd /d/scientific/EgoPM
-find . -name "__pycache__" -type d -not -path "./.venv/*" | xargs rm -rf
+find . -name "__pycache__" -type d -not -path "./.venv/*" -exec rm -rf {} +
 rm -rf .pytest_cache egopm_bench.egg-info
 ```
 
@@ -529,7 +716,7 @@ rm -rf .pytest_cache egopm_bench.egg-info
 7. 一个 Atom 最多一条 Cue；一个 predicate 使用最少且充分的 1–3 个 clause。
 8. 无法确认时输出 `no_cue`，不能猜。
 9. constructed 内容只能从 Seed / Life Log 开始。
-10. 最终 gold 由确定性状态机（`rules/state_machine.py`）产生，禁止大模型写。
+10. 最终 gold 由确定性状态机产生，禁止大模型写。
 
 ---
 
@@ -565,22 +752,94 @@ cues/inputs/selected_atoms.jsonl
 }
 ```
 
-**验收**：恰好 10,000 行；`atom_id` 唯一；`transcript` 与 `dense_caption` 至少一个非空。（这是人工可审查的中间产物，也是唯一允许送进模型的输入。）
+**验收**：恰好 10,000 行；`atom_id` 唯一；`transcript` 与 `dense_caption` 至少一个非空。这是人工可审查的中间产物，也是唯一允许送进模型的输入。该文件不进 Git（已在批次 5 加入忽略）。
 
-### 6.3 `generate_cues.py`
+### 6.3 `accepted` Cue 的字段（Schema 定稿）
 
-四段结构，职责清晰：
+```json
+{
+  "cue_id": "cue_<atom_id>",
+  "atom_id": "...",
+  "predicate": {
+    "all_of": [
+      {
+        "dimension": "activity",
+        "anchor": "Jake",
+        "operator": "ongoing",
+        "value": "speaking",
+        "evidence": {
+          "field": "transcript",
+          "span": "Jake is speaking"
+        }
+      }
+    ]
+  }
+}
+```
 
-1. 读取 `selected_atoms.jsonl`。
-2. 调用模型，得到 `accepted` 或 `no_cue`。
-3. 做确定性验证（见 6.6 第一、二层）。
-4. 写终态并支持恢复。
+关键决定：
 
-CLI 必须包含：`--execute`、`--limit`、`--max-requests`、`--max-cost-cny`、`--timeout-seconds`、`--batch-size`、`--resume`、`--retry-failed`、`--finalize`。缺少 `--execute` 时只做只读预检，不发请求。
+- `cue_id` 使用确定性 `cue_<atom_id>`，**不需要哈希**。
+- `anchor` **必填**，用于明确人物、物体或状态承载者。
+- 只允许 `all_of`，不引入 `any_of` / `not`。
+- clause 数量 1–3。
+- `dimension` 六种：`person` / `location` / `object` / `activity` / `state` / `explicit_time`。
+- `evidence.field` 只允许 `transcript`、`dense_caption`。
 
-**恢复只保留最薄一层**：一个本地 checkpoint，记录已完成的 `atom_id`，用于断点续跑、避免重复付费。**不得**引入 worker、wave、lease、ledger、receipt、SUCCESS、协议哈希链或审批短语。
+### 6.4 三种状态：科学终态与运行状态要分开
 
-### 6.4 `prompts/cues/`
+| 状态 | 性质 | 说明 |
+| --- | --- | --- |
+| `accepted` | 科学终态 | 有 Cue 且通过验证 |
+| `no_cue` | 科学终态 | 无法确认，明确放弃 |
+| `failed` | **运行状态** | API 超时、限流、解析失败等，**不是内容结论** |
+
+- `failed` 可以暂时出现在运行结果里，但**完整生产结束时必须清零**。
+- `--retry-failed` 成功后**替换 checkpoint 中的状态**，再由 `--finalize` 重新生成完整的 `cue_results.jsonl`。
+- **不允许手改 JSONL**：结果文件永远由程序从 checkpoint 重新生成。
+
+### 6.5 checkpoint 格式：单个 SQLite
+
+```text
+cues/runs/<run_id>/checkpoint.sqlite
+```
+
+- 用 Python 自带 `sqlite3`，**不新增依赖**。
+- 按 `atom_id` 更新结果，天然避免重复行。
+- 适合断点恢复：中断后 `--resume` 只处理没有终态的 `atom_id`。
+- 成功 finalize 后可以删除，或作为本机缓存保留；**不得作为下游输入**（下游只读 `cue_results.jsonl`）。
+
+这比反复重写大 JSON、或往 JSONL 追加带重复记录的行都更可靠。它**不是**旧式 ledger：没有 worker、lease、receipt、协议哈希链，只有一张结果表。
+
+### 6.6 `run.json` 与 `cue_results.jsonl`
+
+```text
+cues/runs/<run_id>/
+├─ cue_results.jsonl    # 全量终态，下游唯一输入
+├─ checkpoint.sqlite    # 本机续跑用，不进 Git
+└─ run.json             # 运行说明，不是读取门禁
+```
+
+`cue_results.jsonl` 覆盖**全部** 10,000 个 Atom：
+
+```json
+{"atom_id":"...","status":"accepted","cue":{...}}
+{"atom_id":"...","status":"no_cue","reason":"UNRESOLVED_REFERENT"}
+{"atom_id":"...","status":"failed","reason":"API_TIMEOUT"}
+```
+
+下游只需筛 `status == "accepted"`。不再另外创建 accepted、excluded、coverage、ledger、manifest、SUCCESS 多套文件。
+
+`run.json` 只记录：模型 ID、生成时间、输入路径、输入条数、accepted / no_cue / failed 数量、费用汇总。**不带哈希，不作为读取门禁，不需要版本号。**
+
+`validate_cues.py` 的完整性检查只需四条：
+
+1. 10,000 个输入 ID 是否各出现一次；
+2. 是否有重复 ID；
+3. 是否还有 `failed`（全量生产结束时必须为 0）；
+4. accepted 的 Cue 是否通过事实验证。
+
+### 6.7 `prompts/cues/`
 
 ```text
 prompts/cues/
@@ -592,36 +851,30 @@ prompts/cues/
 
 拆分依据是**职责**，不是机械控制行数。每份要能完整表达一个主题，避免几行的小碎片，也避免几十 KB 的新巨型 prompt。文件数量可以继续增长。
 
-### 6.5 `schemas/cues/cue.schema.json` 与结果文件
+### 6.8 pilot 与正式 run 的关系（必须遵守）
 
-结果目录：
+「同一个 `run_id` 从 50–100 条续跑到 10,000 条」**只有**在以下全部不变时才成立：
 
-```text
-cues/runs/<run_id>/
-├─ cue_results.jsonl
-└─ run.json
-```
+- 模型；
+- prompt；
+- Schema；
+- 采样参数；
+- 输入字段；
+- 验证逻辑。
 
-`cue_results.jsonl` 覆盖**全部** 10,000 个 Atom 的终态：
+**如果 pilot 发现问题并修改了其中任何一项，必须删掉该 pilot run，换新 `run_id` 重新开始。** 否则一个结果文件里会混入两套生成语义。
 
-```json
-{"atom_id":"...","status":"accepted","cue":{...}}
-{"atom_id":"...","status":"no_cue","reason":"UNRESOLVED_REFERENT"}
-{"atom_id":"...","status":"failed","reason":"API_TIMEOUT"}
-```
+这不是版本治理，而是防止同一个数据文件混合不同生成规则。正常续跑不需要新 run；唯一需要换 run 的情形就是「生成规则变了」。
 
-只有三种终态：`accepted` / `no_cue` / `failed`。不再有 `unsupported`、`needs_review`、`deferred_unsupported`、`excluded_ambiguous` 之类的中间态，也不再另外创建 accepted、excluded、coverage、ledger、manifest、SUCCESS 多套文件。下游只需筛 `status == "accepted"`。
+### 6.9 操作符集合
 
-`run.json` 只记录：模型 ID、生成时间、输入路径、输入条数、accepted / no_cue / failed 数量、费用汇总。**不带哈希，不作为读取门禁，不需要版本号。**
+`operator` 的可选值必须在 **pilot 之前一次性定下来**，之后不再变。定下来之后**不需要版本冻结**——它写在 `cue.schema.json` 里，改了就是改了。
 
-`validate_cues.py` 的完整性检查只需四条：
+### 6.10 generate_cues.py 的 CLI 与验证分层
 
-1. 10,000 个输入 ID 是否各出现一次；
-2. 是否有重复 ID；
-3. 是否还有 `failed`；
-4. accepted 的 Cue 是否通过事实验证。
+CLI 必须包含：`--execute`、`--limit`、`--max-requests`、`--max-cost-cny`、`--timeout-seconds`、`--batch-size`、`--resume`、`--retry-failed`、`--finalize`。缺少 `--execute` 时只做只读预检，不发请求。
 
-### 6.6 三层事实验证的边界（必须承认的能力上限）
+三层事实验证的能力边界（必须承认）：
 
 - **第一层（程序可完全解决）**：evidence 字段合法、span 是连续原文、clause 数 1–3、dimension / operator 合法、禁止空值与泛指词、禁止明显未解析代词。
 - **第二层（程序可大部分解决）**：否定和时间语气没有被反转。
@@ -629,24 +882,16 @@ cues/runs/<run_id>/
 
 第三层的合理做法是：**prompt 严格约束 + 对 pilot 与正式结果做分层人工抽查 + 争议项直接 `no_cue`**。不要为此再建复杂的多模型审计流水线。
 
-发现问题时直接改 prompt、Schema 和代码，然后重跑受影响部分——**不再开版本合同**。
+发现问题时直接改 prompt、Schema 和代码，然后按 6.8 决定是否换 run——**不再开版本合同**。
 
 ---
 
 ## 7. Seed / Life Log 暂停条款
 
 - 当前**不实现**任何 Seed / Life Log 代码。
-- `06`–`10` 已删除（注意：这条覆盖了早期「重写 06/07」的想法，以后者为准）。
-- 只保留一份简短的 `DESIGN.md`，写清下列设计即可：
-  - Cue 作为 trigger；
-  - lure 必须同 split；
-  - 至少一个同 `source_group_id`；
-  - 至少一个跨 `source_group_id`；
-  - 每个 lure 明确指出未满足的 predicate clause；
-  - 六路 Life Log 的数据结构；
-  - 状态机与 remind / silent 判定；
-  - gold 由确定性状态机产生。
-- 将来真正开始 Seed 阶段时，在 `scripts/seeds/` 从零实现，并直接读取新版 `cue_results.jsonl`。
+- `06`–`10` 已删除，连同 `rules/state_machine.py` 与 `tests/test_state_machine.py`（见 3.4）。
+- 设计只写在 `DESIGN.md`（见批次 6.2）。
+- 将来真正开始 Seed 阶段时，在 `scripts/seeds/` 从零实现，直接读取新版 `cue_results.jsonl`；状态机按最终 Seed / Life Log 结构重写。
 
 ---
 
@@ -654,20 +899,22 @@ cues/runs/<run_id>/
 
 代码清理部分：
 
-1. `egopm_bench_v1/` 下只剩 `source/`、`cues/`、`scripts/`、`rules/`、`config/`、`prompts/`、`schemas/`、`tests/`。
-2. 仓库内不存在 `coordination/`、CHANGE_REQUEST、handoff、T0–T4、合同版本、冻结流程、SUCCESS 读门、manifest 读门、哈希读门、worker/wave/lease/ledger/receipt。
-3. `scripts/cues/` 与 `config/` 里 grep 不到 `SUCCESS`、`manifest`、`sha256`、`冻结`、`门禁`（`scripts/source/` 与 `cues/wsl_BGE/` 允许保留，因为 Source 已封存、WSL 五文件是原始资料）。
-4. `python -m pytest -q` 全绿，收集数在 15 条以内。
+1. `egopm_bench_v1/` 下只剩 `source/`、`cues/`、`scripts/`、`config/`、`prompts/`、`schemas/`、`tests/`（加上 `DESIGN.md`）。
+2. **活动代码、配置、README 与 `AGENTS.md`** 不再引用或依赖：CHANGE_REQUEST、T0–T4、合同版本、冻结流程、SUCCESS 读门、manifest 读门、哈希读门、worker/wave/lease/ledger/receipt。
+   > 该范围**不包含**历史 Markdown 文档（`论文选题.md`、`EgoPM_Bench_v1_完整生产流水线统筹指南.md`、根 `CHANGE_REQUESTS.md`）。它们第一轮保留，第二轮再处理，不作为本条的检查对象。
+3. `scripts/cues/` 与 `config/cue.yaml` 里 grep 不到 `SUCCESS`、`manifest`、`sha256`、`冻结`、`门禁`。
+   > `scripts/source/`、`config/source.yaml`、`cues/wsl_BGE/` **允许**保留这些字样，理由见 2.3。
+4. `python -m pytest -q` 全绿，且只剩 Source 的三条（批次 4 之后；批次 7 会再加 Cue 的两三条）。
 5. `AGENTS.md` ≤ 1 页，且不含治理词汇。
-6. 一次 `git reset --hard cleanup-pre-20260916-01` 能回到清理前状态。
+6. 每个批次都有独立提交，`git log` 能按批次号回溯。
 
 Cue 阶段部分：
 
 7. `cues/inputs/selected_atoms.jsonl` 恰好 10,000 行，`atom_id` 唯一，且每个都能在 Source 中命中。
 8. `cues/runs/<run_id>/cue_results.jsonl` 覆盖全部 10,000 个 Atom，无重复、无遗漏。
-9. 不存在未处理的 `failed`（或 `failed` 已单独重跑并给出终态）。
+9. `failed` 数量为 0。
 10. 所有 `accepted` 的 Cue 通过 `validate_cues.py` 的第一、二层检查，并已完成 pilot + 正式结果的分层人工抽查。
-11. 中途中断后 `--resume` 能续跑且不重复请求已完成的 Atom。
+11. 中途中断后 `--resume` 能续跑且不重复请求已完成的 Atom；`cue_results.jsonl` 由 `--finalize` 生成，从未被手改。
 
 ---
 
@@ -677,16 +924,17 @@ Cue 阶段部分：
 
 - 文件级大小、行数；
 - 引用数量、被引用次数；
-- Git 状态、未提交文件清单；
+- Git 状态、未提交文件清单、与远端的分支差距；
 - 测试收集数与通过数；
 - 目录体积。
 
-需要时临时跑命令即可：
+需要时临时跑：
 
 ```bash
-find egopm_bench_v1 -name "*.py" | xargs wc -l | tail -1
 git status --short | wc -l
+git rev-list --count origin/main..main
 python -m pytest -q 2>&1 | tail -3
+find egopm_bench_v1 -name "*.py" | xargs wc -l | tail -1
 ```
 
 ---
@@ -700,92 +948,134 @@ python -m pytest -q 2>&1 | tail -3
 | `egopm_bench_v1/source/source_split_map.jsonl` | 保留 | — |
 | `egopm_bench_v1/source/srt_inventory.csv` | 保留 | — |
 | `egopm_bench_v1/source/atom_build_report.json` | 保留 | — |
-| `egopm_bench_v1/source/SOURCE_ATOMS_SUCCESS.json` | 保留（仅自检，不作读门） | — |
-| `egopm_bench_v1/source/raw_srt_segments.jsonl` | 暂留，批次 6 再删 | 6 |
-| `egopm_bench_v1/source/source_video_atoms_draft.jsonl` | 暂留，批次 6 再删 | 6 |
-| `.../bge_m3_source_select_v3_1_20260914_02/*`（5 文件） | 搬入 `cues/wsl_BGE/` | 2 |
-| `WSL_HANDOFF.md`（根） | 搬入 `cues/wsl_BGE/` | 2 |
-| `requirements-bge-m3.lock`（根） | 搬入 `cues/wsl_BGE/` | 2 |
-| `scripts/01`–`04` | 搬入 `scripts/source/`，封存 | 2 |
-| `scripts/05`–`12` | **删除** | 3 |
-| `scripts/__pycache__/` | 删除 | 3 |
-| `tests/test_source_pipeline.py` | 搬入 `tests/source/` | 2 |
-| `tests/test_state_machine.py` | 保留原样 | — |
-| `tests/test_contract_freeze.py` | **删除** | 3 |
-| `tests/test_cue_v2_current.py` | **删除** | 3 |
-| `tests/test_qwen_contracts.py` | **删除** | 3 |
-| `tests/test_validators.py` | **删除** | 3 |
-| `tests/fixtures/` | **删除** | 3 |
-| `rules/state_machine.py` | 保留 | — |
-| `rules/compiler_io.py` | **删除** | 3 |
-| `rules/__init__.py` | 改写 | 3 |
-| `coordination/`（含 CHANGE_REQUESTS、STATUS、handoffs） | **删除** | 3 |
-| `cues/formal/`（75 个 task_*.jsonl） | **删除** | 3 |
-| `cues/cue_library_manifest.json` | **删除** | 3 |
-| `cues/CUE_LIBRARY_SUCCESS.json` | **删除** | 3 |
-| `cues/CUE_EXECUTION_AUTHORIZATION.json` | **删除** | 3 |
-| `cues/realtime/` | **删除**（不可恢复，需确认） | 3 |
-| `cues/v2/`（搬空后的空目录） | 删除 | 3 |
-| `prompts/cue_extractor_v1.md` / `v2` / `v3_compact` | **删除** | 3 |
-| `prompts/seed_auditor_v1.md` / `seed_generator_v1.md` | **删除** | 3 |
-| `schemas/source_video_atom.schema.json` | 保留（03/04 依赖） | — |
+| `egopm_bench_v1/source/SOURCE_ATOMS_SUCCESS.json` | 保留（Source 自检，不作读门） | — |
+| `egopm_bench_v1/source/raw_srt_segments.jsonl` | 暂留，批次 8 再删 | 8 |
+| `egopm_bench_v1/source/source_video_atoms_draft.jsonl` | 暂留，批次 8 再删 | 8 |
+| `.../bge_m3_source_select_v3_1_20260914_02/*`（5 文件） | 搬入 `cues/wsl_BGE/` | 3 |
+| `WSL_HANDOFF.md`（根） | 搬入 `cues/wsl_BGE/` | 3 |
+| `requirements-bge-m3.lock`（根） | 搬入 `cues/wsl_BGE/` | 3 |
+| `scripts/01`–`04` | 搬入 `scripts/source/`，封存 | 3 |
+| `scripts/05`–`12` | **删除** | 4 |
+| `scripts/__pycache__/` | 删除 | 8 |
+| `tests/test_source_pipeline.py` | 搬入 `tests/source/` | 3 |
+| `tests/test_state_machine.py` | **删除**（与状态机一起，见 3.4） | 4 |
+| `tests/test_contract_freeze.py` | **删除** | 4 |
+| `tests/test_cue_v2_current.py` | **删除** | 4 |
+| `tests/test_qwen_contracts.py` | **删除** | 4 |
+| `tests/test_validators.py` | **删除** | 4 |
+| `tests/fixtures/` | **删除** | 4 |
+| `rules/`（整个目录） | **删除** | 4 |
+| `coordination/`（含 CHANGE_REQUESTS、STATUS、handoffs） | **删除** | 4 |
+| `cues/formal/`（75 个 task_*.jsonl） | **删除** | 4 |
+| `cues/cue_library_manifest.json` | **删除** | 4 |
+| `cues/CUE_LIBRARY_SUCCESS.json` | **删除** | 4 |
+| `cues/CUE_EXECUTION_AUTHORIZATION.json` | **删除** | 4 |
+| `cues/realtime/` | **删除**（不可恢复，已确认不备份内容） | 4 |
+| `cues/v2/`（搬空后的空目录） | 删除 | 4 |
+| `prompts/cue_extractor_v1.md` / `v2` / `v3_compact` | **删除** | 4 |
+| `prompts/seed_auditor_v1.md` / `seed_generator_v1.md` | **删除** | 4 |
+| `schemas/source_video_atom.schema.json` | 保留（03/04/测试依赖） | — |
 | `schemas/source_video_atom_draft.schema.json` | 保留（03/04/测试依赖） | — |
-| `schemas/cue_*.json`（4 个） | **删除** | 3 |
-| `schemas/trigger_lure_set.schema.json` | **删除** | 3 |
-| `schemas/decision_instance.schema.json` | **删除** | 3 |
-| `schemas/lifelog.schema.json` | **删除** | 3 |
-| `schemas/reminder_seed.schema.json` | **删除** | 3 |
-| `config/model_registry.yaml` | 保留并精简（批次 3.11） | 3 |
-| `config/paths.yaml` | 保留并精简（批次 3.12） | 3 |
+| `schemas/cue_*.json`（4 个） | **删除** | 4 |
+| `schemas/trigger_lure_set.schema.json` | **删除** | 4 |
+| `schemas/decision_instance.schema.json` | **删除** | 4 |
+| `schemas/lifelog.schema.json` | **删除** | 4 |
+| `schemas/reminder_seed.schema.json` | **删除** | 4 |
+| `config/paths.yaml` | 改名为 `source.yaml` 并精简（见 3.3） | 5 |
+| `config/model_registry.yaml` | **删除**（有用部分并入 `cue.yaml`） | 5 |
 | `config/split_policy.yaml` | 保留（01–04 依赖） | — |
-| `config/benchmark_protocol.yaml` | **删除** | 3 |
-| `config/CUE_EXECUTION_AUTHORIZATION.example.json` | **删除** | 3 |
-| `audit/` | 删除 | 3 |
-| `benchmark/`（空） | 删除 | 3 |
-| `lifelogs/`（空） | 删除 | 3 |
-| `seeds/`（空） | 删除 | 3 |
-| `logs/`（空） | 删除 | 3 |
-| `wsl_BGE-M3_filter/` | **删除**（WSL 端已保留实现） | 3 |
-| `AGENTS.md` | 重写为极简版 | 4 |
-| `pyproject.toml` | 精简（批次 3.13） | 3 |
-| `README.md` | 更新 | 4 |
-| `论文选题.md` | 第一轮保留 | — |
-| `EgoPM_Bench_v1_完整生产流水线统筹指南.md` | 第一轮保留，第二轮再定 | 后续 |
-| `CHANGE_REQUESTS.md`（根） | 第一轮保留，第二轮再定 | 后续 |
-| `代码整理与去治理优化执行方案.md` | 搬入 `_archive/`，不再维护 | 3.14 |
-| `.gitignore` | 精简：删除 `cues/realtime/`、`cues/batch/` 等失效条目 | 3 |
-| `.venv/` | 保留（运行环境，已被忽略） | — |
-| `.codex/` | 保留（工具配置，已被忽略） | — |
-| `.pytest_cache/` | 删除（缓存） | 6 |
-| `egopm_bench.egg-info/` | 删除（构建产物；若仍以 `pip install -e .` 方式使用则保留） | 6 |
+| `config/benchmark_protocol.yaml` | **删除** | 4 |
+| `config/CUE_EXECUTION_AUTHORIZATION.example.json` | **删除** | 4 |
+| `audit/` | 删除 | 4 |
+| `benchmark/`（空） | 删除 | 4 |
+| `lifelogs/`（空） | 删除 | 4 |
+| `seeds/`（空） | 删除 | 4 |
+| `logs/`（空） | 删除 | 4 |
+| `wsl_BGE-M3_filter/` | **删除**（WSL 端已保留实现） | 4 |
+| `codex/*` 分支与 `.codex/worktrees/*` | **不动**（独立任务，不在本次范围） | — |
+| `AGENTS.md` | 重写为极简版 | 2 |
+| `pyproject.toml` | 精简（见下） | 5 |
+| `README.md` | 更新 | 6、7 |
+| `.gitignore` | 更新（见 5.2） | 5 |
+| `.gitattributes` | 新增（见 5.3） | 5 |
+| `.venv/` | 保留（运行环境，已忽略） | — |
+| `.codex/` | 保留（工具配置，已忽略） | — |
+| `.pytest_cache/` | 删除（缓存） | 8 |
+| `egopm_bench.egg-info/` | 删除（构建产物） | 8 |
+| `论文选题.md` | 第一轮保留，非活动规则 | — |
+| `EgoPM_Bench_v1_完整生产流水线统筹指南.md` | 第一轮保留，非活动规则 | — |
+| `CHANGE_REQUESTS.md`（根） | 第一轮保留，非活动规则 | — |
+| `代码整理与去治理优化执行方案.md` | **删除**（Git 历史可恢复，不建 `_archive/`） | 4 |
+
+`pyproject.toml` 精简（批次 5）：
+
+```toml
+# 删除 markers 中的 legacy_v36 与 cue_v2
+# 删除 addopts 里的 "-m 'not legacy_v36'"，只留 "-ra"
+[tool.pytest.ini_options]
+testpaths = ["egopm_bench_v1/tests"]
+addopts = "-ra"
+python_files = ["test_*.py"]
+
+# 删除整个 [tool.egopm] 段（contract_version / full_validation_command 指向已删除的 11_validate_all.py）
+```
 
 ---
 
-## 附录 B：决策记录（最终结论，覆盖过程中的反复）
+## 附录 B：决策记录
 
 | 议题 | 最终结论 | 说明 |
 | --- | --- | --- |
 | 05_extract_cues.py | 不裁剪，**拆除重建** | 内部耦合太重，手术会把历史假设带回来 |
 | 11_validate_all.py | 整文件删除，不改造 | 新版只保留各阶段旁的小型验证 |
 | 06 / 07 是否重写 | **不重写，直接删除** | 与「Seed/Life Log 暂不实现」的最终决定一致 |
-| 06–10 | 全部删除 | Seed/Life Log 只留设计文档 |
-| 08 / 09 / 10 / 12 | 删除 | 未落地或已废弃 |
-| 旧 V9 / realtime | 直接进入清理批次 | 不再等新版 Cue 全量完成后才清理 |
+| 06–10 | 全部删除 | Seed/Life Log 只留 `DESIGN.md` 设计 |
+| `rules/` 与 `test_state_machine.py` | **一并删除** | 状态机仍绑定旧 Seed 字段、旧 Life Log 事件角色与 `10_run_oracle.py`；保留会与删除计划冲突（见 3.4） |
+| 旧 V9 / realtime | 直接删除 | realtime 不备份内容，只记录体量 |
 | WSL 边界 | Windows 仓库不承担筛选程序恢复责任 | WSL 端已完整保留实现 |
 | WSL 返回物 | 在 Cue 阶段内保留 | 放入 `cues/wsl_BGE/`，原样保存 |
 | 五文件中的 `selection_manifest.json` / `BGE_FILTER_SUCCESS.json` | 保留为原始资料 | 代码**不得**当作运行门禁 |
-| Source 阶段 | 原样搬迁封存，不重写 | 只改 `--config` 默认路径深度 |
-| 测试 | 按阶段结构组织，只做少量关键核验 | 不再建覆盖旧治理体系的大型套件 |
-| Cue 结果文件 | 单一终态文件 | 三种终态，不再拆多套文件 |
-| Cue 代码文件数 | 两到三个职责清楚的文件 | 不重建几千行总入口 |
-| prompt | 按职责拆成小型集合 | 依据职责，不机械控制行数 |
-| 运行恢复 | 只留防重复付费的轻量 checkpoint | 取消 worker/wave/lease/ledger/receipt/SUCCESS/哈希链 |
-| 发布追溯、多人审批、版本冻结、哈希读门 | 全部删除 | 与研究事实约束明确区分 |
-| 历史恢复方式 | Git tag + 仓库外压缩包 | 不在仓库内建 `legacy/` |
+| Source 阶段 | 原样搬迁封存，不重写 | 只改 `--config` 默认路径与文件名 |
+| Source 的哈希与 SUCCESS | **保留** | 是已完成阶段的内部实现；不为「全仓 grep 干净」破坏它（见 2.3） |
+| 配置 | 拆成 `source.yaml` + `cue.yaml` | 直接精简 `paths.yaml` 会让 Source 无法复跑 |
+| `model_registry.yaml` | 删除，有用部分并入 `cue.yaml` | 删除 06–12 后无人读取 |
+| 测试 | 按阶段结构组织，只做少量关键核验 | 批次 4 后应只剩 `tests/source` 三条 |
+| Cue 结果文件 | 单一终态文件 | 下游只读 `cue_results.jsonl` |
+| `failed` | 运行状态，非内容终态 | 全量结束时必须为 0，由 `--retry-failed` + `--finalize` 清零 |
+| checkpoint | 单个 `checkpoint.sqlite` | stdlib sqlite3，按 atom_id 更新，不是 ledger |
+| `cue_id` | 确定性 `cue_<atom_id>` | 不需要哈希 |
+| pilot 换 run 规则 | 生成规则任一变化即换新 `run_id` | 防止同一文件混合两套语义 |
+| 历史恢复方式 | Git tag + 仓库外备份 | 不建 `legacy/`、不建 `_archive/` |
+| 批次粒度 | 一批次一提交 | 回滚用 `git revert`，不用 `reset --hard` |
+| `AGENTS.md` 精简次序 | **批次 2，先于搬迁与删除** | 否则后续操作同时受新旧两套规则约束 |
 
 ---
 
-## 附录 C：临时清单（执行中发现问题就写在这里）
+## 附录 C：本轮评审修正记录（相对第一版）
+
+| # | 第一版的写法 | 修正后 | 原因 |
+| --- | --- | --- | --- |
+| 1 | 批次 1「提交 25 个未提交改动」 | 实测 24 个「改动」是纯 CRLF 差异，零内容变更；批次 1 改为推送 3 个提交 + 建 tag + 建分支 | `git diff --stat --ignore-cr-at-eol` 输出为空 |
+| 2 | `AGENTS.md` 重写在批次 4 | 提到**批次 2**，先于搬迁删除 | 旧合同仍禁止删除治理/Schema/配置 |
+| 3 | 批次 3.12 直接精简 `paths.yaml` | 拆成 `source.yaml` + `cue.yaml`，保留 Source 实读字段 | `01`–`04` 实读 `contract_version`、`config_version`、`success_markers`、`artifacts` |
+| 4 | 保留 `state_machine.py` 与旧测试，预期 11 passed | 两者一并删除，`rules/` 整目录删除；批次 4 后预期 **3 passed** | 旧测试导入 `08`/`09`/`10` 并读两个 Schema，删除后收集即失败 |
+| 5 | `.gitignore` 未覆盖新路径 | 新增 `cues/inputs/*.jsonl` 与 `cues/runs/` | `selected_atoms.jsonl` 含 EgoLife 原文 |
+| 6 | Cue Schema 无定稿字段 | 补 6.3 完整字段与六种 dimension | 原文档只说状态，没说 accepted 长什么样 |
+| 7 | `failed` 与其他状态并列 | 区分科学终态与运行状态，明确清零方式 | `failed` 不是内容结论 |
+| 8 | checkpoint 未定格式 | 定为单个 `checkpoint.sqlite` | 避免重写大 JSON 或追加重复行 |
+| 9 | pilot 与正式 run 关系未说明 | 补 6.8 换 run 规则 | 防止一个结果文件混入两套语义 |
+| 10 | 大量使用 `reset --hard` 与 `clean -fd` | 新增 0.2 危险命令警告，改为按批次 `git revert` | `clean -fd` 会删掉未跟踪的新代码与数据 |
+| 11 | 完成定义要求「仓库内不存在 CHANGE_REQUEST」 | 限定为「活动代码/配置/README/AGENTS 不再引用」 | 与「历史 Markdown 第一轮保留」矛盾 |
+| 12 | 批次 4.2 建议另导出保留清单 | 取消导出，继续用附录 A | 会产生第二份事实源 |
+| 13 | 批次 4 要求 README 写 `scripts/cues/` 运行方式 | 批次 6 只写「尚未实现」，命令在批次 7 后补 | Cue 代码此时还不存在 |
+| 14 | 84 KB 方案搬入 `_archive/` | 直接 `git rm` | 已在 Git 历史中，不重建仓库内历史区 |
+| 15 | 未处理 codex worktree 与 `codex/*` 分支 | 明确**排除在范围外**，不在任何批次清理 | 分支未合并进 `main` 且仍被 worktree 实际占用，清理属独立任务 |
+| 16 | 「Git Bash 或 WSL 均可」 | 统一为 **仅 Windows 侧 Git Bash** | 命令使用 `/d/...` 与花括号展开等 Git Bash 写法 |
+| 17 | 1.3 曾写「6 个 `codex/*` 分支」 | 更正为 **5 个** | 实测为 t0/t1/t2/t3-wave1-compiler/t4 |
+
+---
+
+## 附录 D：临时清单（执行中发现问题就写在这里）
 
 > 只在执行过程中追加，不设格式要求。执行结束后可清空。
 > 若问题涉及本文档本身的错误（路径写错、命令失效），**直接改本文档对应段落**，不要新增一节来「补充说明」。
@@ -793,15 +1083,6 @@ python -m pytest -q 2>&1 | tail -3
 | 日期 | 批次 | 问题 | 处理 |
 | --- | --- | --- | --- |
 |  |  |  |  |
-
----
-
-## 附录 D：待你确认的四个事项
-
-1. **`cues/realtime/` 删除**：量级约 37.6 万文件 / 0.98 GiB（待批次 1.5 实测），被 `.gitignore` 排除，删除后无法从 Git 恢复。确认无研究价值后才执行批次 3.10。
-2. **`rules/state_machine.py` 保留**：建议保留（确定性 gold 的唯一已实现资产，8 条测试通过，不依赖旧治理）。若你希望暂停阶段完全不留代码，则一并删除，并在 `DESIGN.md` 中只保留设计描述。
-3. **非代码 md 文档**：按你的要求第一轮保留 `论文选题.md`、`EgoPM_Bench_v1_完整生产流水线统筹指南.md`、`CHANGE_REQUESTS.md`，第二轮再决定归档或删除。
-4. **`代码整理与去治理优化执行方案.md`**：建议搬入 `_archive/` 而非直接删除，避免误删其中仍有价值的流水线设计描述。
 
 ---
 
