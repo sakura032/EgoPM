@@ -24,8 +24,12 @@ packages = []
 
 [tool.pytest.ini_options]
 testpaths = ["egopm_bench_v1/tests"]
-addopts = "-ra"
+addopts = "-ra -m 'not legacy_v36'"
 python_files = ["test_*.py"]
+markers = [
+  "cue_v2: Cue v2 协议、验证器与验收计划测试",
+  "legacy_v36: legacy V3.6 实时紧凑协议回归测试",
+]
 
 [tool.egopm]
 contract_version = "v1.0.0"

@@ -115,3 +115,48 @@ Cue v2 目标约 3,000–5,000 条 accepted Cue，但不以数量单独判成功
 阶段内只有一个固定生产模型，阶段间允许选择不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量审计。Seed 生成、Seed 审计和 Life Log 生成的最终模型在各自生产前另行冻结。
 
 所有阶段分布报告统一写入 `audit/distributions/<stage>/<snapshot_id>/`，并严格收敛为 `distribution_report.json`、由其确定性渲染的中文摘要、manifest 和 `DISTRIBUTION_SUCCESS.json` 四文件。`by_model`、多账号阶段的 `by_worker`、`by_split`、`by_participant`、`by_modality`、`by_shard` 和阶段特有维度都作为报告内对象，不再各建 JSON。对应生产 SUCCESS 必须绑定 `distribution_manifest_sha256`。
+CR-2026-022 第四步：批准 `_02` 兼容导入，保留原始 Schema SHA 并记录 `origin_schema_unavailable`；BGE 为非事实召回层，Cue 事实门保持硬门。
+
+### CR-2026-022-B06
+
+| 字段 | 内容 |
+| --- | --- |
+| 变更 | 将当前 Cue v2 协议验收固定为两个 worker，并以 BGE proof 的 350 条 `audit_sample` 排除集和最大余数分层抽样确定 900/120 验收计划 |
+| 当前身份 | `worker_00`、`worker_01`；模型、Prompt、推理 Schema、参数和预算规则不变 |
+| 受影响文件 | `egopm_bench_v1/scripts/05_extract_cues.py`、`egopm_bench_v1/tests/test_qwen_contracts.py`、当前配置与协议文档 |
+| 合同原因 | 原三 worker 计划不能表达当前双账号预算、分区、重叠验收和恢复身份；简单排序取样不能证明 strata 配额闭合 |
+| 兼容性 | 历史交接和 legacy V3.6 账本只读保留；当前运行器不得读取历史第三 worker 身份 |
+| 验收门 | candidate proof 每个 Atom 恰一条、Source 元数据全覆盖、校准恰 350 条、验收恰 900 条、overlap 恰 120 条、主分区 390/390 且互斥完整 |
+| 状态 | IMPLEMENTED；本步只完成离线确定性计划和回归测试，不调用 API、不生成正式 Cue |
+
+### CR-2026-022-B07
+
+| 字段 | 内容 |
+| --- | --- |
+| 变更 | API 前一致性修正与 Cue v2/legacy V3.6 协议隔离；当前身份统一为 `bge_m3_source_select_v3_1_20260914_02`、`worker_00`、`worker_01` |
+| 受影响文件 | `AGENTS.md`、`egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`、`egopm_bench_v1/coordination/STATUS.md`、`egopm_bench_v1/coordination/CHANGE_REQUESTS.md`、`egopm_bench_v1/config/model_registry.yaml`、`pyproject.toml`、`egopm_bench_v1/scripts/05_extract_cues.py`、当前合同与 Qwen 测试 |
+| 合同原因 | 第六步遗留的旧 selection/三 worker 表述可能使运行器误读历史身份；验收计划必须保持候选 Source 流式边界、整数最大余数法、全局 selection 序列和 350 条校准闭合 |
+| 隔离规则 | Cue v2 只读取 v2 prompt、推理/正式 Schema、`cues/v2/**` 和双 worker 资源；legacy V3.6 只读取紧凑 Schema、旧 prompt、`cues/formal/**`/`cues/realtime/**`。两套协议不共享 request builder、配置入口、staging、ledger 或正式输出 |
+| 兼容性 | 历史 CR、handoff 和 legacy 账本保留只读事实；`worker_02` 不得进入当前配置或运行器。BGE `_02` 按外部优化结果兼容导入，原始 artifact Schema 缺失仅保留 provenance warning |
+| 验收门 | 双 worker 分区 5000/5000；协议验收 900/120/780/390/390；校准恰 350 且与验收不相交；candidate proof、Source 元数据和 selection_sequence 全覆盖；标记测试与全量回归无新增 legacy 失败。当前 `_02` proof 的 `sample_index` 在七个固定 `sample_stratum` 内各为 `1..50`，校准身份为三元组，`calibration_index=1..350` 仅由计划派生，不改写原始 proof |
+| 状态 | IMPLEMENTED；本步不调用 API、不读取密钥、不生成正式 Cue 或任何正式验收工件 |
+
+### CR-2026-022-B08
+
+| 字段 | 内容 |
+| --- | --- |
+| 变更 | 校准样本身份修正：接纳现有 proof 在七个 `sample_stratum` 内分别编号 `sample_index=1..50`，并在验收计划中派生全局 `calibration_index=1..350` |
+| 受影响文件 | `egopm_bench_v1/scripts/05_extract_cues.py`、`egopm_bench_v1/tests/test_qwen_contracts.py`、`egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`、`egopm_bench_v1/coordination/STATUS.md`、本文件 |
+| 不可变边界 | 不修改、重写、重编号或移动 BGE 五文件；原始校准身份始终是 `(sample_stratum, sample_index, atom_id)`，派生编号不回写 proof |
+| 验收门 | 七层名称与固定顺序、每层恰 50 条、局部编号唯一且覆盖 `1..50`、Atom 可回查 candidate/Source；校准排除、overlap、主分区和计划摘要均按 Atom 或完整复合身份处理 |
+| 状态 | IMPLEMENTED；仅离线修正与测试，不调用 API、不读取密钥、不创建验收工件 |
+
+### CR-2026-022-B09
+
+| 字段 | 内容 |
+| --- | --- |
+| 变更 | 收口 `origin_schema_unavailable`：adopted 外部兼容导入保留 provenance 状态，但将 Schema 缺失 warning 与 strict 身份硬错误分离 |
+| 受影响文件 | `egopm_bench_v1/scripts/05_extract_cues.py`、`egopm_bench_v1/tests/test_qwen_contracts.py`、`egopm_bench_v1/coordination/STATUS.md`、`egopm_bench_v1/coordination/CUE_SEED_V2_PLAN.md`、本文件 |
+| 兼容规则 | `strict` 仍以 `ARTIFACT_SCHEMA_SHA_MISMATCH` 阻断；`adopted_external_v1` 返回 `provenance_status=origin_schema_unavailable`、`data_gate=passed`、`provenance_gate=warning` 和 `ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE`，warnings 不作为失败 |
+| 身份边界 | 本地结构校验 Schema 仅记录为 `effective_validation_schema`，不宣称为原始产生 Schema；原始 artifact Schema SHA 不伪造、不删除、不覆盖 |
+| 状态 | IMPLEMENTED；不修改 BGE 五文件、不调用 API、不读取密钥；warning 限制原始可复现性声明但不阻断 Cue v2 下游 |

@@ -8,119 +8,27 @@ default_region: cn-beijing
 default_endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
 
 models:
-  cue_extraction:
-    # 公共池基础别名；使用新账号后不再依赖 TPM 预留快照 ID。
+  cue_v2_extraction:
+    # Cue v2 的唯一当前配置；CLI 可显式覆盖，脚本不得另设路径默认值。
     model_id: qwen3.7-flash
     thinking_enabled: false
     reasoning_effort: none
     temperature: 0
-    prompt_version: cue_extractor_v3_6_compact
-    schema: cue_candidate.schema.json
-    schema_version: v1.1.0
-    execution:
-      cue_execution_policy_version: v3.6.0
-      # 此版本标识协议哈希的 canonical payload 结构；结构变化必须拒绝恢复旧 shard。
-      protocol_hash_payload_version: v3.6.0
-      mode: explicit_realtime_execute_only
-      shard_size_atoms: 500
-      max_retries: 2
-      transport: realtime_chat_completions
-      package_policy:
-        maximum_atoms: 5
-        maximum_request_utf8_bytes: 24000
-        ordering: atom_id_lexicographic
-        output_tokens_per_atom: 96
-        output_max_tokens_formula: output_tokens_per_atom_times_package_atom_count
-        inference_schema: cue_inference_batch_compact_v1.schema.json
-        inference_schema_version: v1.1.0
-        response_top_level_field: items
-        response_correlation_field: n
-      controlled_field_policy:
-        model_input_fields: [item_index, transcript, dense_caption, visible_text]
-        model_output_fields: [n, f, x, p, c, v, e, s, a, r]
-        program_backfilled_fields: [cue_id, atom_id, split, source_text, supporting_text_field, model_id, prompt_version, schema_version, run_id]
-        raw_model_response_storage: forbidden
-      compact_inference_policy:
-        cue_type_codes: {T: time, P: person, L: place, O: object, A: activity, S: state_change}
-        supporting_text_field_codes: {T: transcript, D: dense_caption, V: visible_text}
-        operator_codes: {"=": eq, "!": not_eq, "+": present, "-": absent, "^": starts, "$": ends, "~": contains}
-        required_fields: [n, f, x, p, c, v]
-        optional_defaults: {e: [], s: null, a: null, r: null}
-        confidence_scale: 100
-      realtime_api_policy:
-        request_endpoint: /chat/completions
-        maximum_in_flight: 10
-        requests_per_minute: 300
-        tokens_per_minute: 1000000
-        token_reservation: serialized_utf8_request_bytes_plus_max_tokens
-        retryable_http_statuses: [408, 429, 500, 502, 503, 504]
-        retry_backoff_initial_seconds: 2
-        retry_backoff_max_seconds: 60
-        request_timeout_seconds: 60
-        request_body_storage: temporary_memory_only
-        raw_response_storage: forbidden_stream_only
-        successful_local_validation_failure: quarantine_no_auto_retry
-      realtime_ledger_policy:
-        required_fields: [realtime_shard_index, package_id, request_sha256, attempt, outcome, usage, retry_eligible, failure_origin]
-        terminal_outcomes: [validated_success, service_transport_exhausted, local_validation_quarantine, budget_stopped]
-        require_single_terminal_outcome_per_package: true
-        prohibit_requeue_after_local_validation_quarantine: true
-        prohibit_requeue_after_budget_stop: true
-        # 隔离诊断只保存固定 code 与字段路径；禁止错误值、原文和原始响应。
-        local_validation_diagnostic: {format: code_path_v1, raw_content: forbidden}
-      realtime_execution_policy:
-        authorization_version: v2.0.0
-        authorization_required: true
-        execution_confirmation: START_REALTIME_CUE_API
-        maximum_cost_reservation_fraction: 1.0
-        stop_before_authorized_budget_exceeded: true
-        max_local_validation_quarantine_per_run: 0
-        failure_retry_requires_same_protocol: true
-        explicit_rerun_failed_packages_only: true
-        per_item_repair_attempts: 1
-        unresolved_item_audit_queue: required_before_cue_library_success
-        # 实时只替换传输层，继续采用已获教师同意的 1 + 6×10 + 14 task 八波范围。
-        wave_task_counts: [1, 10, 10, 10, 10, 10, 10, 14]
-        logical_shards_per_task: 10
-        # 进度快照只含计数、估算费用与状态，绝不包含字幕、请求体或模型原始响应。
-        progress_update_interval_seconds: 15
-      token_accounting:
-        authoritative_source: response_usage
-        input_field: prompt_tokens
-        output_field: completion_tokens
-        total_field: total_tokens
-        preflight_upper_bound: serialized_utf8_realtime_request_bytes
-        raw_response_storage: forbidden
-      pricing_snapshot:
-        pricing_version: "2026-09-05_cn-beijing_realtime_list"
-        official_pricing_url: https://help.aliyun.com/zh/model-studio/model-pricing
-        input_price_cny_per_million_tokens: 0.2
-        output_price_cny_per_million_tokens: 0.8
-        price_region: cn-beijing
-        input_context_window_tokens: 32000
-        successful_requests_only_billed: false
-        context_cache_supported: false
-      shard_layout:
-        root: cues/realtime
-        run_directory: runs
-        realtime_shards_manifest: realtime_shards_manifest.jsonl
-        package_directory: packages
-        input_manifest_suffix: .input.jsonl
-        output_suffix: .result.jsonl
-        ledger_suffix: .ledger.jsonl
-        completion_suffix: .complete.json
-        failed_suffix: .failed.json
-        run_ledger_filename: realtime_run_ledger.jsonl
-        run_state_filename: realtime_run_state.json
-        progress_filename: progress.json
-        merge_order: numeric_shard_index_ascending
-      recovery:
-        require_matching_source_hash: true
-        require_matching_protocol_hash: true
-        rerun_only_incomplete_or_failed_packages: true
-        completion_marker_requires_sha256: true
-        require_package_id_bijection: true
-        prohibit_automatic_local_validation_retry: true
+    prompt_path: ../prompts/cue_extractor_v2.md
+    inference_schema_path: ../schemas/cue_v2_inference.schema.json
+    artifact_schema_path: ../schemas/cue_v2_artifacts.schema.json
+    source_path: ../source/source_video_atoms.jsonl
+    candidate_path: ../cues/v2/source_selection/bge_m3_source_select_v3_1_20260914_02/candidate_atoms.jsonl
+    runs_root: ../cues/v2/runs
+    maximum_atoms_per_request: 5
+    dimension_operators:
+      object: [present, held]
+      activity: [starts, ongoing]
+      state: [is, changes_to]
+      location: [at]
+    raw_response_policy: forbidden
+    visible_text_evidence: forbidden
+    reason_codes: [NO_OBSERVABLE_CONDITION, INSUFFICIENT_EVIDENCE, UNRESOLVED_REFERENT, AMBIGUOUS_PERSON_ROLE, AMBIGUOUS_SCOPE, AMBIGUOUS_TEMPORAL_MODALITY, UNSUPPORTED_RELATION, MULTIPLE_UNRELATED_FACTS, EXPLICIT_TIME_NOT_ENABLED]
   seed_generation:
     model_id: qwen3.7-plus-2026-05-26
     thinking_enabled: true

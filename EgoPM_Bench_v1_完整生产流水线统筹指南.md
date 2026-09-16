@@ -25,7 +25,7 @@ EgoPM-Bench v1 的研究对象不是“给视频写摘要”，而是：
 
 480 是预注册的正式目标，不允许通过降低质量门凑数。候选通过数不足时扩大 Cue/Seed 候选池；达到各层覆盖门且至少 576 个候选通过机器门后，才允许停止扩充并进入全部人工终审。数据时长必须同时报告 manifest 引用时长、去重真实来源时长和虚拟时间跨度。
 
-本项目不建立会混入 benchmark 的 P0、P1 或 smoke 数据集。大规模调用前必须建立独立的协议验收集，用来证明 prompt、Schema、语义门和三个账号同质；验收集永不进入正式 Cue、Seed 或 benchmark。每条正式数据仍必须通过同一套完整质量门，并分阶段冻结 schema、规则和协议。
+本项目不建立会混入 benchmark 的 P0、P1 或 smoke 数据集。大规模调用前必须建立独立的协议验收集，用来证明 prompt、Schema、语义门和两个账号同质；验收集永不进入正式 Cue、Seed 或 benchmark。每条正式数据仍必须通过同一套完整质量门，并分阶段冻结 schema、规则和协议。
 
 ---
 
@@ -65,18 +65,18 @@ Life Log 每到达一个规定决策点，就产生一次模型输入和 gold ac
 
 ### 1. 最终选型
 
-本项目采用“阶段内单模型、阶段间可换模型”的政策。Cue v2 由三个阿里云账号使用同一 Flash 协议并行；Seed、审计和 Life Log 可在各自阶段选择不同中国厂商模型，但必须在生产前冻结固定模型并通过独立 CR：
+本项目采用“阶段内单模型、阶段间可换模型”的政策。Cue v2 由两个阿里云账号使用同一 Flash 协议并行；Seed、审计和 Life Log 可在各自阶段选择不同中国厂商模型，但必须在生产前冻结固定模型并通过独立 CR：
 
 | 工作 | 固定模型 | 模式 | 原因 |
 | --- | --- | --- | --- |
-| Cue v2 候选抽取 | `qwen3.7-flash` | 同一固定协议；JSON Schema | 三个百炼账号只扩展静态分区吞吐，不改变模型语义 |
+| Cue v2 候选抽取 | `qwen3.7-flash` | 同一固定协议；JSON Schema | 两个百炼账号只扩展静态分区吞吐，不改变模型语义 |
 | Reminder Seed、trigger predicate、lure 与生命周期候选生成 | 待阶段 CR 冻结；首选候选为 `qwen3.7-plus-2026-05-26` | 思考；中等推理；JSON Schema | 900–1,400 个候选需要单独核算质量、成本和并发 |
 | Cue/Seed 独立模型审计 | Plus 为低成本主审；DeepSeek 仅少量争议第三意见 | 分层抽检；结构化输出 | 不对全量候选使用昂贵模型，人工仍独立终审 |
 | Life Log 组装 | 确定性编排与受控 constructed 模板为默认；模型仅可选用于模板润色 | 不得改写 Source 事实、引入新现实实体或决定状态/gold |
 | SRT 解析、时间对齐、去重、划分、状态转移与 gold | Python 确定性脚本 | 不调用大模型 | 必须可复现，不能让模型猜 |
 | 相似 trigger/lure 检索 | `BAAI/bge-m3` 固定修订 | 稠密+稀疏混合检索；确定性 RRF | 比词面 Jaccard 更适合跨表达语义；v1 不增加 reranker |
 
-旧 `realtime_v9_01` 继续受原 Flash 协议约束并只作审计，不得重跑或混入 Cue v2。Cue v2 新 campaign 沿用 `qwen3.7-flash`，但使用重新设计的完整词字段、clause evidence、语义门和三账号隔离账本。不同阶段的模型选择不沿用旧“全部 Plus”政策，也不使用 Max；任何生成或审计模型都不能替代程序验证与人工签字。
+旧 `realtime_v9_01` 继续受原 Flash 协议约束并只作审计，不得重跑或混入 Cue v2。Cue v2 新 campaign 沿用 `qwen3.7-flash`，但使用重新设计的完整词字段、clause evidence、语义门和双账号隔离账本。不同阶段的模型选择不沿用旧“全部 Plus”政策，也不使用 Max；任何生成或审计模型都不能替代程序验证与人工签字。
 
 ### 2. 模型绝对不能做什么
 
@@ -255,7 +255,7 @@ D:\scientific\EgoPM\
 
 1. T0 是合同、配置、Schema 和阶段提升的唯一写入者；同一时间不得由多个终端修改同一个代码或 Markdown 文件。
 2. 数据生产可以开多个普通 PowerShell 终端，但启动前由协调器静态分配互不重叠的 task/partition 范围。
-3. Cue v2 的三个百炼账号分别绑定一个固定 worker；三个 worker 必须使用同一模型、prompt、Schema、参数和 campaign ID。
+3. Cue v2 的两个百炼账号分别绑定一个固定 worker；两个 worker 必须使用同一模型、prompt、Schema、参数和 campaign ID。
 4. 每个 worker 只能写自己的 `*.tmp`、ledger、费用快照和 staging 分区，不得追加共享正式文件、累计账本，也不得写 manifest/SUCCESS。
 5. worker 完成后退出；协调器只读聚合已关闭账本，独占运行全局唯一性、覆盖、费用、哈希、Schema 和语义检查，再原子写 manifest/SUCCESS。
 6. request ID 绑定 campaign、worker、partition、package、Atom 集合 SHA 与 attempt；重复 ID、费用缺失或终态冲突必须停批，禁止自动重发。
@@ -450,14 +450,14 @@ T1 通过后，T0 冻结 SOURCE_ATOMS_SUCCESS 哈希。若 T4 报错，只退回
 
 #### Wave 3：BGE selection、Cue v2 与候选 Seed
 
-依赖顺序是先 Cue、后检索、再 Seed，不能让三个对话各自生成一份：
+依赖顺序是先 Cue、后检索、再 Seed，不能让多个对话各自生成一份：
 
 1. 在 WSL2 中用固定 BGE-M3 对全量 Source 单进程编码，执行冻结的 10,000–12,000 个候选 Atom selection；
 2. T4 在 Windows 导入五文件快照，从 proof 与 Source 验证离散选择逻辑、manifest、模型 revision、分布和人工样本；不重跑 BGE；
-3. 协调器把候选 Atom 静态分给三个阿里云 worker；
-4. 三个 worker 使用同一 `qwen3.7-flash` Cue v2 协议并行写各自 staging 和独立账本；
+3. 协调器把候选 Atom 静态分给两个阿里云 worker；
+4. 两个 worker 使用同一 `qwen3.7-flash` Cue v2 协议并行写各自 staging 和独立账本；
 5. 协调器闭合 ambiguous、运行 clause 语义门并生成约 3,000–5,000 条 accepted Cue 的正式分片、manifest 和 SUCCESS；
-6. T4 验证 Cue v2 Schema、原字段证据、predicate 语义、分布、账本和三账号同质性；
+6. T4 验证 Cue v2 Schema、原字段证据、predicate 语义、分布、账本和双账号同质性；
 7. T2 基于 Cue v2 与 BGE-M3 结果生成 900–1,400 个 Seed candidates；
 8. T4 运行候选硬条件验证；至少 576 个候选通过机器门后才允许停止扩充；
 9. T0 接收全部候选供人工审核。
@@ -509,7 +509,7 @@ T1 通过后，T0 冻结 SOURCE_ATOMS_SUCCESS 哈希。若 T4 报错，只退回
 | Seed 生成与 Seed 终审 | 不可以对同一批同时进行 | 审计对象必须稳定 |
 | 模型审计与人工独立阅读 | 可以 | 两者先独立判断，再汇总；昂贵模型只做分层抽检和争议项 |
 | Life Log 生成与已完成 shard 验证 | 可以 | 以 SUCCESS/hash 为边界 |
-| 三个终端调用同一 Flash 处理静态不重叠 partition | 可以 | 同一 campaign、同一协议；worker 账本和预算完全隔离 |
+| 两个终端调用同一 Flash 处理静态不重叠 partition | 可以 | 同一 campaign、同一协议；worker 账本和预算完全隔离 |
 | 多个终端处理同一 Atom 或追加同一账本 | 绝对不可以 | 会重复计费、碰撞 request ID 并破坏恢复终态 |
 | T3 生成 gold 与千问生成 gold | 不可以 | gold 只有 oracle 一条来源 |
 | T4 报错与生产者修复 | 可以 | T4写 issue，生产者写自己的代码 |
@@ -524,12 +524,11 @@ T1 通过后，T0 冻结 SOURCE_ATOMS_SUCCESS 哈希。若 T4 报错，只退回
 | Terminal 0 | D:\scientific\EgoPM | 协调器、合同、全局验证、manifest/SUCCESS |
 | Terminal 1 | D:\scientific\EgoPM | 百炼账号 A / `worker_00`；只写静态 partition A 的 staging 与独立账本 |
 | Terminal 2 | D:\scientific\EgoPM | 百炼账号 B / `worker_01`；只写静态 partition B 的 staging 与独立账本 |
-| Terminal 3 | D:\scientific\EgoPM | 百炼账号 C / `worker_02`；只写静态 partition C 的 staging 与独立账本 |
 | Terminal 4 | D:\scientific\EgoPM | 对已完成且哈希稳定的分片做只读验证 |
 
 多个普通 PowerShell 窗口可以并行写不同 partition，但禁止同时写同一分片、同一临时文件、累计账本、manifest 或 SUCCESS。每个 worker 具有独立授权、预算、租约、request ledger 和费用快照。任何范围重叠或 request ID 重复都必须先停止，不得用“最后合并时去重”补救。
 
-本地 BGE-M3 移至 WSL2，使用 `wsl_BGE-M3_filter/` 中的专用 `.venv-bge-m3`、单 GPU 和单编码进程；三个 Windows API 终端不承担 BGE 编码。不要同时在 WSL 启动第二个 BGE 或视觉/VLM 进程争抢 GPU。
+本地 BGE-M3 移至 WSL2，使用 `wsl_BGE-M3_filter/` 中的专用 `.venv-bge-m3`、单 GPU 和单编码进程；两个 Windows API 终端不承担 BGE 编码。不要同时在 WSL 启动第二个 BGE 或视觉/VLM 进程争抢 GPU。
 
 ### 9. 每个对话结束时必须交接
 
@@ -565,7 +564,7 @@ coordination/STATUS.md 只由 T0 更新，建议使用：
 | Source atoms | T1 | BLOCKED | — | Contract v1 | implement 01–04 |
 | Source QA | T4 | BLOCKED | — | Source atoms | validate |
 | BGE candidate selection | T2/WSL | BLOCKED | selection v3.1 request/查询/策略/两个必要 Schema 已冻结 | WSL 实现、运行与导入 QA | 生成并验证 10,000–12,000 个候选 Atom 和 proof |
-| Cue v2 library | T2 | BLOCKED | — | BGE selection + 三账号协议 | 生成约 3,000–5,000 条高质量 Cue |
+| Cue v2 library | T2 | BLOCKED | — | BGE selection + 双账号协议 | 生成约 3,000–5,000 条高质量 Cue |
 | Seed candidates | T2 | BLOCKED | — | Cue v2 library | 生成 900–1,400 个候选 |
 | Seed audit | T0/T4 | BLOCKED | — | Candidates | audit |
 | Families/oracle | T3 | BLOCKED | — | Frozen Seeds | compile |
@@ -743,7 +742,7 @@ Cue 是可判断的观察条件，不要求完整主谓宾。“手机出现”�
 ### 4. 校准、验收和扩量顺序
 
 1. 先复用 BGE proof 的 350 条 audit sample，人工标注 `no_cue`、dimension、operator、span、value、人物角色、否定/范围/时间语气和 Seed 可执行性，用于写 prompt、Schema、validator 和历史失败回归测试；
-2. 最终协议另取 800–1,000 条验收 Atom，其中至少 120 条由三个账号重叠处理；先执行约 500 条子波次，若修改协议则整套验收重新开始；
+2. 最终协议另取 800–1,000 条验收 Atom，其中至少 120 条由两个账号重叠处理；先执行约 500 条子波次，若修改协议则整套验收重新开始；
 3. 验收要求 span 与 value 两层硬门为 100%，accepted 分层语义精确率不低于 97%，事实角色/关系/否定/范围/时间语气失真为 0，Schema 有效率不低于 99.5%；
 4. 正式生产先运行约 1,500 条 checkpoint，核对质量、dimension/operator 分布、worker 漂移、吞吐和每千条费用，再处理剩余候选；
 5. 每个请求最多携带 5 个带稳定 `item_index` 的 Atom，各项独立验证。单项失败最多一次只含该 Atom 的简化修复，仍失败即排除，不循环重付；
@@ -1119,7 +1118,7 @@ egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/
 | B. 原子建库 | SRT inventory | 解析、对齐、宽松保留 | source_video_atoms.jsonl | schema、来源、时间全通过 |
 | C. 来源冻结 | atom 库 | 去重、分组、split | source_split_map.jsonl | 无跨 split 泄漏 |
 | D. BGE 候选筛选 | atom 库 | WSL 单 GPU 的 dense+sparse+多样性筛选 | 10,000–12,000 个候选 Atom + proof + 综合报告 + manifest + SUCCESS | 固定 revision、Source/request SHA、WSL 数值审计、T4 离散 proof/分布/人工样本通过 |
-| E. Cue v2 建库 | BGE selection | 三个百炼账号、同一 Flash 协议、程序语义门 | 约 3,000–5,000 条 Cue 分片 + manifest + SUCCESS | 每个 clause 有原字段证据，语义与分布门通过 |
+| E. Cue v2 建库 | BGE selection | 两个百炼账号、同一 Flash 协议、程序语义门 | 约 3,000–5,000 条 Cue 分片 + manifest + SUCCESS | 每个 clause 有原字段证据，语义与分布门通过 |
 | F. Seed 候选 | Cue v2 manifest | 固定单一模型决策优先生成 | 900–1,400 个 candidates | 每个有唯一 Cue 血缘、同组+跨组 lure、全局不复用与 terminal |
 | G. Seed 冻结 | candidates | 低成本模型意见 + 人工终审 | 480 个 frozen Seeds | 全部可状态机化且血缘/组别/不复用检查通过 |
 | H. Family 生成 | frozen Seeds | 2 反事实 × 3 难度 | 2,880 条 Life Logs | 核心规则一致 |
@@ -1135,10 +1134,10 @@ egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/
 
 历史 Source 阶段已经完成；当前从以下顺序继续，不要先生成 Seed 故事：
 
-1. 按 CR-2026-018/019/020 实现 Cue Schema v2、selection contract、三账号账本/租约和 T4 语义门；
+1. 按 CR-2026-018/019/020 实现 Cue Schema v2、selection contract、双账号账本/租约和 T4 语义门；
 2. 将 `wsl_BGE-M3_filter/` 复制到 WSL，创建专用 `.venv-bge-m3`；
 3. 执行已拆分并冻结的 BGE selection v3.1（根 request、模型配置、48 行查询集、选择策略、两个必要 Schema），导入并验证 10,000–12,000 个候选 Atom 及精简 proof；
-4. 将候选静态分给三个阿里云账号，使用同一 `qwen3.7-flash` 协议写隔离 staging；
+4. 将候选静态分给两个阿里云账号，使用同一 `qwen3.7-flash` 协议写隔离 staging；
 5. 协调器生成 Cue v2 正式分片、分布报告、manifest 和 SUCCESS；
 6. 选择并冻结 Seed 生成模型，生成 900–1,400 个 candidates；
 7. 完成机器门、低成本模型意见和全部人工终审，冻结 480 个 Seed；

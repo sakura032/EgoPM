@@ -7,16 +7,19 @@
 
 ## 2026-09-15 当前实施边界
 
+当前有效实现身份已由 CR-2026-022-B09 固定为 BGE selection
+`bge_m3_source_select_v3_1_20260914_02`、两个账号 `worker_00`/`worker_01`、两个独立预算、ledger 和 staging。校准 proof 按七个固定 `sample_stratum` 各自使用 `sample_index=1..50`，身份为 `(sample_stratum, sample_index, atom_id)`，`calibration_index=1..350` 仅由计划派生，不回写原始 proof。adopted 预检的 `ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE` 只限制 BGE 原始可复现性声明，不阻断 Cue v2 下游；下文 CR-2026-018/019/020 的三账号、旧 selection 和“尚未实现”文字均为历史决议快照，不得被当前运行器读取。
+
 - CR-2026-013/014/015 的 V9 实时运行、费用、覆盖账本和 CR-2026-016 的 75 个分片/manifest/SUCCESS 全部保持不可变，但 CR-2026-018 已因系统性内容语义问题撤销其 Seed 上游资格。旧数据只作审计，不得删除、覆盖、修复、重发或混入 Cue v2。
-- CR-2026-018/019/020 冻结 Cue/Seed v2 方向：WSL BGE-M3 先形成 10,000 条核心候选，再按稀有语义簇和新颖度确定性补样至 10,000–12,000 条；三个百炼账号用同一 `qwen3.7-flash` 协议并行抽取约 3,000–5,000 条高质量 Cue；生成 900–1,400 个候选 Seed，最终冻结 480 个 Seed 并派生 2,880 条 Life Log。
+- CR-2026-018/019/020 冻结 Cue/Seed v2 方向：WSL BGE-M3 先形成 10,000 条核心候选，再按稀有语义簇和新颖度确定性补样至 10,000–12,000 条；两个百炼账号用同一 `qwen3.7-flash` 协议并行抽取约 3,000–5,000 条高质量 Cue；生成 900–1,400 个候选 Seed，最终冻结 480 个 Seed 并派生 2,880 条 Life Log。
 - 同一生产阶段只允许一个固定模型，阶段间允许不同中国厂商模型。DeepSeek 只少量用于独立审计或争议第三意见，不做全量高成本审计；不用 Max。
 - Cue v2、Seed 和 Life Log 的分布报告写入 `egopm_bench_v1/audit/distributions/<stage>/<snapshot_id>/`，并由对应阶段 SUCCESS 绑定其 manifest SHA。
-- CR-2026-022 冻结一个 predicate、1–3 个 clause、三层 Cue 语义门与统一 Life Log 骨架；任何简短 Cue 都必须有可识别指向，正负 Life Log 必须在同一 trigger 和 Source 观察上只改变 constructed 生命周期状态。
+- CR-2026-022 冻结一个 predicate、1–3 个 clause、三层 Cue 语义门与统一 Life Log 骨架；任何简短 Cue 都必须有可识别指向，正负 Life Log 必须在同一 trigger 和 Source 观察上只改变 constructed 生命周期状态。B07 已完成离线纯函数、双 worker 验收计划和协议隔离测试，暂不调用 API、不生成正式 Cue。
 - 本文件后续旧章节若仍描述全量 Cue、35–40 Seed、约 60 候选、统一 Plus、仅 span 即可验收或正负分支替换 trigger，均只作历史背景；正式实施以 `AGENTS.md` v1.5.0、协调登记册 CR-2026-018/019/020/021/022 和 `CUE_SEED_V2_PLAN.md` 为准。
 
 ## CR-2026-022：事实性三层门与统一 Life Log 骨架
 
-**状态：设计批准；仅修改现有治理与方法文档，Schema、配置、Python 实现、测试和正式 API 运行仍待后续批次。**
+**状态：设计批准；B07 已完成 Schema、配置、Python 纯函数和隔离测试，正式 API 运行与 Cue 生成仍待后续授权。**
 
 旧 V9 已证明“JSON 合法、span 存在、ID/血缘正确”不能保证内容真实：294,839 条 accepted Cue 中约 98.62% 塌缩为 `time`，38,179 个 clause 使用哨兵值，人物/场景/活动冗余字段全空，且大量错误仍带高 confidence。新版因此不再把格式成功当作语义成功，也不要求模型为每个 Atom 强行生成 Cue。
 
@@ -30,7 +33,7 @@ Cue v2 的内容合同冻结为：一个 Atom 最多一条正式 Cue；一条 Cu
 
 确定性程序执行全部第一、二层和可规则化的第三层检查；第三层无法可靠判定的指代、角色、范围和时间语气进入结构化人工审计。另一个模型只能提供意见，不能跳过前两层或自动生成金标。一个 Atom 无清楚事实时使用 `no_cue`；一个 accepted Cue 若含多个 clause，它们必须组成同一最小充分观察条件，不能堆叠无关事实。
 
-校准和扩量采用四段式：先以 BGE proof 的 350 条 audit sample 建立人工设计校准；最终协议另取 800–1,000 条验收集，其中至少 120 条三账号重叠，先跑约 500 条受控子波次；通过后正式处理约 1,500 条 checkpoint；质量与费用稳定后再扩展剩余候选。accepted 分层语义精确率门为不低于 97%，人物角色、地点关系、否定、范围和时间语气的事实失真为 0。每个请求最多携带 5 个独立 Atom（这是传输分包上限，不是 Cue 的 clause 数量）；每条 Cue 仍只允许 1–3 个 `all_of` clause，单项最多一次简化修复；强模型只用于 ambiguous、分层抽样和拟进入 Seed 的 trigger Cue。
+校准和扩量采用四段式：先以 BGE proof 的 350 条 audit sample 建立人工设计校准；最终协议另取 800–1,000 条验收集，其中至少 120 条双账号重叠，先跑约 500 条受控子波次；通过后正式处理约 1,500 条 checkpoint；质量与费用稳定后再扩展剩余候选。accepted 分层语义精确率门为不低于 97%，人物角色、地点关系、否定、范围和时间语气的事实失真为 0。每个请求最多携带 5 个独立 Atom（这是传输分包上限，不是 Cue 的 clause 数量）；每条 Cue 仍只允许 1–3 个 `all_of` clause，单项最多一次简化修复；强模型只用于 ambiguous、分层抽样和拟进入 Seed 的 trigger Cue。
 
 Life Log 的核心 2,880 条统一为：一条目标意图创建、一条 constructed 生命周期控制、两条真实 lure 和一条真实 trigger，目标相关 Source 观察数恒为 3。同一 family 的六条日志共享 trigger、lure 和背景 Source 序列；positive/negative 只替换一条位置相同的生命周期控制事件，使同一 trigger 上的 gold 从 `remind` 翻转为 `silent`。核心负分支只使用 `completed/cancelled/expired/already_reminded`；`never_created` 若研究，另作不混算的结构消融。
 

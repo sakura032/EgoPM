@@ -427,8 +427,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-atoms", type=Path, default=ROOT / "source/source_video_atoms.jsonl")
     parser.add_argument("--source-success", type=Path, default=ROOT / "source/SOURCE_ATOMS_SUCCESS.json")
-    parser.add_argument("--cue-manifest", type=Path, default=ROOT / "cues/cue_library_manifest.json")
-    parser.add_argument("--cue-success", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
+    parser.add_argument("--cue-manifest", type=Path, help="旧 V9 输入已无默认值；阶段 D 将改为单个 Cue v2 run 输入")
+    parser.add_argument("--cue-success", type=Path, help="旧 V9 输入已无默认值；阶段 D 将删除该参数")
     parser.add_argument("--source-schema", type=Path, default=ROOT / "schemas/source_video_atom.schema.json")
     parser.add_argument("--cue-schema", type=Path, default=ROOT / "schemas/cue_candidate.schema.json")
     parser.add_argument("--retrieval-schema", type=Path, default=ROOT / "schemas/trigger_lure_set.schema.json")
@@ -439,6 +439,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--lures-per-trigger", type=int, default=4)
     parser.add_argument("--run-id")
     args = parser.parse_args(argv)
+    if args.cue_manifest is None or args.cue_success is None:
+        parser.error("当前阶段不允许默认读取 V9 Cue；请等待 Cue v2 下游接口切换")
     if args.lures_per_trigger < 2:
         parser.error("lures-per-trigger 至少为 2")
     return args

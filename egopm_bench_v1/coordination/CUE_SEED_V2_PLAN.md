@@ -2,7 +2,7 @@
 
 > 决议日期：2026-09-09  
 > 事实边界修订：2026-09-15，CR-2026-022
-> 状态：T0 已冻结项目方向、Cue 三层语义门和统一 Life Log 骨架；Schema、配置和执行代码尚未实施
+> 状态：T0 已冻结项目方向、Cue 三层语义门和统一 Life Log 骨架；批次 B 已完成 Cue v2 Schema、纯验证器、双 worker 验收计划与协议隔离的离线实现，暂不调用 API 或生成正式 Cue
 > 适用范围：Cue v2、BGE-M3 候选筛选、Seed candidates、Seed 审计和 Life Log 规模  
 > 上游：冻结 Source Atom 370,799 条，SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`
 
@@ -17,7 +17,7 @@
 | `source/**` 与 `SOURCE_ATOMS_SUCCESS.json` | `KEEP_IMMUTABLE` | BGE selection v3.1 只读上游 | 禁止重写、搬移或仅为新布局重建 |
 | `cues/formal/**`、旧 `cue_library_manifest.json`、旧 `CUE_LIBRARY_SUCCESS.json` | `ARCHIVE_IN_PLACE` | `realtime_v9_01` 结构、哈希与费用审计 | 原路径不可变；不得成为 06/07/11 的当前默认输入 |
 | 旧 realtime/package/ledger/receipt/coverage/disposition | `ARCHIVE_IN_PLACE` | 执行、恢复和费用事故审计 | 不删除、不重发、不修复、不迁入 Cue v2 账本 |
-| `cues/v2/**` | `CURRENT_TARGET` | selection、协议验收、三 worker staging、formal、manifest、SUCCESS | 后续批次只在已冻结工件预算内创建，不预建空目录 |
+| `cues/v2/**` | `CURRENT_TARGET` | selection、协议验收、两个 worker staging、formal、manifest、SUCCESS | 后续批次只在已冻结工件预算内创建，不预建空目录 |
 | `config/paths.yaml`、`model_registry.yaml`、`benchmark_protocol.yaml` | `UPDATE_LATER` | 显式区分 `legacy_cue_v9_*` 与 `cue_v2_*` | 批次 B 经破坏性 CR 修改；当前批次不动 |
 | `schemas/cue_candidate.schema.json` 与旧 inference Schema | `REPLACE_OR_LEGACY_LATER` | Cue v2 clause-level Schema 与新的模型输出 Schema | 批次 B 冻结；不同记录形状才允许独立 Schema |
 | `scripts/05_extract_cues.py` | `REWRITE_LATER` | 只消费已通过门的 BGE selection 并生产 Cue v2 | 批次 C 移除旧生产默认入口；是否保留审计读取函数由引用盘点决定 |
@@ -55,7 +55,7 @@
 
 ### 4. 本迁移的工件预算
 
-批次 A 新增正式机器文件为 **0**，新增目录为 **0**；只修改既有中文治理文档。后续每个 CR 或可独立审阅的落实单元默认最多新增 1 棵持久目录树和 5 种非分片机器工件，且每个 snapshot 实例只能产生预算列出的文件集合；分布报告固定为 4 个文件。正式数据分片、三 worker 隔离和不同记录形状 Schema 如需豁免，必须在各自批次 CR 中逐项冻结，不能沿用本批次的概括性授权。
+批次 A 新增正式机器文件为 **0**，新增目录为 **0**；只修改既有中文治理文档。后续每个 CR 或可独立审阅的落实单元默认最多新增 1 棵持久目录树和 5 种非分片机器工件，且每个 snapshot 实例只能产生预算列出的文件集合；分布报告固定为 4 个文件。正式数据分片、两个 worker 隔离和不同记录形状 Schema 如需豁免，必须在各自批次 CR 中逐项冻结，不能沿用本批次的概括性授权。
 
 ## 一、方向调整
 
@@ -65,7 +65,7 @@
 
 1. 对全量 Source 做确定性预过滤和本地 BGE-M3 多路召回；
 2. 当前 selection 先冻结 10,000 个核心候选，再按稀有语义簇和新颖度门确定性补样，最终为 10,000–12,000 个候选 Atom；
-3. 三个阿里云账号使用同一个 `qwen3.7-flash` 生产协议并行抽取 Cue v2；
+3. 两个阿里云账号使用同一个 `qwen3.7-flash` 生产协议并行抽取 Cue v2；
 4. 目标得到约 3,000–5,000 条高质量 `accepted_cue`，按 Seed 可达性停止，而不是追求固定 Cue 总量；
 5. 生成 900–1,400 个 Seed candidates；
 6. 经程序门、低成本模型审计和全部人工终审，冻结 480 个独立 Seed；
@@ -137,7 +137,8 @@ Current dimension 统一使用 `person/location/object/activity/state/explicit_t
 
 同一个正式生产阶段只能使用一个固定模型 ID、一个 prompt hash、一个推理 Schema hash 和一套采样参数。多个账号只扩展吞吐，不得改变模型语义。Cue v2 沿用 `qwen3.7-flash`；新 campaign 启动时必须冻结实际请求模型 ID、地域、端点、参数和协议 SHA。运行过程中若服务端模型映射发生不可证明的一致性变化，必须停止并新建 campaign，不能继续混写。
 
-三个阿里云账号分别绑定 `worker_00`、`worker_01`、`worker_02`。每个账号只处理预先分配且互不重叠的 partition。账号、worker、partition 不进入正式 Cue 行，但必须在私有执行账本和 shard provenance 中可追溯。
+当前协议的两个阿里云账号分别绑定 `worker_00`、`worker_01`。每个账号只处理预先分配且互不重叠的 partition。账号、worker、partition 不进入正式 Cue 行，但必须在私有执行账本和 shard provenance 中可追溯；旧三 worker 交接仅作只读历史。
+Cue v2 运行器只读取 `cue_v2_inference.schema.json`、`cue_v2_artifacts.schema.json`、`cue_extractor_v2.md` 与 `cues/v2/**`；legacy V3.6 继续只读紧凑 Schema、旧 prompt、`cues/formal/**` 和 `cues/realtime/**`。两套协议不得共享 request builder、staging、ledger 或正式输出入口，Cue v2 禁止 legacy fallback。
 
 ### 2. 阶段间允许不同模型
 
@@ -154,20 +155,23 @@ Current dimension 统一使用 `person/location/object/activity/state/explicit_t
 正式扩量前，从 BGE selection 中按 `split × participant × modality × source_group_id × 召回通道` 分层冻结 800–1,000 个 Atom，形成独立的协议验收集。它只用于验证 prompt、Schema、解析器、语义门和账号同质性，永不进入 Cue、Seed 或 benchmark，也不计入正式分布。
 
 BGE proof 已提供的 350 条分层 audit sample 先作为设计校准集，用于人工形成高质量正例、`no_cue` 例、歧义例和旧故障反例；它们帮助编写 prompt、Schema 和 validator，但不能代替 800–1,000 条最终协议验收。最终验收集在协议固定后另行冻结，其中首个约 500 条作为受控子波次；只有该子波次不触发协议修改时，结果才可与余下 300–500 条合并。若根据首波修改 prompt、Schema、operator 或语义门，整个验收身份作废并使用新集合重新开始。
+当前 `_02` proof 的 350 条 `audit_sample` 按七个固定 `sample_stratum` 各自使用 `sample_index=1..50`。校准身份固定为 `(sample_stratum, sample_index, atom_id)`，计划按 `Activity`、`Explicit-Time`、`Location`、`Object`、`Person`、`State`、`diversity_only` 的顺序派生 `calibration_index=1..350`；该编号只存在于内存验收计划，不回写或改编号原始 proof。未知层名、重复局部编号、重复 Atom 或缺层仍是硬阻断。
 
-其中至少 120 个重叠 Atom 必须由三个阿里云账号分别处理一次，用于检测账号、地域、端点或服务端映射差异。验收只保存结构化输出、无正文 disposition、安全错误码、人工标签和聚合统计，仍然禁止保存原始模型响应。
+采用 `adopted_external_v1` 时，BGE 预检返回 `data_gate=passed`、`provenance_gate=warning`、`provenance_status=origin_schema_unavailable` 和 `ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE`。该 warning 不属于下游阻断条件，允许候选进入 Cue v2 生成；若采用本地 Schema 做结构校验，只记录为 `effective_validation_schema`，不得声称它就是原始产生 Schema。它限制的是 BGE 原始可复现性声明，而不是 Source→Cue 三层事实门。
 
-扩量门至少要求：第一层字段内连续 span 合法率 100%；第二层 value 直接支持率 100%；哨兵字符串、跨字段/跨 Atom 借证、无法解析指向对象为 0；Schema 有效率不低于 99.5%；accepted Cue 的分层三层语义精确率不低于 97%；人物角色、地点关系、否定、范围和时间语气的事实失真为 0；`no_cue` 与各 clause dimension 单独报告精确率/召回率；三个账号重叠样本的结构和语义差异均经人工解释，不存在系统性漂移。任一门失败时必须修改协议并产生新的验收集 ID，旧验收结果不得与新协议合并，也不得直接扩大正式调用。
+其中至少 120 个重叠 Atom 必须由两个阿里云账号分别处理一次，用于检测账号、地域、端点或服务端映射差异。验收只保存结构化输出、无正文 disposition、安全错误码、人工标签和聚合统计，仍然禁止保存原始模型响应。
+
+扩量门至少要求：第一层字段内连续 span 合法率 100%；第二层 value 直接支持率 100%；哨兵字符串、跨字段/跨 Atom 借证、无法解析指向对象为 0；Schema 有效率不低于 99.5%；accepted Cue 的分层三层语义精确率不低于 97%；人物角色、地点关系、否定、范围和时间语气的事实失真为 0；`no_cue` 与各 clause dimension 单独报告精确率/召回率；两个账号重叠样本的结构和语义差异均经人工解释，不存在系统性漂移。任一门失败时必须修改协议并产生新的验收集 ID，旧验收结果不得与新协议合并，也不得直接扩大正式调用。
 
 ## 四、BGE-M3 候选筛选
 
-BGE-M3 在 WSL2 中本地单 GPU、单编码进程运行。当前正式 selection 为 `bge_m3_source_select_v3_1_20260910_01`。Windows 仓库中的 `wsl_BGE-M3_filter/` 是可搬运执行包；WSL 输出返回 Windows 后进入：
+BGE-M3 在 WSL2 中本地单 GPU、单编码进程运行。当前正式 selection 为 `bge_m3_source_select_v3_1_20260914_02`。Windows 仓库中的 `wsl_BGE-M3_filter/` 是可搬运执行包；WSL 输出返回 Windows 后进入：
 
 ```text
 egopm_bench_v1/cues/v2/source_selection/<selection_id>/
 ```
 
-输入已拆分为：只读 Source/Source SUCCESS、无自身 SHA 的根 `selection_request.json`、独立 `model_config.json`、48 行 `query_set.jsonl`、独立 `selection_policy.json` 和两个必要 Schema。根请求 SHA256 为 `921024d8b4621fb8f8a8d600e191f4ba3d7406325bc4b5a17954863b7f435baa`；模型配置 SHA256 为 `f3c94a036343435c31cba9b953434da300d81dbe2cead4d0df5f06a6fa6470d2`；查询集 SHA256 为 `b248b33bb1f4a96ad93ca1effdcc3c830ab58296ca6de7f501226b7ca57d2cd1`；策略 SHA256 为 `02f812f01a72fd50cda220c7fc31f49e0483be36980dd1bd208685a525508065`；Source 行 Schema SHA256 为 `0d576ed34f4a4d19fa38294392bb277306bba145f0492015fe909709c8be92e4`；统一 artifact Schema SHA256 为 `283c6de2a0bf7ab3a222b76ab65ba6c1fa6010fe569b6b9dc1f9b08de4b0e3da`。不另建 schema manifest、Source SUCCESS Schema 或规范化向量文件；相关 proof 类型统一为 artifact Schema 内的 `$defs`。组件任一字节变化都必须新建 selection ID。
+当前快照的 manifest 绑定根请求 SHA256 为 `4e4c79d33e9ce8bd4a0636b92448fc8c500532f885db47519a135c837d8e359d`、Source 行 Schema SHA256 为 `0d576ed34f4a4d19fa38294392bb277306bba145f0492015fe909709c8be92e4`、Source SHA256 为 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`，外部 artifact Schema SHA256 为 `fb6f619cf0bfb81074f95fb1f471dcbec66af5023dd5085c8b543a2589d8a261`。该原始 artifact Schema 在 Windows 权威目录不可用，因此按 `adopted_external_v1` 兼容导入并保留 provenance warning；不得伪造或删除 manifest 原始 SHA。不另建 schema manifest、Source SUCCESS Schema 或规范化向量文件；相关 proof 类型统一为 artifact Schema 内的 `$defs`。组件任一字节变化都必须新建 selection ID。
 
 BGE 执行包的机器合同固定为 7 个小文件：根请求、旁路 SHA、模型配置、查询 JSONL、选择策略和两个 Schema；用户另复制既有 Source/Source SUCCESS，不为它们生成包装 JSON。正式回传恰好 5 个文件。query hit、候选 provenance、cluster/shard 汇总和人工样本使用一个异构 `selection_proof.jsonl`，全部统计使用一个 `selection_report.json`，不按查询族、cluster、shard 或 proof 类型拆文件。
 
@@ -217,11 +221,11 @@ BGE 只决定“哪些 Atom 值得交给生成模型”。正式 `candidate_atom
 
 T4 不重跑 BGE，可以从 proof 与 Source 独立重算 rank 连续性、RRF、primary attribution、候选成员、离散配额和分布报告。T4 无法从小文件证明全库 BGE top-k 数值完备性、embedding 正确性或全量 cluster 指派；这些由 WSL 本地完整审计验证，并由 manifest 绑定审计 Merkle 根、固定源码、模型 revision 和依赖锁。该边界必须在数据集卡和论文方法中明示。
 
-## 五、三个 API 终端并行合同
+## 五、两个 API 终端并行合同
 
 ### 1. 静态分配
 
-协调器在任何 API 调用前生成唯一 `campaign_manifest.json`，其中冻结全部 partition、每个 partition 的 Atom 范围、所属 worker、模型、协议 SHA 和预算上限。三个终端不得自行领取任务或修改 partition。
+协调器在任何 API 调用前生成唯一 `campaign_manifest.json`，其中冻结全部 partition、每个 partition 的 Atom 范围、所属 worker、模型、协议 SHA 和预算上限。两个终端不得自行领取任务或修改 partition。
 
 ### 2. 请求 ID
 
@@ -238,9 +242,9 @@ T4 不重跑 BGE，可以从 proof 与 Source 独立重算 rank 连续性、RRF�
 过去发生过重复 request ID、Wave/累计账本不一致和共享预算身份冲突，新版禁止多个 worker 追加任何共享账本：
 
 - 每个 worker 有独立授权文件、独立预算上限、独立 request ledger 和独立费用快照；
-- 总预算在运行前拆成三个不可重叠的硬额度，worker 不得借用其他额度；
+- 总预算在运行前拆成两个不可重叠的硬额度，worker 不得借用其他额度；
 - worker 只原子更新自己的状态文件；
-- 协调器只读三个已关闭账本，按 request ID 集合构造累计账本；
+- 协调器只读两个已关闭账本，按 request ID 集合构造累计账本；
 - 聚合若发现任何重复 request ID、费用事件缺失、终态冲突或身份不一致，立即阻断，不自动重发；
 - 恢复只扫描本 worker、本 partition 的未终态请求；已计费、已成功或已有终态的 Atom 永不自动重发；
 - 迁移只能由确定性工具生成新账本并保留全部历史费用事件，不得手改 JSONL 或删除冲突行。
@@ -424,18 +428,18 @@ Cue ID、predicate、trigger/lure 角色、生命周期前后状态、counterfac
 | 修复只覆盖显式失败，不覆盖伪成功 | 对 accepted 也执行语义门和分层人工抽检 |
 | 重复 request ID | 五级确定性 ID、worker 命名空间和聚合唯一性门 |
 | 累计账本与终态冲突 | worker 独立账本；协调器只读集合聚合，不并发追加 |
-| 共享预算身份冲突 | 三个独立授权和硬预算切片；总预算由 campaign manifest 绑定 |
+| 共享预算身份冲突 | 两个独立授权和硬预算切片；总预算由 campaign manifest 绑定 |
 | 恢复时误重发 | 仅恢复本 worker 未终态 request；任何冲突先阻断、后迁移 |
 | 完整验证占用约 5.5 GB 内存 | 分片流式验证；近重复索引独立执行并使用磁盘/分桶算法 |
 | BGE 依赖在下游启动时仍缺失 | WSL 环境、模型 revision、自检和 selection SUCCESS 先于 Cue API |
 
 ## 十一、实施顺序
 
-当前只冻结计划，不修改 Python、Schema 或配置，也不运行 API。后续顺序必须是：
+批次 B 至 B07 已完成 Cue v2 Schema、配置、纯验证器、BGE 兼容导入预检、协议验收计划和协议隔离测试；仍不运行 API、不生成正式 Cue。后续顺序必须是：
 
 ### 0. 先清点并隔离 legacy 接口
 
-当前仓库仍可见的 `cue_candidate.schema.json`、`cue_inference_batch_v1.schema.json`、`cue_inference_batch_compact_v1.schema.json`、`reminder_seed.schema.json`、`model_registry.yaml` 以及 `prompts/seed_generator_v1.md` 中的 `time/place/state_change`、短码和 `primary_cue_type`，均属于旧执行接口或待批次 B/C 更新的实现材料。它们不能被解释为本计划已经冻结的 Cue v2 合同，也不能被 Seed 入口读取。批次 B/C 必须逐项完成以下迁移后才可解除该隔离：
+当前仓库仍可见的 `cue_candidate.schema.json`、`cue_inference_batch_v1.schema.json`、`cue_inference_batch_compact_v1.schema.json`、`reminder_seed.schema.json`、legacy `model_registry.yaml` 分支以及 `prompts/seed_generator_v1.md` 中的 `time/place/state_change`、短码和 `primary_cue_type`，均属于只读 legacy 执行接口。它们不能被解释为 Cue v2 合同，也不能被 v2 或 Seed 入口读取；v2 只使用独立 Schema、prompt、配置键和 `cues/v2/**` 路径。
 
 - 将正式 Cue Schema、推理 Schema、配置编码表和 Seed Schema 的 current dimension 统一为 `person/location/object/activity/state/explicit_time`，并删除顶层 `cue_type`、`primary_cue_type` 等旧血缘字段；
 - 将推理字段改为单一原字段连续 `span`，在解析器中实现一 Atom 一 Cue、一个 predicate、1–3 个 `all_of` clause 及三层质量门；
@@ -443,13 +447,13 @@ Cue ID、predicate、trigger/lure 角色、生命周期前后状态、counterfac
 - 对迁移前的旧 Schema/fixture/执行器保留只读审计身份，增加稳定的 legacy 拒绝错误码；任何旧 manifest、旧短码或旧 dimension 进入正式入口都必须在读取前阻断。
 
 1. T0 以 CR-018/019/020/021/022 冻结 Cue v2 Schema 方向、模型政策、事实性三层门、统一 Life Log 骨架、SUCCESS 字段和工件预算；批次 B 再把 operator、错误码和推荐数值落实到 Schema/配置；
-2. T2 只做无 API 实现：BGE 导入器、Cue v2 prompt/解析器、三个 worker 的独立预算/账本/lease/恢复机制，以及唯一 formalizer；
+2. T2 只做无 API 实现：BGE 导入器、Cue v2 prompt/解析器、两个 worker 的独立预算/账本/lease/恢复机制，以及唯一 formalizer；
 3. T4 只做无生产数据实现：语义门、账本一致性门、分布报告和阶段 SUCCESS validator；
 4. 在 WSL 建立专用环境，完成 BGE-M3 自检并生成带输入 SHA 的 selection request；
 5. WSL 单进程生成 Source selection，回传 Windows 指定目录，由 T4 验证 SHA、覆盖、互斥和分布；
-6. 先完成人工标注的 350 条设计校准，再冻结 800–1,000 个协议验收 Atom，其中至少 120 个由三个账号重叠处理；验收先跑约 500 条不改协议的受控子波次；
-7. 验收通过后冻结 Cue 协议 SHA、静态 partition、三个账号的独立授权和预算切片；
-8. 用户在三个终端分别执行单行 PowerShell API 命令；生产先关闭约 1,500 条 checkpoint，质量、费用和 worker 漂移通过后才能继续；生产者只能写各自 staging 与私有账本；
+6. 先完成人工标注的 350 条设计校准，再冻结 800–1,000 个协议验收 Atom，其中至少 120 个由两个账号重叠处理；验收先跑约 500 条不改协议的受控子波次；
+7. 验收通过后冻结 Cue 协议 SHA、静态 partition、两个账号的独立授权和预算切片；
+8. 用户在两个终端分别执行单行 PowerShell API 命令；生产先关闭约 1,500 条 checkpoint，质量、费用和 worker 漂移通过后才能继续；生产者只能写各自 staging 与私有账本；
 9. 唯一协调器关闭所有 worker 后，完成 ambiguous 终态、formal 分片、全局分布、T4 QA、manifest 和 Cue SUCCESS；
 10. T0 冻结 Seed Schema、单文件布局、900–1,400 候选停止规则、阶段模型和审计抽样合同；
 11. T2 生成 Seed candidates，T4 验 trigger/lure 唯一性、同组/跨组构成、血缘、失败子句和分布；
@@ -458,3 +462,4 @@ Cue ID、predicate、trigger/lure 角色、生命周期前后状态、counterfac
 14. 生成 2,880 条 Life Log，由确定性 oracle 产生 gold，最后完成分布报告和全链路 QA。
 
 任何下游阶段都不得在上游 manifest、分布报告、T4 QA 与阶段 SUCCESS 全部成立前提前读取“看起来已完成”的局部文件。
+CR-2026-022 第四步接纳 `_02` 为外部优化结果兼容导入；原 Schema 不可用仅记录 provenance warning，anytime solver 不得作全局最优表述，三层事实门不放宽。

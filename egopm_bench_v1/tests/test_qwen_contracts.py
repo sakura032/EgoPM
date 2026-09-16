@@ -18,8 +18,12 @@ from types import SimpleNamespace
 from urllib import error as urlerror
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
+
+# 本文件覆盖 V3.6 realtime、worker 与 BGE 协议验收历史；当前 Cue v2 使用独立轻量测试。
+pytestmark = pytest.mark.legacy_v36
 
 
 def module() -> Any:
@@ -63,6 +67,7 @@ def buckets(value: Any, policy: Any) -> tuple[Any, Any]:
     return value.TokenBucket(policy.requests_per_minute), value.TokenBucket(policy.tokens_per_minute)
 
 
+@pytest.mark.legacy_v36
 def test_realtime_config_is_frozen() -> None:
     """模型、包大小、输出上限、重试、价格和传输必须来自 T0 冻结配置。"""
     value = module()
@@ -72,6 +77,7 @@ def test_realtime_config_is_frozen() -> None:
     assert (policy.request_endpoint, policy.input_price_cny_per_million_tokens, policy.output_price_cny_per_million_tokens) == ("/chat/completions", 0.2, 0.8)
 
 
+@pytest.mark.legacy_v36
 def test_token_bucket_waits_under_fake_clock() -> None:
     """客户端 RPM/TPM 桶耗尽后必须等待补充，不能无节制发送请求。"""
     value = module(); now = [0.0]; sleeps: list[float] = []
@@ -80,6 +86,7 @@ def test_token_bucket_waits_under_fake_clock() -> None:
     assert sleeps == [30.0]
 
 
+@pytest.mark.legacy_v36
 def test_transient_retry_success_and_recovery_skip(tmp_path: Path) -> None:
     """临时 429 可重试，完成包恢复时必须跳过且不得再次调用传输器。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -97,6 +104,7 @@ def test_transient_retry_success_and_recovery_skip(tmp_path: Path) -> None:
     assert "choices" not in (root / "packages" / manifest["package_id"] / "realtime_state.json").read_text(encoding="utf-8")
 
 
+@pytest.mark.legacy_v36
 def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     """本地验证失败隔离不重试，预算超限熔断，实时状态拒绝 Batch 根和字段。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -116,6 +124,7 @@ def test_quarantine_budget_and_batch_mixing_are_stopped(tmp_path: Path) -> None:
     with pytest.raises(value.ContractError, match="Batch"): value.validate_realtime_ledger_event({**result[2], "batch_custom_id": "x"})
 
 
+@pytest.mark.legacy_v36
 def test_wave_coverage_close_writes_ledger_then_marks_resolved(tmp_path: Path) -> None:
     """覆盖闭合成功时先原子落盘覆盖账本，再把审计 package 标为已处置。"""
     value = module(); settings, *_ = setup(value)
@@ -136,6 +145,7 @@ def test_wave_coverage_close_writes_ledger_then_marks_resolved(tmp_path: Path) -
     assert state["status"] == "excluded_after_repair" and state["item_audit_resolved"] is True
 
 
+@pytest.mark.legacy_v36
 def test_wave_coverage_close_is_transactional_on_mid_failure(tmp_path: Path) -> None:
     """覆盖闭合中途失败不得写入覆盖账本，也不得把已通过校验的 package 标为已处置。"""
     value = module(); settings, *_ = setup(value)
@@ -165,6 +175,7 @@ def test_wave_coverage_close_is_transactional_on_mid_failure(tmp_path: Path) -> 
     assert "item_audit_resolved" not in state_a
 
 
+@pytest.mark.legacy_v36
 def test_wave_coverage_close_records_content_filtered_package(tmp_path: Path) -> None:
     """被内容过滤的 package 无结果文件，闭合须为全部 Atom 写 excluded_content_filtered。"""
     value = module(); settings, *_ = setup(value)
@@ -186,6 +197,7 @@ def test_wave_coverage_close_records_content_filtered_package(tmp_path: Path) ->
     assert records[0]["code"] == "data_inspection_failed" and records[0]["path"] is None and records[0]["attempt"] == 1
 
 
+@pytest.mark.legacy_v36
 def test_realtime_run_continues_after_content_filtered_without_stopping(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """内容过滤包不得停掉整波：混合 content_filtered 与成功的波次应以 completed 收尾。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -220,6 +232,7 @@ def test_realtime_run_continues_after_content_filtered_without_stopping(tmp_path
         (json.dumps({"items": [{"n": 0, "p": [["A", "=", "活动"]], "f": "V", "start": 0, "end": 999, "c": 80, "v": "A"}]}, ensure_ascii=False), "SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE", "/items/0/end"),
     ],
 )
+@pytest.mark.legacy_v36
 def test_local_validation_failure_records_safe_category_only(tmp_path: Path, payload: str, expected_code: str, expected_path: str) -> None:
     """本地失败必须逐项审计，且状态与队列不含模型输出正文。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -242,6 +255,7 @@ def test_local_validation_failure_records_safe_category_only(tmp_path: Path, pay
     value.validate_realtime_ledger_event(result[2])
 
 
+@pytest.mark.legacy_v36
 def test_json_parse_repairs_each_known_atom_without_replaying_package(tmp_path: Path) -> None:
     """整包 JSON 解析失败要把两个已知 Atom 分别修复，修复成功后不留审计队列。"""
     value = module(); settings, policy, _manifest, rows = setup(value)
@@ -270,6 +284,7 @@ def test_json_parse_repairs_each_known_atom_without_replaying_package(tmp_path: 
     assert "choices" not in (package_dir / "realtime_state.json").read_text(encoding="utf-8")
 
 
+@pytest.mark.legacy_v36
 def test_repair_usage_crossing_budget_stops_before_later_repairs(tmp_path: Path) -> None:
     """首轮已计费后，第一项 repair 越过预算时不得继续发送后续修复请求。"""
     value = module(); settings, policy, _manifest, rows = setup(value)
@@ -290,6 +305,7 @@ def test_repair_usage_crossing_budget_stops_before_later_repairs(tmp_path: Path)
     assert tracker.spent_cny() > tracker.maximum_cny
 
 
+@pytest.mark.legacy_v36
 def test_http_400_has_safe_diagnostic_without_raw_body() -> None:
     """HTTP 400 必须终结为无正文诊断，且不把原始错误体暴露给运行状态。"""
     value = module(); settings, policy, *_ = setup(value)
@@ -303,6 +319,7 @@ def test_http_400_has_safe_diagnostic_without_raw_body() -> None:
     assert "{" not in str(caught.value)
 
 
+@pytest.mark.legacy_v36
 def test_permanent_http_400_writes_safe_failed_terminal_state(tmp_path: Path) -> None:
     """不可重试的 400 要写可恢复失败终态与诊断，但不写服务端原始正文。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -316,6 +333,7 @@ def test_permanent_http_400_writes_safe_failed_terminal_state(tmp_path: Path) ->
     assert "choices" not in json.dumps(state, ensure_ascii=False)
 
 
+@pytest.mark.legacy_v36
 def test_content_inspection_failure_is_content_filtered_terminal_not_wave_stop(tmp_path: Path) -> None:
     """内容安全过滤 400 必须归为逐条 content_filtered 终态，而不是停掉整波。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -336,6 +354,7 @@ def test_content_inspection_failure_is_content_filtered_terminal_not_wave_stop(t
     assert len(rows) == 1 and rows[0]["package_id"] == manifest["package_id"]
 
 
+@pytest.mark.legacy_v36
 def test_recovery_skips_existing_content_filtered_terminal_without_transport(tmp_path: Path) -> None:
     """已落盘的 content_filtered 包在恢复时必须被识别为终态跳过，不能再次请求服务。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -358,6 +377,7 @@ def test_recovery_skips_existing_content_filtered_terminal_without_transport(tmp
     assert result == ("recovered_content_filtered", 0.0, {"outcome": "recovered_content_filtered"})
 
 
+@pytest.mark.legacy_v36
 def test_server_compatible_inference_schema_keeps_entity_deduplication_locally() -> None:
     """服务端不支持 uniqueItems 时，本地解析仍须拒绝重复实体。"""
     value = module(); settings, _policy, _manifest, rows = setup(value)
@@ -370,6 +390,7 @@ def test_server_compatible_inference_schema_keeps_entity_deduplication_locally()
         value.parse_inference_items(duplicate, [rows["src_a_001"]], inference_validator, cue_validator, settings, "synthetic")
 
 
+@pytest.mark.legacy_v36
 def test_position_evidence_uses_declared_single_field_and_keeps_original_span() -> None:
     """位置证据只能在 f 指定字段切片，保存内容必须是程序从原字段取回的原文。"""
     value = module(); settings, _policy, _manifest, rows = setup(value)
@@ -380,6 +401,7 @@ def test_position_evidence_uses_declared_single_field_and_keeps_original_span() 
 
 
 @pytest.mark.parametrize(("start", "end", "expected"), [(0, 0, "INFERENCE_SCHEMA_MINIMUM"), (0, 99, "SUPPORTING_TEXT_OFFSET_OUT_OF_RANGE")])
+@pytest.mark.legacy_v36
 def test_position_evidence_rejects_invalid_unicode_codepoint_offsets(start: int, end: int, expected: str) -> None:
     """偏移必须是同一字段的左闭右开 Unicode code-point 范围，不能借其他字段或越界。"""
     value = module(); settings, _policy, _manifest, rows = setup(value)
@@ -389,6 +411,7 @@ def test_position_evidence_rejects_invalid_unicode_codepoint_offsets(start: int,
         value.parse_inference_items(payload, [rows["src_a_001"]], iv, cv, settings, "synthetic")
 
 
+@pytest.mark.legacy_v36
 def test_request_keeps_three_evidence_fields_separate() -> None:
     """请求正文必须逐字段保留证据，禁止在进入模型前拼成不可审计的 text。"""
     value = module(); settings, _policy, _manifest, rows = setup(value)
@@ -399,6 +422,7 @@ def test_request_keeps_three_evidence_fields_separate() -> None:
     assert items == [{"item_index": 0, "transcript": "转录", "dense_caption": "描述", "visible_text": "可见"}]
 
 
+@pytest.mark.legacy_v36
 def test_item_failure_keeps_sibling_cue_and_enters_one_repair_audit_queue(tmp_path: Path) -> None:
     """五项包中的一项失败不得抹去同包有效 Cue；修复仅发送失败 Atom 一次后进入审计。"""
     value = module(); settings, policy, _manifest, rows = setup(value)
@@ -431,6 +455,7 @@ def test_item_failure_keeps_sibling_cue_and_enters_one_repair_audit_queue(tmp_pa
     assert "choices" not in (package_dir / "realtime_state.json").read_text(encoding="utf-8")
 
 
+@pytest.mark.legacy_v36
 def test_position_protocol_rejects_model_text_field() -> None:
     """模型不得回传 x；Schema 要求只保留字段码与 Unicode code-point 位置。"""
     value = module(); settings, _policy, _manifest, rows = setup(value)
@@ -440,6 +465,7 @@ def test_position_protocol_rejects_model_text_field() -> None:
         value.parse_inference_items(payload, [rows["src_a_001"]], iv, cv, settings, "synthetic")
 
 
+@pytest.mark.legacy_v36
 def test_materialize_realtime_wave_stops_after_selected_shards(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Wave 1 只能保留十个 shard，并在越过边界后停止读取完整 Source。"""
     value = module(); settings, _policy, _manifest, _rows = setup(value)
@@ -466,6 +492,7 @@ def test_materialize_realtime_wave_stops_after_selected_shards(tmp_path: Path, m
     assert progress[-1] == (5_000, 5_000)
 
 
+@pytest.mark.legacy_v36
 def test_atomic_replace_retries_windows_share_lock(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Windows 短暂占用应重试成功，且替换前的真实状态文件不会被预先删除。"""
     value = module(); target = tmp_path / "state.json"; target.write_text('{"old":true}\n', encoding="utf-8")
@@ -482,6 +509,7 @@ def test_atomic_replace_retries_windows_share_lock(tmp_path: Path, monkeypatch: 
     assert calls[0] == 2 and target.read_text(encoding="utf-8") == '{"new":true}\n'
 
 
+@pytest.mark.legacy_v36
 def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """调度器最多保留十个在飞包，并在无正文 progress.json 记录完成数和 ETA。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -511,6 +539,7 @@ def test_realtime_run_limits_inflight_and_writes_progress(tmp_path: Path, monkey
     assert "source_text" not in json.dumps(progress, ensure_ascii=False)
 
 
+@pytest.mark.legacy_v36
 def test_realtime_run_transient_failure_does_not_stop_wave(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """单个网络/服务端瞬断不得停整波，也不得写账本；下一轮恢复会把它当未完成重发。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -543,6 +572,7 @@ def test_realtime_run_transient_failure_does_not_stop_wave(tmp_path: Path, monke
     assert first_id not in ledger_ids
 
 
+@pytest.mark.legacy_v36
 def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """恢复必须保留隔离计数、不重写账本，并只让尚未请求的包进入假执行器。"""
     value = module(); settings, policy, first, rows = setup(value)
@@ -581,6 +611,7 @@ def test_realtime_resume_skips_accounted_quarantine_and_submits_only_unseen(tmp_
     assert [event["realtime_request_id"] for event in events].count(first["realtime_request_id"]) == 1
 
 
+@pytest.mark.legacy_v36
 def test_legacy_json_parse_quarantine_migrates_to_item_audit_without_transport(tmp_path: Path) -> None:
     """v8 旧 JSON_PARSE 隔离仅生成安全审计项，恢复时不得重新调用服务。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -610,6 +641,7 @@ def test_legacy_json_parse_quarantine_migrates_to_item_audit_without_transport(t
     )
 
 
+@pytest.mark.legacy_v36
 def test_reconcile_package_ledger_backfills_missing_cumulative_audit_event(tmp_path: Path) -> None:
     """已有逐项审计 package 的安全账本可补回累计账本，恢复时无需重发。"""
     value = module(); settings, policy, manifest, rows = setup(value)
@@ -627,6 +659,7 @@ def test_reconcile_package_ledger_backfills_missing_cumulative_audit_event(tmp_p
     assert (wave_root / settings.layout["run_ledger_filename"]).is_file()
 
 
+@pytest.mark.legacy_v36
 def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> None:
     """Wave 2 必须从共享无正文账本继承 Wave 1 已发生费用，不能重新获得完整 ¥80。"""
     value = module(); _settings, policy, manifest, _rows = setup(value)
@@ -641,6 +674,7 @@ def test_cumulative_budget_is_shared_across_wave_directories(tmp_path: Path) -> 
     assert cumulative["accounted_request_count"] == 1 and "source_text" not in json.dumps(cumulative, ensure_ascii=False)
 
 
+@pytest.mark.legacy_v36
 def test_later_wave_requires_each_prior_wave_to_complete(tmp_path: Path) -> None:
     """启动 Wave 2 前必须离线确认 Wave 1 同 run/Source/协议下零失败地完整完成。"""
     value = module(); settings, _policy, *_ = setup(value)
@@ -657,3 +691,420 @@ def test_later_wave_requires_each_prior_wave_to_complete(tmp_path: Path) -> None
     value.atomic_write_json(tmp_path / "wave_01" / "progress.json", success)
     with pytest.raises(value.ContractError, match="尚未完整成功"):
         value.require_completed_prior_waves(tmp_path, 2, preflight, settings)
+
+
+def cue_v2_item(disposition: str, clauses: list[dict[str, Any]], reasons: list[str] | None = None) -> dict[str, Any]:
+    """构造内存 Cue v2 推理项，确保纯函数测试不写入任何正式路径。"""
+
+    return {"item_index": 0, "disposition": disposition, "predicate": {"all_of": clauses}, "reason_codes": reasons or []}
+
+
+def cue_v2_clause(dimension: str, operator: str, value: str, field: str = "transcript", span: str | None = None) -> dict[str, Any]:
+    """构造具备独立同字段证据的最小 clause，正文只存在于测试内存。"""
+
+    return {"dimension": dimension, "operator": operator, "value": value, "evidence": {"field": field, "span": span if span is not None else value}}
+
+
+def cue_v2_matrix() -> dict[str, list[str]]:
+    """返回与冻结配置相同的矩阵，使纯函数不依赖文件或旧 Settings。"""
+
+    return {"person": ["present", "absent", "speaking", "mentioned"], "location": ["at", "not_at", "entering", "leaving", "mentioned"], "object": ["present", "absent", "held", "placed"], "activity": ["starts", "ongoing", "ends", "not_occurring"], "state": ["is", "is_not", "changes_to"], "explicit_time": ["stated", "planned", "hypothetical"]}
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_normalization_and_direct_support_are_strict() -> None:
+    """NFKC 和空白可以规范化，但大小写、标点、翻译或词序变化不能伪装为直接支持。"""
+
+    value = module()
+    assert value.normalize_cue_v2_text(" Ａ\u3000手机\n") == "A 手机"
+    atom_value = {"transcript": "A 手机。", "dense_caption": "另一字段"}
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "手机", span="A 手机。")] ), atom_value, cue_v2_matrix())["status"] == "accepted_machine"
+    for unsupported in ("a", "A手机", "phone", "手机A"):
+        result = value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", unsupported, span="A 手机。")]), atom_value, cue_v2_matrix())
+        assert result["status"] == "rejected"
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_evidence_and_structure_gates_are_safe() -> None:
+    """字段内连续证据、终态结构与哨兵值必须在不泄露正文的前提下阻断。"""
+
+    value = module(); atom_value = {"transcript": "手机出现", "dense_caption": "杯子出现", "visible_text": "秘密正文"}
+    good = cue_v2_clause("object", "present", "手机", span="手机出现")
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [good]), atom_value, cue_v2_matrix())["status"] == "accepted_machine"
+    cross = cue_v2_clause("object", "present", "杯子", "transcript", "杯子出现")
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cross]), atom_value, cue_v2_matrix())["issues"][0]["code"] == "CROSS_FIELD_EVIDENCE"
+    visible = cue_v2_clause("object", "present", "秘密", "visible_text", "秘密正文")
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [visible]), atom_value, cue_v2_matrix())["status"] == "rejected"
+    for sentinel in ("null", "none", "unknown", "n/a", "未知"):
+        assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", sentinel, span=sentinel)]), {"transcript": sentinel, "dense_caption": "x"}, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", []), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [good] * 4), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [good], ["INSUFFICIENT_EVIDENCE"]), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("no_cue", [good], ["NO_OBSERVABLE_CONDITION"]), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("ambiguous", [], []), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("no_cue", [], ["NO_OBSERVABLE_CONDITION"] * 2), atom_value, cue_v2_matrix())["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("ambiguous", [], ["AMBIGUOUS_SCOPE"]), atom_value, cue_v2_matrix())["status"] == "needs_semantic_audit"
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_semantic_rules_are_conservative_and_input_is_unchanged() -> None:
+    """角色、极性、地点、范围和时间语气不明时审计或拒绝，且纯函数不得修改输入。"""
+
+    value = module(); matrix = cue_v2_matrix()
+    atom_value = {"transcript": "Alice 没拿手机。如果明天三点开会。", "dense_caption": "冰箱出现。门打开了。"}
+    original_atom = json.loads(json.dumps(atom_value, ensure_ascii=False))
+    mentioned = cue_v2_item("accepted_cue", [cue_v2_clause("person", "present", "Alice", span="Alice")])
+    assert value.validate_cue_v2_inference_item(mentioned, atom_value, matrix)["status"] == "needs_semantic_audit"
+    speaking = cue_v2_item("accepted_cue", [cue_v2_clause("person", "speaking", "Alice", span="Alice")])
+    assert value.validate_cue_v2_inference_item(speaking, atom_value, matrix)["issues"][0]["code"] == "PERSON_ROLE_MISMATCH"
+    negative = cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "手机", span="没拿手机")])
+    assert value.validate_cue_v2_inference_item(negative, atom_value, matrix)["issues"][0]["code"] == "OPERATOR_POLARITY_MISMATCH"
+    location = cue_v2_item("accepted_cue", [cue_v2_clause("location", "at", "厨房", "dense_caption", "冰箱出现")])
+    assert value.validate_cue_v2_inference_item(location, atom_value, matrix)["status"] == "rejected"
+    bad_pair = cue_v2_item("accepted_cue", [cue_v2_clause("person", "held", "Alice", span="Alice")])
+    assert value.validate_cue_v2_inference_item(bad_pair, atom_value, matrix)["issues"][0]["code"] == "SEMANTIC_DIMENSION_MISMATCH"
+    time = cue_v2_item("accepted_cue", [cue_v2_clause("explicit_time", "stated", "明天三点", span="如果明天三点开会")])
+    assert value.validate_cue_v2_inference_item(time, atom_value, matrix)["issues"][0]["code"] == "TEMPORAL_MODALITY_MISMATCH"
+    leaked = value.validate_cue_v2_inference_item(negative, atom_value, matrix)
+    assert "手机" not in json.dumps(leaked, ensure_ascii=False) and atom_value == original_atom
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_all_dimensions_and_remaining_conservative_boundaries() -> None:
+    """六维合法关系可通过结构门；范围、空承载活动状态和视频数字不得被升格为事实。"""
+
+    value = module(); matrix = cue_v2_matrix()
+    cases = [
+        ("person", "speaking", "Alice", "Alice: hello"), ("location", "mentioned", "厨房", "厨房"),
+        ("object", "held", "手机", "拿着手机"), ("activity", "ongoing", "洗碗", "洗碗"),
+        ("state", "is", "门已打开", "门已打开"), ("explicit_time", "stated", "下午3点", "下午3点"),
+    ]
+    for dimension, operator, item_value, span in cases:
+        result = value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause(dimension, operator, item_value, span=span)]), {"transcript": span, "dense_caption": "x"}, matrix)
+        assert result["status"] in {"accepted_machine", "needs_semantic_audit"}
+    clauses = [cue_v2_clause("object", "present", "手机", span="手机"), cue_v2_clause("location", "mentioned", "厨房", span="厨房"), cue_v2_clause("activity", "ongoing", "洗碗", span="洗碗")]
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", clauses), {"transcript": "手机 厨房 洗碗", "dense_caption": "x"}, matrix)["status"] == "needs_semantic_audit"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "手机", span="所有手机")]), {"transcript": "所有手机", "dense_caption": "x"}, matrix)["issues"][0]["code"] == "SCOPE_MISMATCH"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("activity", "ongoing", "正在做")]), {"transcript": "正在做", "dense_caption": "x"}, matrix)["status"] == "rejected"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("state", "is", "打开了")]), {"transcript": "打开了", "dense_caption": "x"}, matrix)["status"] == "needs_semantic_audit"
+    assert value.validate_cue_v2_inference_item(cue_v2_item("accepted_cue", [cue_v2_clause("explicit_time", "stated", "120")]), {"transcript": "120", "dense_caption": "x", "local_start_sec": 120}, matrix)["status"] == "rejected"
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_english_negation_and_scope_require_whole_tokens() -> None:
+    """英文否定和范围词只能按完整 token 生效，不能把普通单词的子串改造成极性或范围。"""
+
+    value = module(); matrix = cue_v2_matrix()
+    notebook = cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "notebook", span="notebook")])
+    someone = cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "someone", span="someone")])
+    assert value.validate_cue_v2_inference_item(notebook, {"transcript": "notebook", "dense_caption": "x"}, matrix)["status"] == "accepted_machine"
+    assert value.validate_cue_v2_inference_item(someone, {"transcript": "someone", "dense_caption": "x"}, matrix)["status"] == "accepted_machine"
+    no_phone = cue_v2_item("accepted_cue", [cue_v2_clause("object", "present", "phone", span="no phone")])
+    assert value.validate_cue_v2_inference_item(no_phone, {"transcript": "no phone", "dense_caption": "x"}, matrix)["issues"][0]["code"] == "OPERATOR_POLARITY_MISMATCH"
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_request_is_strict_and_has_no_controlled_metadata() -> None:
+    """Cue v2 请求只传两个原文字段并绑定严格 Schema，不读取密钥或写入正式工件。"""
+
+    value = module(); schema = json.loads((ROOT / "schemas/cue_v2_inference.schema.json").read_text(encoding="utf-8"))
+    atoms = [{"atom_id": "secret", "split": "train", "visible_text": "secret", "event_timestamp": 1, "transcript": "t", "dense_caption": "d"}]
+    request = value.build_cue_v2_request(atoms, schema)
+    payload = json.loads(request["messages"][0]["content"])
+    assert payload == {"items": [{"item_index": 0, "transcript": "t", "dense_caption": "d"}]}
+    assert set(payload["items"][0]) == {"item_index", "transcript", "dense_caption"}
+    assert all(f'"{key}"' not in request["messages"][0]["content"] for key in ("atom_id", "split", "visible_text", "event_timestamp", "start", "end", "n", "f", "x"))
+    assert request["temperature"] == 0 and request["max_tokens"] == 128
+    assert request["response_format"]["json_schema"] == {"name": "cue_v2_inference", "strict": True, "schema": schema}
+    assert value.build_cue_v2_request(atoms * 5, schema)["max_tokens"] == 640
+    empty = value.build_cue_v2_request([{"transcript": "", "dense_caption": ""}], schema)
+    assert json.loads(empty["messages"][0]["content"])["items"][0]["transcript"] == ""
+    with pytest.raises(value.ContractError, match="ATOM_COUNT"):
+        value.build_cue_v2_request([], schema)
+
+
+def cue_v2_acceptance_fixture() -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """构造包含 10,000 候选、七层局部编号校准和完整 Source 元数据的内存验收夹具。"""
+
+    candidates = [{"atom_id": f"src_accept_{index:05d}"} for index in range(10_000)]
+    proof: list[dict[str, Any]] = []
+    calibration_strata = ("Activity", "Explicit-Time", "Location", "Object", "Person", "State", "diversity_only")
+    for stratum_index, sample_stratum in enumerate(calibration_strata):
+        for sample_index in range(1, 51):
+            index = stratum_index * 50 + sample_index - 1
+            proof.append({"atom_id": candidates[index]["atom_id"], "record_type": "audit_sample", "sample_stratum": sample_stratum, "sample_index": sample_index})
+    for index, candidate in enumerate(candidates):
+        memberships = ["query_union", "diversity_reservoir"] if index % 4 == 0 else ["query_union"]
+        proof.append({"atom_id": candidate["atom_id"], "record_type": "candidate", "selection_sequence": index + 1, "selection_memberships": memberships})
+    source = [{
+        "atom_id": candidate["atom_id"], "split": ("train", "dev", "test")[index % 3],
+        "participant_source_id": f"P{index % 5}", "modality_coverage": ("both", "transcript_only", "dense_caption_only")[index % 3],
+        "source_group_id": f"G{index % 17}",
+    } for index, candidate in enumerate(candidates)]
+    return candidates, proof, source
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_two_worker_acceptance_plan_uses_closed_strata_quotas() -> None:
+    """验收计划必须闭合最大余数配额，严格输出 900/120/390/390 且不等于简单排序截取。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    plan = value.build_protocol_acceptance_plan(candidates, proof, source)
+    summary = plan["summary"]
+    assert summary["candidate_count"] == 10_000 and summary["calibration_count"] == 350
+    assert (summary["atom_count"], summary["overlap_count"], summary["main_count"]) == (900, 120, 780)
+    assert summary["worker_counts"] == {"worker_00": 390, "worker_01": 390}
+    assert summary["worker_input_counts"] == {"worker_00": 510, "worker_01": 510}
+    assert set(plan["worker_partitions"]) == {"worker_00", "worker_01"}
+    assert "worker_02" not in plan["worker_partitions"]
+    assert len(plan["acceptance_atom_ids"]) == len(set(plan["acceptance_atom_ids"])) == 900
+    assert len(plan["overlap_atom_ids"]) == len(set(plan["overlap_atom_ids"])) == 120
+    assert set(plan["overlap_atom_ids"]).isdisjoint(set(plan["worker_partitions"]["worker_00"]) | set(plan["worker_partitions"]["worker_01"]))
+    assert set(plan["worker_partitions"]["worker_00"]).isdisjoint(plan["worker_partitions"]["worker_01"])
+    assert set(plan["worker_partitions"]["worker_00"]) | set(plan["worker_partitions"]["worker_01"]) == set(plan["acceptance_atom_ids"]) - set(plan["overlap_atom_ids"])
+    assert all(set(plan["overlap_atom_ids"]).issubset(plan["worker_acceptance_inputs"][key]) for key in ("worker_00", "worker_01"))
+    assert all(len(plan["worker_acceptance_inputs"][key]) == 510 for key in ("worker_00", "worker_01"))
+    assert plan["acceptance_atom_ids"] != sorted(candidate["atom_id"] for candidate in candidates)[:900]
+    assert sum(row["quota"] for row in plan["strata"]) == 900
+    assert sum(row["actual_count"] for row in plan["strata"]) == 900
+    assert all(len(row["key"]) == 5 for row in plan["strata"])
+    assert len(plan["remainder_order"]) == len(plan["strata"]) and len(plan["overlap_remainder_order"]) == len(plan["overlap_strata"])
+    assert len(plan["summary"]["acceptance_set_sha256"]) == 64 and len(plan["plan_sha256"]) == 64
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_acceptance_plan_rejects_proof_source_and_calibration_gaps() -> None:
+    """候选 proof 缺项、重复、越界、Source 缺项或非 350 校准必须稳定失败。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    candidate_start = 350
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CANDIDATE_PROOF_INCOMPLETE"):
+        value.build_protocol_acceptance_plan(candidates, proof[:candidate_start] + proof[candidate_start + 1:], source)
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CANDIDATE_PROOF_DUPLICATE"):
+        value.build_protocol_acceptance_plan(candidates, proof + [dict(proof[candidate_start])], source)
+    out_of_range = {"atom_id": "src_out_of_range", "record_type": "candidate", "selection_sequence": 10_001, "selection_memberships": ["query_union"]}
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_PROOF_ATOM_OUT_OF_RANGE"):
+        value.build_protocol_acceptance_plan(candidates, proof + [out_of_range], source)
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_SOURCE_ATOM_MISSING"):
+        value.build_protocol_acceptance_plan(candidates, proof, source[:-1])
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_STRATUM_COUNT_MISMATCH"):
+        value.build_protocol_acceptance_plan(candidates, proof[1:], source)
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_current_worker_identity_has_no_worker_02_leak() -> None:
+    """当前配置和静态候选分区只允许两个 worker，历史文本不能成为运行身份。"""
+
+    value = module()
+    workers = value.partition_cue_v2_candidates([{"atom_id": f"src_{index:05d}"} for index in range(10_000)])
+    assert list(workers) == ["worker_00", "worker_01"]
+    assert [len(workers[key]) for key in workers] == [5_000, 5_000]
+    config_text = (ROOT / "config/model_registry.yaml").read_text(encoding="utf-8")
+    assert "worker_count: 2" in config_text and "worker_ids: [worker_00, worker_01]" in config_text
+    assert "worker_02" not in config_text
+    assert "worker_02" not in (ROOT / "scripts/05_extract_cues.py").read_text(encoding="utf-8")
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_acceptance_reuses_preflight_atoms_without_scanning_source_again() -> None:
+    """已有预检候选 Atom 时，验收计划不得再次遍历完整 Source。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+
+    class ExplodingSource:
+        def __iter__(self) -> Any:
+            raise AssertionError("不应扫描完整 Source")
+
+    plan = value.build_protocol_acceptance_plan(candidates, proof, ExplodingSource(), preflight_atoms=source)
+    assert plan["summary"]["source_bound"] is True
+    assert len(plan["acceptance_atom_ids"]) == 900
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_acceptance_checks_sequence_and_audit_sample_identity() -> None:
+    """selection_sequence 必须全局唯一，校准身份必须按七层局部 sample_index 闭合。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    duplicate_sequence = [dict(row) for row in proof]
+    duplicate_sequence[351]["selection_sequence"] = duplicate_sequence[350]["selection_sequence"]
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_SELECTION_SEQUENCE_DUPLICATE"):
+        value.build_protocol_acceptance_plan(candidates, duplicate_sequence, source)
+    bad_sample_index = [dict(row) for row in proof]
+    bad_sample_index[0]["sample_index"] = 51
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_INVALID"):
+        value.build_protocol_acceptance_plan(candidates, bad_sample_index, source)
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_calibration_uses_local_sample_index_and_stable_derived_index() -> None:
+    """七层均可使用 sample_index=1，计划序号仍稳定派生为 1..350。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    plan = value.build_protocol_acceptance_plan(candidates, proof, source)
+    calibration = plan["calibration"]
+    assert len(calibration) == 350
+    assert [row["calibration_index"] for row in calibration] == list(range(1, 351))
+    assert [row["sample_stratum"] for row in calibration[::50]] == list(value._CUE_V2_CALIBRATION_STRATA)
+    assert [row["sample_index"] for row in calibration[::50]] == [1] * 7
+    assert all(set(row) == {"sample_stratum", "sample_index", "atom_id", "calibration_index"} for row in calibration)
+    reversed_plan = value.build_protocol_acceptance_plan(candidates, list(reversed(proof)), source)
+    assert reversed_plan["plan_sha256"] == plan["plan_sha256"]
+    assert reversed_plan["calibration"] == calibration
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_calibration_rejects_local_duplicates_unknown_strata_and_wrong_counts() -> None:
+    """校准层名大小写、局部编号、Atom 身份和每层 50 条都是硬门。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    duplicate_index = [dict(row) for row in proof]
+    duplicate_index[1]["sample_index"] = 1
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_DUPLICATE"):
+        value.build_protocol_acceptance_plan(candidates, duplicate_index, source)
+
+    duplicate_atom = [dict(row) for row in proof]
+    duplicate_atom[50]["atom_id"] = duplicate_atom[0]["atom_id"]
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_ATOM_DUPLICATE"):
+        value.build_protocol_acceptance_plan(candidates, duplicate_atom, source)
+
+    unknown_stratum = [dict(row) for row in proof]
+    unknown_stratum[0]["sample_stratum"] = "activity"
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_STRATUM_INVALID"):
+        value.build_protocol_acceptance_plan(candidates, unknown_stratum, source)
+
+    missing_stratum_row = proof[0]
+    missing = [dict(row) for row in proof if row is not missing_stratum_row]
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_STRATUM_COUNT_MISMATCH"):
+        value.build_protocol_acceptance_plan(candidates, missing, source)
+
+    too_many = [dict(row) for row in proof]
+    too_many[0]["sample_index"] = 51
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_INVALID"):
+        value.build_protocol_acceptance_plan(candidates, too_many, source)
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_calibration_identity_cannot_be_reduced_to_sample_index() -> None:
+    """计划暴露的校准记录必须同时携带层名、局部编号和 Atom 身份。"""
+
+    value = module()
+    candidates, proof, source = cue_v2_acceptance_fixture()
+    plan = value.build_protocol_acceptance_plan(candidates, proof, source)
+    assert all({"sample_stratum", "sample_index", "atom_id"}.issubset(row) for row in plan["calibration"])
+    assert plan["calibration_protocol"] == {
+        "identity_version": value._CUE_V2_CALIBRATION_IDENTITY_VERSION,
+        "strata_order": list(value._CUE_V2_CALIBRATION_STRATA),
+        "samples_per_stratum": 50,
+        "index_rule": value._CUE_V2_CALIBRATION_INDEX_RULE,
+    }
+    sample_index_only = [dict(row) for row in proof]
+    sample_index_only[0].pop("sample_stratum")
+    with pytest.raises(value.BGESelectionPreflightError, match="ACCEPTANCE_CALIBRATION_STRATUM_INVALID"):
+        value.build_protocol_acceptance_plan(candidates, sample_index_only, source)
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_protocol_files_and_runtime_identities_are_disjoint() -> None:
+    """Cue v2 与 legacy V3.6 必须绑定不同 prompt、Schema、路径、账本和 campaign 命名空间。"""
+
+    registry = yaml.safe_load((ROOT / "config/model_registry.yaml").read_text(encoding="utf-8"))
+    paths = yaml.safe_load((ROOT / "config/paths.yaml").read_text(encoding="utf-8"))
+    v2 = registry["models"]["cue_v2_extraction"]
+    legacy = registry["models"]["cue_extraction"]
+    v2_schemas = {v2["inference_schema"], v2["formal_schema"], v2["inference_schema_path"], v2["formal_schema_path"]}
+    legacy_schemas = {legacy["schema"], legacy["inference_schema_path"], legacy["execution"]["package_policy"]["inference_schema"]}
+    assert v2_schemas.isdisjoint(legacy_schemas)
+    assert v2["prompt_path"] != legacy["prompt_path"]
+    assert v2["campaign_namespace"] == "cue_v2"
+    assert v2["selection_id"] == "bge_m3_source_select_v3_1_20260914_02"
+    assert legacy["prompt_version"] == "cue_extractor_v3_6_compact"
+    assert set(v2["worker_resources"]) == {"worker_00", "worker_01"}
+    assert len({v2["worker_resources"][worker]["budget_id"] for worker in v2["worker_resources"]}) == 2
+    assert len({v2["worker_resources"][worker]["staging_root"] for worker in v2["worker_resources"]}) == 2
+    assert len({v2["worker_resources"][worker]["ledger_path"] for worker in v2["worker_resources"]}) == 2
+    assert paths["cue_v2"]["cue_v2_root"] != paths["cues_dir"]
+    assert all("../cues/v2" in paths["cue_v2"][key] for key in ("cue_v2_root", "cue_v2_source_selection_root", "cue_v2_protocol_acceptance_root", "cue_v2_worker_staging_root", "cue_v2_formal_root", "cue_v2_disposition_ledger", "cue_v2_library_manifest", "cue_v2_library_success"))
+    assert "../cues/formal" not in json.dumps(paths["cue_v2"], ensure_ascii=False)
+    assert "worker_02" not in json.dumps(v2, ensure_ascii=False)
+
+
+def cue_v2_bge_preflight_fixture(tmp_path: Path, value: Any) -> tuple[Path, Path, Path, str]:
+    """构造最小五文件 BGE 快照，专门验证 origin Schema provenance 语义。"""
+
+    snapshot = tmp_path / "selection"
+    snapshot.mkdir()
+    source_path = tmp_path / "source.jsonl"
+    source_path.write_text(json.dumps({"atom_id": "src_1", "split": "train"}) + "\n", encoding="utf-8")
+    candidate_path = snapshot / "candidate_atoms.jsonl"
+    candidate_path.write_text(json.dumps({"atom_id": "src_1"}) + "\n", encoding="utf-8")
+    proof_path = snapshot / "selection_proof.jsonl"
+    proof_path.write_text(json.dumps({"record_type": "candidate", "atom_id": "src_1"}) + "\n", encoding="utf-8")
+    schema_path = tmp_path / "effective_artifact.schema.json"
+    schema_path.write_text(json.dumps({"$defs": {
+        "candidate_atom": {"type": "object", "required": ["atom_id"], "properties": {"atom_id": {"type": "string"}}, "additionalProperties": False},
+        "selection_proof_record": {"type": "object"},
+    }}, ensure_ascii=False), encoding="utf-8")
+    source_sha = value._cue_v2_sha256(source_path)
+    report = {
+        "selection_id": "synthetic_selection",
+        "source_sha256": source_sha,
+        "counts": {"final_candidates": 1},
+        "blockers": [],
+        "validation": {"machine_gate_passed": True},
+        "solver": {"objective_statuses": ["OPTIMAL"]},
+    }
+    report_path = snapshot / "selection_report.json"
+    report_path.write_text(json.dumps(report, ensure_ascii=False), encoding="utf-8")
+    files = []
+    for path, rows in ((candidate_path, 1), (proof_path, 1), (report_path, 1)):
+        files.append({"relative_path": path.name, "sha256": value._cue_v2_sha256(path), "byte_count": path.stat().st_size, "row_count": rows})
+    bound_schema_sha = "f" * 64
+    manifest = {
+        "selection_id": "synthetic_selection", "artifact_schema_sha256": bound_schema_sha,
+        "source_sha256": source_sha, "final_candidate_count": 1, "files": files,
+    }
+    manifest_path = snapshot / "selection_manifest.json"
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    success = {
+        "selection_id": "synthetic_selection", "artifact_schema_sha256": bound_schema_sha,
+        "manifest_sha256": value._cue_v2_sha256(manifest_path), "candidate_count": 1, "source_sha256": source_sha,
+    }
+    (snapshot / "BGE_FILTER_SUCCESS.json").write_text(json.dumps(success, ensure_ascii=False), encoding="utf-8")
+    return snapshot, source_path, schema_path, bound_schema_sha
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_bge_preflight_strict_fails_but_adopted_keeps_data_gate_passed(tmp_path: Path) -> None:
+    """strict 仍拒绝 Schema 身份不符；adopted 仅警告且允许候选进入 Cue 阶段。"""
+
+    value = module()
+    snapshot, source_path, schema_path, _bound_schema_sha = cue_v2_bge_preflight_fixture(tmp_path, value)
+    with pytest.raises(value.BGESelectionPreflightError, match="ARTIFACT_SCHEMA_SHA_MISMATCH"):
+        value.preflight_bge_selection_snapshot(snapshot, source_path, [schema_path], validation_profile="strict")
+    adopted = value.preflight_bge_selection_snapshot(snapshot, source_path, [schema_path], validation_profile="adopted_external_v1")
+    assert [row["atom_id"] for row in adopted["atoms"]] == ["src_1"]
+    assert adopted["provenance_status"] == "origin_schema_unavailable"
+    assert adopted["data_gate"] == "passed"
+    assert adopted["provenance_gate"] == "warning"
+    assert adopted["blockers"] == []
+    assert adopted["warnings"] == ["ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE"]
+    assert adopted["effective_validation_schema"]["sha256"] == value._cue_v2_sha256(schema_path)
+    assert adopted["effective_validation_schema"]["origin_verified"] is False
+
+
+@pytest.mark.cue_v2
+def test_cue_v2_prompt_states_fact_and_protocol_boundaries() -> None:
+    """Cue v2 prompt 必须明示 clause、连续 span、语义门和禁止的跨字段推断。"""
+
+    prompt = (ROOT / "prompts/cue_extractor_v2.md").read_text(encoding="utf-8")
+    required = (
+        "1–3", "all_of", "连续原文", "跨字段", "跨 Atom", "常识补全", "visible_text",
+        "event_timestamp", "人物角色", "否定", "范围", "时间语气", "no_cue", "ambiguous",
+    )
+    assert all(fragment in prompt for fragment in required)

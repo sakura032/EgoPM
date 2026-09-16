@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -187,6 +188,7 @@ def write_valid_cue_v2_marker(qa, config, source_hash: str) -> dict:
     return marker
 
 
+@pytest.mark.legacy_v36
 def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
     qa = load_validator()
     config_path = copy_config_tree(tmp_path)
@@ -205,6 +207,7 @@ def test_success_marker_hash_is_a_strict_read_gate(tmp_path: Path) -> None:
     assert any(issue["issue_type"] == "success_marker_hash" for issue in tampered_collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_stage_version_map_accepts_frozen_source_and_cue_schema_versions(tmp_path: Path) -> None:
     """Source v1.1 与 Cue v1.0 应各自按冻结版本通过，不能由全局版本混淆。"""
 
@@ -219,6 +222,7 @@ def test_stage_version_map_accepts_frozen_source_and_cue_schema_versions(tmp_pat
     assert qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", cue_collector)
 
 
+@pytest.mark.legacy_v36
 def test_stage_version_map_rejects_wrong_cue_schema_version(tmp_path: Path) -> None:
     """Cue 标记若把其 v1.0 Schema 声明成 v1.1，必须在读取 JSONL 前被阻断。"""
 
@@ -233,6 +237,8 @@ def test_stage_version_map_rejects_wrong_cue_schema_version(tmp_path: Path) -> N
     assert any(issue["issue_type"] == "success_marker_schema_versions" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
+@pytest.mark.cue_v2
 def test_cue_v2_success_requires_frozen_execution_lineage(tmp_path: Path) -> None:
     """最终 Cue 保持 Schema v1.0.0，但必须完整声明并匹配 v2 执行协议。"""
 
@@ -244,6 +250,8 @@ def test_cue_v2_success_requires_frozen_execution_lineage(tmp_path: Path) -> Non
     assert qa.marker_is_valid(config, "cue", "cue_library", "cue_library", "T2 cue", collector)
 
 
+@pytest.mark.legacy_v36
+@pytest.mark.cue_v2
 def test_cue_v2_success_rejects_missing_or_tampered_execution_lineage(tmp_path: Path) -> None:
     """协议哈希、Source 哈希或用量汇总缺失/不符时，T4 必须在读 Cue 前阻断。"""
 
@@ -260,6 +268,8 @@ def test_cue_v2_success_rejects_missing_or_tampered_execution_lineage(tmp_path: 
     assert "cue_realtime_lineage_fields" in {issue["issue_type"] for issue in collector.issues}
 
 
+@pytest.mark.legacy_v36
+@pytest.mark.cue_v2
 def test_cue_v2_success_rejects_wrong_hash_version_and_usage_totals(tmp_path: Path) -> None:
     """字段齐全仍不足够：提示词哈希、推理版本、协议哈希和用量算术都必须可信。"""
 
@@ -278,6 +288,8 @@ def test_cue_v2_success_rejects_wrong_hash_version_and_usage_totals(tmp_path: Pa
     assert {"cue_execution_lineage_mismatch", "cue_usage_summary_tokens"}.issubset(issue_types)
 
 
+@pytest.mark.legacy_v36
+@pytest.mark.cue_v2
 def test_cue_v2_success_rejects_frozen_execution_contract_drift(tmp_path: Path) -> None:
     """限流等 execution 语义变化即使不改最终 Cue Schema，也必须令旧协议哈希失效。"""
 
@@ -309,6 +321,7 @@ def update_realtime_manifest(qa, config, marker: dict, mutate) -> None:
     config.marker("cue_library").write_text(json.dumps(marker), encoding="utf-8")
 
 
+@pytest.mark.legacy_v36
 def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(tmp_path: Path) -> None:
     """短码仅是推理层优化；独立展开必须仍合成最终 Cue，并拒绝任何未知码。"""
 
@@ -339,6 +352,7 @@ def test_compact_short_codes_expand_to_final_cue_schema_and_reject_unknown_code(
         raise AssertionError("未知短码不得被静默展开")
 
 
+@pytest.mark.legacy_v36
 def test_cue_evidence_normalization_accepts_format_only_variants() -> None:
     """归一化仍识别纯格式差异，而 v3.5 最终 span 保留程序切出的原文。"""
 
@@ -359,6 +373,7 @@ def test_cue_evidence_normalization_accepts_format_only_variants() -> None:
     assert not collector.blockers
 
 
+@pytest.mark.legacy_v36
 def test_cue_evidence_normalization_rejects_rewrite_numeric_and_reordering() -> None:
     """格式归一化不能把实质改写、单位变化或非连续重排误判为原字幕片段。"""
 
@@ -376,6 +391,7 @@ def test_cue_evidence_normalization_rejects_rewrite_numeric_and_reordering() -> 
         assert any(issue["issue_type"] == "cue_supporting_span_not_program_slice" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_validator_accepts_declared_same_atom_transcript_evidence() -> None:
     """Cue 可以声明同 atom 的 transcript 证据，但 source_text 始终原样回填 visible_text。"""
 
@@ -403,6 +419,7 @@ def test_cue_validator_accepts_declared_same_atom_transcript_evidence() -> None:
     assert not collector.blockers
 
 
+@pytest.mark.legacy_v36
 def test_cue_validator_rejects_unknown_unavailable_and_cross_field_evidence() -> None:
     """未知或空证据字段、以及把另一字段内容冒充为声明字段都必须失败关闭。"""
 
@@ -435,6 +452,7 @@ def test_cue_validator_rejects_unknown_unavailable_and_cross_field_evidence() ->
         assert any(issue["issue_type"] == expected[name] for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_validator_rejects_cross_atom_evidence() -> None:
     """Cue 不能把另一 atom 的同名字段文本作为当前 atom 的证据。"""
 
@@ -469,6 +487,7 @@ def test_cue_validator_rejects_cross_atom_evidence() -> None:
     assert any(issue["issue_type"] == "cue_supporting_span_not_program_slice" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_item_audit_queue_blocks_success_and_rejects_raw_or_second_repair(tmp_path: Path) -> None:
     """逐项失败可留无正文审计，但不得穿透正式 SUCCESS 或重复修复。"""
 
@@ -495,6 +514,7 @@ def test_item_audit_queue_blocks_success_and_rejects_raw_or_second_repair(tmp_pa
     assert any(issue["issue_type"] == "cue_realtime_item_queue_raw_content" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_wave_audit_gate_accepts_nonblocking_audit_state_but_blocks_final_gate(tmp_path: Path) -> None:
     """Wave 可继续时仍须把逐项审计和遗留整包隔离留在最终阻断门。"""
 
@@ -531,6 +551,7 @@ def test_wave_audit_gate_accepts_nonblocking_audit_state_but_blocks_final_gate(t
     assert "cue_realtime_package_quarantine" in issue_types
 
 
+@pytest.mark.legacy_v36
 def test_cue_v30_rejects_tampered_package_mapping_and_raw_content(tmp_path: Path) -> None:
     """实时 package 映射必须唯一且无正文，防止取消 Batch 或文本混入实时结果。"""
 
@@ -558,6 +579,7 @@ def test_cue_v30_rejects_tampered_package_mapping_and_raw_content(tmp_path: Path
     assert any(issue["issue_type"] == "cue_realtime_raw_content" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_v30_rejects_realtime_price_rate_and_output_policy_drift(tmp_path: Path) -> None:
     """实时单价、限流和输出上限同属执行合同，任何漂移都必须阻断旧运行恢复。"""
 
@@ -583,6 +605,7 @@ def test_cue_v30_rejects_realtime_price_rate_and_output_policy_drift(tmp_path: P
     assert any(issue["issue_type"] == "cue_execution_lineage_mismatch" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_v30_rejects_non_success_or_requeued_package(tmp_path: Path) -> None:
     """本地隔离或预算停止不得自动重排，最终 SUCCESS 仅接受唯一 validated_success。"""
 
@@ -601,6 +624,7 @@ def test_cue_v30_rejects_non_success_or_requeued_package(tmp_path: Path) -> None
     assert any(issue["issue_type"] == "cue_realtime_ledger_terminal" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_v30_rejects_progress_outside_frozen_wave_or_inflight_limit(tmp_path: Path) -> None:
     """最终实时 QA 必须拒绝跨波、超十并发和含正文的进度快照。"""
 
@@ -627,6 +651,7 @@ def test_cue_v30_rejects_progress_outside_frozen_wave_or_inflight_limit(tmp_path
     assert any(issue["issue_type"] == "cue_realtime_progress_raw_content" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_cue_v30_rejects_budget_overrun_and_batch_artifact_mix(tmp_path: Path) -> None:
     """预算熔断必须真实生效，实时 run-state 也不得借 Batch 字段/正文绕过审计。"""
 
@@ -645,6 +670,7 @@ def test_cue_v30_rejects_budget_overrun_and_batch_artifact_mix(tmp_path: Path) -
     assert any(issue["issue_type"] == "cue_realtime_budget_fuse" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path: Path) -> None:
     qa = load_validator()
     srt = tmp_path / "raw" / "example.srt"
@@ -677,6 +703,7 @@ def test_source_validator_rejects_time_and_cross_split_near_duplicates(tmp_path:
     assert {"source_time_order", "split_near_duplicate"}.issubset(issue_types)
 
 
+@pytest.mark.legacy_v36
 def test_source_time_boundary_uses_dense_caption_primary_window(tmp_path: Path) -> None:
     """Dense 主窗口可合法超过较短 Transcript，Transcript-only 仍必须在自身 SRT 内。"""
 
@@ -722,6 +749,7 @@ def test_source_time_boundary_uses_dense_caption_primary_window(tmp_path: Path) 
     assert any(issue["issue_type"] == "source_time_out_of_srt" for issue in transcript_collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_source_cross_session_duplicate_index_equals_naive_reference() -> None:
     """精确索引必须完整覆盖同一人同日的全部不同 session，而非只覆盖相邻编号。"""
 
@@ -763,6 +791,7 @@ def test_source_cross_session_duplicate_index_equals_naive_reference() -> None:
     assert observed_cross_split == expected_cross_split
 
 
+@pytest.mark.legacy_v36
 def test_decision_validator_rejects_answer_labels_in_model_input() -> None:
     qa = load_validator()
     log = fixture("lifelog.valid.json")
@@ -773,6 +802,7 @@ def test_decision_validator_rejects_answer_labels_in_model_input() -> None:
     assert any(issue["issue_type"] == "answer_leakage" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_schema_state_and_duration_validators_reject_independent_failures() -> None:
     qa = load_validator()
     schema_collector = qa.IssueCollector()
@@ -793,6 +823,7 @@ def test_schema_state_and_duration_validators_reject_independent_failures() -> N
     assert {"state_transition", "difficulty_event_count", "difficulty_virtual_span"}.issubset(issue_types)
 
 
+@pytest.mark.legacy_v36
 def test_counterfactual_validator_rejects_missing_action_flip() -> None:
     qa = load_validator()
     positive_log = fixture("lifelog.valid.json")
@@ -813,6 +844,7 @@ def test_counterfactual_validator_rejects_missing_action_flip() -> None:
     assert any(issue["issue_type"] == "counterfactual_gold_flip" for issue in collector.issues)
 
 
+@pytest.mark.legacy_v36
 def test_missing_success_marker_blocks_without_reading_or_writing_formal_data(tmp_path: Path) -> None:
     qa = load_validator()
     config_path = copy_config_tree(tmp_path)

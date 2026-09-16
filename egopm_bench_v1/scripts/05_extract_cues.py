@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""第 05 阶段：为冻结 Source Atom 构建 v3 实时 Cue 的无 API 计划与可恢复执行器。
+"""第 05 阶段：从 Source Atom 构建当前 Cue v2 的预检与提取入口。
 
-职责：验证冻结 Source、紧凑提示词和 Schema，并按最多五条 Atom 构造独立实时 package、
-限流/重试/预算熔断状态和无正文账本。输入是 Source SUCCESS、Source Atom、模型配置、
-提示词和 Schema；输出是只读预检报告，或在未来显式授权入口中写入验证后的 Cue 片段。
-它位于 Source QA 后、Cue QA 前；默认模式绝不联网，绝不读取密钥，且禁止复用已取消 Batch。
+职责：当前默认路径从唯一 `cue_v2_extraction` 配置读取 Source、候选、提示词和推理 Schema，
+执行有限规模的只读输入预检，并为后续小规模 Cue v2 提取提供入口；输入是 Source Atom、
+candidate_atoms、提示词和 Schema，输出是无正文预检摘要或后续的当前 Cue 运行文件。它位于
+Source 之后、Cue 到 Seed 链路之前。旧 V3.6 realtime/package 实现仅在显式 `--legacy-v9` 下保留
+为隔离历史，不是当前默认路径；默认模式绝不联网或读取密钥。
 """
 
 from __future__ import annotations
@@ -70,6 +71,711 @@ def safe_json_path(parts: Iterable[Any]) -> str:
 
     rendered = [str(part) for part in parts if isinstance(part, (str, int))]
     return "/" + "/".join(rendered) if rendered else "/"
+
+
+# Cue v2 纯验证区只处理调用方已放入内存的一个推理项和一个 Atom；它刻意不接入旧
+# V9 CLI、配置加载、网络或账本，以便协议验收可独立证明三层事实门的确定性边界。
+CUE_V2_REASON_CODES = frozenset({
+    "NO_OBSERVABLE_CONDITION", "INSUFFICIENT_EVIDENCE", "UNRESOLVED_REFERENT",
+    "AMBIGUOUS_PERSON_ROLE", "AMBIGUOUS_SCOPE", "AMBIGUOUS_TEMPORAL_MODALITY",
+    "UNSUPPORTED_RELATION", "MULTIPLE_UNRELATED_FACTS",
+})
+CUE_V2_SENTINELS = frozenset({"null", "none", "unknown", "n/a", "na", "nil", "无", "未知"})
+CUE_V2_UNRESOLVED = frozenset({"我", "他", "她", "它", "这里", "那里", "这个", "那个", "东西", "正在做", "发生变化"})
+CUE_V2_NEGATION = ("没有", "不是", "不在", "没", "不", "未", "no", "not", "never", "without")
+CUE_V2_NEGATIVE_OPERATORS = frozenset({"absent", "not_at", "not_occurring", "is_not"})
+CUE_V2_SCOPE = ("所有", "全部", "每个", "一个", "两个", "only", "all", "every", "one", "two")
+
+
+class BGESelectionPreflightError(ContractError):
+    """BGE 快照只读预检的稳定阻断码，异常文本不回显候选或 Source 正文。"""
+
+
+def _cue_v2_english_token_present(text: str, token: str) -> bool:
+    """仅把英文否定/范围词按完整词匹配，防止 notebook 或 someone 的子串误伤。"""
+
+    return re.search(rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])", text, re.IGNORECASE) is not None
+
+
+def normalize_cue_v2_text(text: str) -> str:
+    """按 Cue v2 的最小确定性规则规范化文本，不改变大小写、标点或词序。
+
+    输入是 value 或同字段证据 span；输出仅作第二层直接子串比较。NFKC 与空白处理
+    解决显示等价和排版差异，其他任何文本变化均保留，以免释义伪装成 Source 支持。
+    """
+
+    if not isinstance(text, str):
+        return ""
+    return " ".join(unicodedata.normalize("NFKC", text).split())
+
+
+def _cue_v2_issue(code: str, layer: int, path: str) -> dict[str, Any]:
+    """生成只含固定代码和 JSON 路径的诊断，避免返回 Source 或模型正文。"""
+
+    return {"code": code, "layer": layer, "path": path}
+
+
+def _cue_v2_result(status: str, issues: list[dict[str, Any]], predicate: dict[str, Any] | None = None) -> dict[str, Any]:
+    """统一纯函数结果；predicate 仅在通过时返回，issues 永不携带敏感正文。"""
+
+    result: dict[str, Any] = {"status": status, "issues": issues}
+    if predicate is not None:
+        result["predicate"] = predicate
+    return result
+
+
+def _cue_v2_has_negation(text: str) -> bool:
+    """保守识别中英文显式否定，命中后不允许肯定关系绕过极性检查。"""
+
+    return any(
+        _cue_v2_english_token_present(text, marker) if marker.isascii() else marker in text
+        for marker in CUE_V2_NEGATION
+    )
+
+
+def validate_cue_v2_inference_item(item: dict[str, Any], atom: dict[str, Any], dimension_operators: dict[str, Any]) -> dict[str, Any]:
+    """执行 Cue v2 三层纯验证并返回安全结果，绝不修改输入、访问文件或调用旧 V9 设置。
+
+    第一层验证同字段连续 span，第二层验证 value 的最小文本支持，第三层只处理可解释
+    的角色、极性、范围与时间规则。任何无法由局部规则可靠判定的语义都停在审计状态。
+    """
+
+    issues: list[dict[str, Any]] = []
+    if not isinstance(item, dict) or not isinstance(atom, dict):
+        return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/")])
+    if set(item) != {"item_index", "disposition", "predicate", "reason_codes"}:
+        return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/")])
+    if not isinstance(item.get("item_index"), int) or isinstance(item.get("item_index"), bool) or not 0 <= item["item_index"] <= 4:
+        return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/item_index")])
+    disposition = item.get("disposition")
+    predicate = item.get("predicate")
+    all_of = predicate.get("all_of") if isinstance(predicate, dict) else None
+    reasons = item.get("reason_codes")
+    if disposition not in {"accepted_cue", "no_cue", "ambiguous"} or not isinstance(all_of, list) or not isinstance(reasons, list):
+        return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/predicate/all_of")])
+    if len(reasons) > 3 or any(not isinstance(reason, str) or reason not in CUE_V2_REASON_CODES for reason in reasons) or len(set(reasons)) != len(reasons):
+        return _cue_v2_result("rejected", [_cue_v2_issue("UNRESOLVED_REFERENT", 1, "/reason_codes")])
+    if disposition == "accepted_cue":
+        if not 1 <= len(all_of) <= 3 or reasons:
+            return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/predicate/all_of")])
+    elif len(all_of) != 0 or not 1 <= len(reasons) <= 3:
+        return _cue_v2_result("rejected", [_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, "/predicate/all_of")])
+    elif disposition == "ambiguous":
+        return _cue_v2_result("needs_semantic_audit", [])
+    else:
+        return _cue_v2_result("rejected", [])
+
+    needs_audit = False
+    for index, clause in enumerate(all_of):
+        base = f"/predicate/all_of/{index}"
+        if not isinstance(clause, dict) or set(clause) != {"dimension", "operator", "value", "evidence"}:
+            issues.append(_cue_v2_issue("CLAUSE_COUNT_OUT_OF_RANGE", 1, base)); continue
+        dimension, operator, value, evidence = (clause.get("dimension"), clause.get("operator"), clause.get("value"), clause.get("evidence"))
+        if not isinstance(dimension, str) or not isinstance(operator, str) or not isinstance(value, str):
+            issues.append(_cue_v2_issue("SEMANTIC_DIMENSION_MISMATCH", 3, f"{base}/operator")); continue
+        if not isinstance(evidence, dict) or set(evidence) != {"field", "span"}:
+            issues.append(_cue_v2_issue("SPAN_NOT_CONTIGUOUS", 1, f"{base}/evidence")); continue
+        field, span = evidence.get("field"), evidence.get("span")
+        if field not in {"transcript", "dense_caption"}:
+            issues.append(_cue_v2_issue("CROSS_FIELD_EVIDENCE", 1, f"{base}/evidence/field")); continue
+        source = atom.get(field)
+        if not isinstance(source, str) or not source or not isinstance(span, str) or not span or span not in source:
+            other = "dense_caption" if field == "transcript" else "transcript"
+            other_source = atom.get(other)
+            code = "CROSS_FIELD_EVIDENCE" if isinstance(span, str) and span and isinstance(other_source, str) and span in other_source else "SPAN_NOT_CONTIGUOUS"
+            issues.append(_cue_v2_issue(code, 1, f"{base}/evidence/span")); continue
+        normalized_value, normalized_span = normalize_cue_v2_text(value), normalize_cue_v2_text(span)
+        if not normalized_value or normalized_value not in normalized_span:
+            issues.append(_cue_v2_issue("VALUE_NOT_SUPPORTED", 2, f"{base}/value")); continue
+        sentinel = normalized_value.strip().casefold()
+        if sentinel in CUE_V2_SENTINELS:
+            issues.append(_cue_v2_issue("VALUE_NOT_SUPPORTED", 2, f"{base}/value")); continue
+        if normalized_value in CUE_V2_UNRESOLVED:
+            if normalized_value == "我" and isinstance(atom.get("participant_source_id"), str) and atom["participant_source_id"].strip():
+                needs_audit = True
+            else:
+                issues.append(_cue_v2_issue("UNRESOLVED_REFERENT", 2, f"{base}/value")); continue
+        allowed = dimension_operators.get(dimension) if isinstance(dimension_operators, dict) else None
+        if not isinstance(allowed, list) or operator not in allowed:
+            issues.append(_cue_v2_issue("SEMANTIC_DIMENSION_MISMATCH", 3, f"{base}/operator")); continue
+        negated = _cue_v2_has_negation(span)
+        if negated and operator not in CUE_V2_NEGATIVE_OPERATORS:
+            issues.append(_cue_v2_issue("OPERATOR_POLARITY_MISMATCH", 3, f"{base}/operator")); continue
+        if operator in CUE_V2_NEGATIVE_OPERATORS and not negated:
+            needs_audit = True
+        if any(
+            (_cue_v2_english_token_present(span, marker) and not _cue_v2_english_token_present(normalized_value, marker)) if marker.isascii() else (marker in span and marker not in normalized_value)
+            for marker in CUE_V2_SCOPE
+        ) or re.search(r"\d", span) and not re.search(r"\d", normalized_value):
+            issues.append(_cue_v2_issue("SCOPE_MISMATCH", 3, f"{base}/value")); continue
+        span_folded = span.casefold()
+        if dimension == "person":
+            if normalized_value == "我": needs_audit = True
+            elif operator == "speaking" and not (":" in span or any(token in span_folded for token in ("说", "讲话", "says", "speaking"))):
+                issues.append(_cue_v2_issue("PERSON_ROLE_MISMATCH", 3, f"{base}/operator")); continue
+            elif operator == "present": needs_audit = True
+        elif dimension == "location" and operator != "mentioned":
+            relation = {"at": ("在", "位于", " at ", " in "), "not_at": ("不在", "not at"), "entering": ("进入", "进", "enter"), "leaving": ("离开", "出", "leave")}[operator]
+            if not any(token in span_folded or token in span for token in relation): needs_audit = True
+        elif dimension == "activity":
+            if normalized_value in {"正在做", "弄一下"}: issues.append(_cue_v2_issue("UNRESOLVED_REFERENT", 3, f"{base}/value")); continue
+            # 动作词本身不能可靠确定活动主体/对象；除非后续人工确认，不把局部词面
+            # 猜测成完整活动事实，因此单 clause 也至少进入语义审计。
+            needs_audit = True
+        elif dimension == "state":
+            if normalized_value in {"打开了", "变了", "好了"}: needs_audit = True
+        elif dimension == "explicit_time":
+            time_like = re.search(r"\d{1,2}[:：]\d{2}|\d+点|\d{4}[-/]\d{1,2}|明天|下周|每天|tomorrow|next week", span, re.I)
+            hypothetical = any(token in span_folded or token in span for token in ("如果", "假如", "要是", "if", "when"))
+            planned = any(token in span_folded or token in span for token in ("明天", "下周", "计划", "将", "要", "tomorrow", "next week", "plan", "will"))
+            if not time_like or span.strip().isdigit() or "秒表" in span or "时间戳" in span:
+                issues.append(_cue_v2_issue("TEMPORAL_MODALITY_MISMATCH", 3, f"{base}/value")); continue
+            # 条件词优先描述语气；“如果明天三点……”同时含未来词，但不能被
+            # 误判成已成立的 planned 事实。其余未来表达才要求 planned。
+            if (hypothetical and operator != "hypothetical") or (planned and not hypothetical and operator != "planned"):
+                issues.append(_cue_v2_issue("TEMPORAL_MODALITY_MISMATCH", 3, f"{base}/operator")); continue
+            if operator == "stated" and (hypothetical or planned):
+                issues.append(_cue_v2_issue("TEMPORAL_MODALITY_MISMATCH", 3, f"{base}/operator")); continue
+            if hypothetical or planned: needs_audit = True
+    if issues:
+        return _cue_v2_result("rejected", issues)
+    if needs_audit or len(all_of) > 1:
+        return _cue_v2_result("needs_semantic_audit", [])
+    return _cue_v2_result("accepted_machine", [], {"all_of": all_of})
+
+
+def _cue_v2_sha256(path: Path) -> str:
+    """流式计算文件 SHA256，供只读快照预检比较原始字节而不加载大文件。"""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _cue_v2_jsonl_rows(path: Path) -> Iterable[dict[str, Any]]:
+    """逐行读取 JSONL；任何非对象行都以稳定预检错误阻断，避免猜测快照结构。"""
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise BGESelectionPreflightError("BGE_JSONL_INVALID") from exc
+            if not isinstance(row, dict):
+                raise BGESelectionPreflightError("BGE_JSONL_INVALID")
+            yield row
+
+
+def _cue_v2_schema_validator(schema: dict[str, Any], definition: str) -> jsonschema.Draft202012Validator | None:
+    """为 BGE 行构造局部 `$defs` validator；Schema 不含该定义时保持兼容跳过。"""
+
+    definitions = schema.get("$defs")
+    if not isinstance(definitions, dict) or definition not in definitions:
+        return None
+    # 只复制 Schema 结构引用，不复制任何 Source 正文；这样每行可独立验证且不改变输入。
+    scoped_schema = {"$schema": schema.get("$schema", "https://json-schema.org/draft/2020-12/schema"), "$defs": definitions, "$ref": f"#/$defs/{definition}"}
+    return jsonschema.Draft202012Validator(scoped_schema)
+
+
+def _cue_v2_first_available_schema(artifact_schema_paths: list[Path]) -> tuple[dict[str, Any], Path] | None:
+    """读取第一个可解析的候选 artifact Schema，供 adopted 模式复核行形状。"""
+
+    for path in artifact_schema_paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("$defs"), dict) and (
+            "candidate_atom" in payload["$defs"] or "selection_proof_record" in payload["$defs"]
+        ):
+            return payload, path
+    return None
+
+
+def preflight_bge_selection_snapshot(
+    snapshot_dir: Path,
+    source_atoms_path: Path,
+    artifact_schema_paths: Iterable[Path],
+    validation_profile: str = "strict",
+    *,
+    source_success_path: Path | None = None,
+    source_schema_paths: Iterable[Path] | None = None,
+) -> dict[str, Any]:
+    """只读验证五文件 BGE 快照并按候选顺序流式返回匹配的 Source Atom。
+
+    输入为快照目录、冻结 Source JSONL 与候选 artifact Schema 路径；输出只含候选
+    Atom 且顺序与 candidate 文件一致。函数不写入目录、不会移动快照，并将所有失败
+    收敛为稳定错误码，因此调用方可先阻断不可信快照再决定后续流程。
+    """
+
+    if validation_profile not in {"strict", "adopted_external_v1"}:
+        raise BGESelectionPreflightError("BGE_VALIDATION_PROFILE_INVALID")
+    expected = {"candidate_atoms.jsonl", "selection_proof.jsonl", "selection_report.json", "selection_manifest.json", "BGE_FILTER_SUCCESS.json"}
+    if not snapshot_dir.is_dir() or {entry.name for entry in snapshot_dir.iterdir()} != expected:
+        raise BGESelectionPreflightError("BGE_SNAPSHOT_FILE_SET_MISMATCH")
+    try:
+        manifest = json.loads((snapshot_dir / "selection_manifest.json").read_text(encoding="utf-8"))
+        success = json.loads((snapshot_dir / "BGE_FILTER_SUCCESS.json").read_text(encoding="utf-8")); report = json.loads((snapshot_dir / "selection_report.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BGESelectionPreflightError("BGE_MANIFEST_INVALID") from exc
+    if not isinstance(manifest, dict) or not isinstance(success, dict):
+        raise BGESelectionPreflightError("BGE_MANIFEST_INVALID")
+    bound_schema = manifest.get("artifact_schema_sha256"); provenance_status = "origin_schema_available"
+    # 先物化路径列表，避免调用方传入生成器后被 SHA 检查消费，导致后续行 Schema 检查失效。
+    artifact_paths = [Path(path) for path in artifact_schema_paths]
+    available = {_cue_v2_sha256(path) for path in artifact_paths if path.is_file()}
+    if validation_profile == "strict" and (not isinstance(bound_schema, str) or bound_schema not in available):
+        raise BGESelectionPreflightError("ARTIFACT_SCHEMA_SHA_MISMATCH")
+    if validation_profile == "adopted_external_v1" and (not isinstance(bound_schema, str) or bound_schema not in available):
+        provenance_status = "origin_schema_unavailable"
+    if success.get("artifact_schema_sha256") != bound_schema or success.get("manifest_sha256") != _cue_v2_sha256(snapshot_dir / "selection_manifest.json"):
+        raise BGESelectionPreflightError("BGE_UPSTREAM_HASH_MISMATCH")
+    file_records = manifest.get("files")
+    record_paths = [record.get("relative_path") for record in file_records] if isinstance(file_records, list) and all(isinstance(record, dict) for record in file_records) else []
+    if not isinstance(file_records, list) or len(file_records) != 3 or len(set(record_paths)) != 3 or set(record_paths) != {"candidate_atoms.jsonl", "selection_proof.jsonl", "selection_report.json"}:
+        raise BGESelectionPreflightError("BGE_MANIFEST_INVALID")
+    for record in file_records:
+        if not isinstance(record, dict):
+            raise BGESelectionPreflightError("BGE_MANIFEST_INVALID")
+        target = snapshot_dir / str(record["relative_path"])
+        if _cue_v2_sha256(target) != record.get("sha256") or target.stat().st_size != record.get("byte_count"):
+            raise BGESelectionPreflightError("BGE_FILE_HASH_MISMATCH")
+        if "row_count" in record and sum(1 for _ in _cue_v2_jsonl_rows(target)) != record["row_count"]:
+            raise BGESelectionPreflightError("BGE_ROW_COUNT_MISMATCH")
+    # 若调用方提供了 BGE artifact Schema，则逐行执行现有定义的结构验证；缺失原始
+    # Schema 不会在 adopted_external_v1 中伪造替代品，但已有 Schema 仍必须零错误。
+    available_schema = _cue_v2_first_available_schema(artifact_paths)
+    effective_validation_schema: dict[str, Any] | None = None
+    candidate_validator = proof_validator = None
+    if available_schema is not None:
+        schema_payload, schema_path = available_schema
+        schema_digest = _cue_v2_sha256(schema_path)
+        # 该字段只说明本地实际采用的结构校验 Schema；即使 SHA 与 manifest 不同，
+        # 也不能把它描述为生成快照时的原始 Schema。
+        effective_validation_schema = {
+            "sha256": schema_digest,
+            "source": "local_validation_schema",
+            "origin_verified": isinstance(bound_schema, str) and schema_digest == bound_schema,
+        }
+        candidate_validator = _cue_v2_schema_validator(schema_payload, "candidate_atom")
+        proof_validator = _cue_v2_schema_validator(schema_payload, "selection_proof_record")
+    candidates = list(_cue_v2_jsonl_rows(snapshot_dir / "candidate_atoms.jsonl"))
+    if candidate_validator is not None:
+        for row in candidates:
+            if next(candidate_validator.iter_errors(row), None) is not None:
+                raise BGESelectionPreflightError("BGE_CANDIDATE_SCHEMA_INVALID")
+    candidate_ids = [row.get("atom_id") for row in candidates]
+    if any(not isinstance(atom_id, str) or not atom_id for atom_id in candidate_ids) or len(set(candidate_ids)) != len(candidate_ids):
+        raise BGESelectionPreflightError("BGE_CANDIDATE_ID_INVALID")
+    if len(candidates) != manifest.get("final_candidate_count") or len(candidates) != success.get("candidate_count"):
+        raise BGESelectionPreflightError("BGE_CANDIDATE_COUNT_MISMATCH")
+    try:
+        source_digest = _cue_v2_sha256(source_atoms_path)
+    except OSError as exc:
+        raise BGESelectionPreflightError("BGE_SOURCE_HASH_MISMATCH") from exc
+    if manifest.get("source_sha256") != source_digest:
+        raise BGESelectionPreflightError("BGE_SOURCE_HASH_MISMATCH")
+
+    # Source 的 SUCCESS 与 Schema 是上游血缘硬门；仅在 manifest 声明相应身份时
+    # 启用检查，以兼容早期没有这些字段的 synthetic fixture，不会替真实快照降级。
+    declared_source_schema = manifest.get("source_schema_sha256")
+    if isinstance(declared_source_schema, str):
+        schema_paths = [Path(path) for path in source_schema_paths] if source_schema_paths is not None else [ROOT / "schemas" / "source_video_atom.schema.json", source_atoms_path.parent / "source_video_atom.schema.json"]
+        source_schema_digests = {_cue_v2_sha256(path) for path in schema_paths if path.is_file()}
+        if declared_source_schema not in source_schema_digests:
+            raise BGESelectionPreflightError("BGE_SOURCE_SCHEMA_SHA_MISMATCH")
+    declared_source_success = manifest.get("source_success_sha256")
+    source_success_payload: dict[str, Any] | None = None
+    if isinstance(declared_source_success, str):
+        success_path = source_success_path or (source_atoms_path.parent / "SOURCE_ATOMS_SUCCESS.json")
+        if not success_path.is_file():
+            raise BGESelectionPreflightError("BGE_SOURCE_SUCCESS_MISSING")
+        try:
+            if _cue_v2_sha256(success_path) != declared_source_success:
+                raise BGESelectionPreflightError("BGE_SOURCE_SUCCESS_HASH_MISMATCH")
+            source_success_payload = json.loads(success_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            if isinstance(exc, BGESelectionPreflightError):
+                raise
+            raise BGESelectionPreflightError("BGE_SOURCE_SUCCESS_INVALID") from exc
+        if not isinstance(source_success_payload, dict) or source_success_payload.get("sha256") != source_digest:
+            raise BGESelectionPreflightError("BGE_SOURCE_SUCCESS_BINDING_MISMATCH")
+    selected = set(candidate_ids)
+    found: dict[str, dict[str, Any]] = {}
+    source_row_count = 0
+    for atom in _cue_v2_jsonl_rows(source_atoms_path):
+        source_row_count += 1
+        atom_id = atom.get("atom_id")
+        if atom_id in selected:
+            if atom_id in found:
+                raise BGESelectionPreflightError("BGE_SOURCE_ATOM_DUPLICATE")
+            found[atom_id] = atom
+    if len(found) != len(selected):
+        raise BGESelectionPreflightError("BGE_SOURCE_ATOM_MISSING")
+    if source_success_payload is not None and isinstance(source_success_payload.get("row_count"), int) and source_row_count != source_success_payload["row_count"]:
+        raise BGESelectionPreflightError("BGE_SOURCE_ROW_COUNT_MISMATCH")
+    proof_rows = list(_cue_v2_jsonl_rows(snapshot_dir / "selection_proof.jsonl"))
+    if proof_validator is not None:
+        for row in proof_rows:
+            if next(proof_validator.iter_errors(row), None) is not None:
+                raise BGESelectionPreflightError("BGE_PROOF_SCHEMA_INVALID")
+    if not isinstance(report, dict) or report.get("selection_id") != manifest.get("selection_id") or success.get("selection_id") != manifest.get("selection_id") or report.get("blockers") != [] or report.get("validation", {}).get("machine_gate_passed") is not True:
+        raise BGESelectionPreflightError("BGE_REPORT_BINDING_MISMATCH")
+    report_counts = report.get("counts")
+    if not isinstance(report_counts, dict) or report_counts.get("final_candidates") != len(candidates):
+        raise BGESelectionPreflightError("BGE_CANDIDATE_COUNT_MISMATCH")
+    if report.get("source_sha256") != manifest.get("source_sha256") or success.get("source_sha256") != manifest.get("source_sha256"):
+        raise BGESelectionPreflightError("BGE_SOURCE_HASH_MISMATCH")
+    if isinstance(declared_source_schema, str) and (
+        report.get("source_schema_sha256") != declared_source_schema or success.get("source_schema_sha256") != declared_source_schema
+    ):
+        raise BGESelectionPreflightError("BGE_SOURCE_SCHEMA_SHA_MISMATCH")
+    if isinstance(manifest.get("request_sha256"), str) and (
+        report.get("request_sha256") != manifest.get("request_sha256") or success.get("request_sha256") != manifest.get("request_sha256")
+    ):
+        raise BGESelectionPreflightError("BGE_UPSTREAM_HASH_MISMATCH")
+    statuses = report.get("solver", {}).get("objective_statuses", [])
+    if not statuses or statuses[0] != "OPTIMAL" or any(status not in {"OPTIMAL", "FEASIBLE"} for status in statuses):
+        raise BGESelectionPreflightError("BGE_SOLVER_STATUS_INVALID")
+    warnings = ["ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE"] if provenance_status == "origin_schema_unavailable" else []
+    return {
+        "atoms": [found[atom_id] for atom_id in candidate_ids],
+        "provenance_status": provenance_status,
+        "data_gate": "passed",
+        "provenance_gate": "warning" if provenance_status == "origin_schema_unavailable" else "passed",
+        "effective_validation_schema": effective_validation_schema,
+        "declared_artifact_schema_sha256": bound_schema,
+        "blockers": [],
+        "warnings": warnings,
+    }
+
+
+def partition_cue_v2_candidates(candidate_atoms: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    """按候选原始顺序静态分配两个 worker，只返回内存分区而不生成 ledger 或 staging。"""
+
+    atom_ids = [atom.get("atom_id") for atom in candidate_atoms if isinstance(atom, dict)]
+    if len(atom_ids) != len(candidate_atoms) or any(not isinstance(atom_id, str) or not atom_id for atom_id in atom_ids):
+        raise BGESelectionPreflightError("BGE_PARTITION_ATOM_ID_INVALID")
+    if len(set(atom_ids)) != len(atom_ids):
+        raise BGESelectionPreflightError("BGE_PARTITION_DUPLICATE_ATOM")
+    workers = {"worker_00": [], "worker_01": []}
+    for index, atom in enumerate(candidate_atoms):
+        workers[f"worker_{index % 2:02d}"].append(atom)
+    flattened = [atom for worker in workers.values() for atom in worker]
+    if len({id(atom) for atom in flattened}) != len(candidate_atoms) or sorted(id(atom) for atom in flattened) != sorted(id(atom) for atom in candidate_atoms) or max(map(len, workers.values())) - min(map(len, workers.values())) > 1:
+        raise BGESelectionPreflightError("BGE_PARTITION_INVARIANT_FAILED")
+    return workers
+
+
+_CUE_V2_RETRIEVAL_CHANNELS = (
+    "query_union_and_diversity_reservoir",
+    "query_union",
+    "diversity_reservoir",
+)
+
+# 校准 proof 的 sample_index 只在 sample_stratum 内编号。该顺序是协议身份的一部分，
+# 不能通过输入行顺序或字典排序推导，否则同一份不可变 proof 可能产生不同验收集合。
+_CUE_V2_CALIBRATION_STRATA = (
+    "Activity",
+    "Explicit-Time",
+    "Location",
+    "Object",
+    "Person",
+    "State",
+    "diversity_only",
+)
+_CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM = 50
+_CUE_V2_CALIBRATION_IDENTITY_VERSION = "cue_v2_calibration_stratum_v1"
+_CUE_V2_CALIBRATION_INDEX_RULE = "fixed_stratum_order_then_sample_index_1_based"
+
+
+def _cue_v2_retrieval_channel(proof: dict[str, Any]) -> str:
+    """按冻结优先级把 proof membership 映射为单一检索分层通道。"""
+
+    declared = proof.get("retrieval_channel")
+    if declared is not None:
+        if not isinstance(declared, str) or declared not in _CUE_V2_RETRIEVAL_CHANNELS:
+            raise BGESelectionPreflightError("ACCEPTANCE_RETRIEVAL_CHANNEL_INVALID")
+        return declared
+    memberships = proof.get("selection_memberships")
+    if isinstance(memberships, str):
+        memberships = [memberships]
+    if not isinstance(memberships, list) or not all(isinstance(item, str) for item in memberships):
+        raise BGESelectionPreflightError("ACCEPTANCE_RETRIEVAL_CHANNEL_INVALID")
+    membership_set = set(memberships)
+    if not membership_set.issubset(set(_CUE_V2_RETRIEVAL_CHANNELS)):
+        raise BGESelectionPreflightError("ACCEPTANCE_RETRIEVAL_CHANNEL_INVALID")
+    if "query_union_and_diversity_reservoir" in membership_set:
+        return "query_union_and_diversity_reservoir"
+    if {"query_union", "diversity_reservoir"}.issubset(membership_set):
+        return "query_union_and_diversity_reservoir"
+    for channel in _CUE_V2_RETRIEVAL_CHANNELS[1:]:
+        if channel in membership_set:
+            return channel
+    raise BGESelectionPreflightError("ACCEPTANCE_RETRIEVAL_CHANNEL_INVALID")
+
+
+def _cue_v2_atom_stratum(source: dict[str, Any], proof: dict[str, Any]) -> tuple[Any, ...]:
+    """从 Source/proof 提取验收分层键，统一使用冻结的模态字段和检索优先级。"""
+
+    return (
+        source.get("split"),
+        source.get("participant_source_id", source.get("participant")),
+        source.get("modality", source.get("modality_coverage")),
+        source.get("source_group_id"),
+        _cue_v2_retrieval_channel(proof),
+    )
+
+
+def _cue_v2_stratum_sort_key(stratum: tuple[Any, ...]) -> tuple[str, ...]:
+    """把可能含空值的分层键变成稳定、与运行顺序无关的排序键。"""
+
+    return tuple("" if value is None else str(value) for value in stratum)
+
+
+def _cue_v2_id_sha256(atom_ids: Iterable[str]) -> str:
+    """计算只含 Atom 身份的确定性集合摘要，不接触 Source 正文。"""
+
+    payload = json.dumps(list(atom_ids), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _cue_v2_calibration_records(proof_rows: Iterable[dict[str, Any]], candidate_set: set[str]) -> tuple[list[dict[str, Any]], set[str]]:
+    """严格解析按 stratum 局部编号的 350 条校准身份，并派生验收计划序号。
+
+    原始 proof 的 `(sample_stratum, sample_index, atom_id)` 是不可变身份；
+    `calibration_index` 仅是固定七层顺序下的计划派生字段，绝不回写 proof。
+    """
+
+    by_stratum: dict[str, list[tuple[int, str]]] = {name: [] for name in _CUE_V2_CALIBRATION_STRATA}
+    seen_atom_ids: set[str] = set()
+    seen_indices: dict[str, set[int]] = {name: set() for name in _CUE_V2_CALIBRATION_STRATA}
+    for row in proof_rows:
+        if not isinstance(row, dict):
+            raise BGESelectionPreflightError("ACCEPTANCE_PROOF_INVALID")
+        if row.get("record_type") != "audit_sample":
+            continue
+        sample_stratum = row.get("sample_stratum")
+        if not isinstance(sample_stratum, str) or sample_stratum not in _CUE_V2_CALIBRATION_STRATA:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_STRATUM_INVALID")
+        sample_index = row.get("sample_index")
+        if not isinstance(sample_index, int) or isinstance(sample_index, bool) or not 1 <= sample_index <= _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_INVALID")
+        if sample_index in seen_indices[sample_stratum]:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_DUPLICATE")
+        atom_id = row.get("atom_id")
+        if not isinstance(atom_id, str) or not atom_id:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_ATOM_INVALID")
+        if atom_id in seen_atom_ids:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_ATOM_DUPLICATE")
+        if atom_id not in candidate_set:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_ATOM_OUT_OF_RANGE")
+        seen_indices[sample_stratum].add(sample_index)
+        seen_atom_ids.add(atom_id)
+        by_stratum[sample_stratum].append((sample_index, atom_id))
+
+    records: list[dict[str, Any]] = []
+    for stratum_position, sample_stratum in enumerate(_CUE_V2_CALIBRATION_STRATA):
+        rows = by_stratum[sample_stratum]
+        if len(rows) != _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM:
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_STRATUM_COUNT_MISMATCH")
+        if seen_indices[sample_stratum] != set(range(1, _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM + 1)):
+            raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_SAMPLE_INDEX_COVERAGE_MISMATCH")
+        for sample_index, atom_id in sorted(rows, key=lambda pair: pair[0]):
+            records.append({
+                "sample_stratum": sample_stratum,
+                "sample_index": sample_index,
+                "atom_id": atom_id,
+                "calibration_index": stratum_position * _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM + sample_index,
+            })
+    if len(records) != len(_CUE_V2_CALIBRATION_STRATA) * _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM:
+        raise BGESelectionPreflightError("ACCEPTANCE_CALIBRATION_COUNT_MISMATCH")
+    return records, seen_atom_ids
+
+
+def _cue_v2_maximum_remainder_quotas(counts: dict[tuple[Any, ...], int], target: int, tie_atom_ids: dict[tuple[Any, ...], str] | None = None) -> tuple[dict[tuple[Any, ...], int], list[dict[str, Any]]]:
+    """以最大余数法闭合配额，相同余数先按层内最小 Atom 身份、再按分层键排序。"""
+
+    total = sum(counts.values())
+    if target < 0 or target > total:
+        raise BGESelectionPreflightError("ACCEPTANCE_QUOTA_TARGET_INVALID")
+    rows: list[dict[str, Any]] = []
+    quotas: dict[tuple[Any, ...], int] = {}
+    for stratum, count in counts.items():
+        base, remainder = divmod(count * target, total) if total else (0, 0)
+        base = min(count, base)
+        rows.append({"stratum": stratum, "candidate_count": count, "base_quota": base, "remainder": remainder, "remainder_denominator": total})
+        quotas[stratum] = base
+    remaining = target - sum(quotas.values())
+    tie_atom_ids = tie_atom_ids or {}
+    ranked = sorted(rows, key=lambda row: (-row["remainder"], tie_atom_ids.get(row["stratum"], ""), _cue_v2_stratum_sort_key(row["stratum"])))
+    rank = 0
+    for row in ranked:
+        if remaining <= 0:
+            break
+        if quotas[row["stratum"]] < row["candidate_count"]:
+            quotas[row["stratum"]] += 1
+            remaining -= 1
+            rank += 1
+            row["remainder_rank"] = rank
+    if remaining:
+        raise BGESelectionPreflightError("ACCEPTANCE_QUOTA_NOT_CLOSED")
+    for row in rows:
+        row["quota"] = quotas[row["stratum"]]
+        row["actual_count"] = row["quota"]
+    return quotas, ranked
+
+
+def build_protocol_acceptance_plan(candidate_atoms: list[dict[str, Any]], proof_rows: list[dict[str, Any]], source_atoms: Iterable[dict[str, Any]] | dict[str, dict[str, Any]], *, preflight_atoms: Iterable[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """从 BGE 候选、proof 和 Source 元数据确定性构造 900/120 协议验收计划。
+
+    候选 proof 是唯一事实索引；Source 仅提供分层元数据。校准先按七个固定 strata
+    验证局部身份，再对剩余候选计算最大余数配额，并在每层以内使用 BGE selection_sequence 和 atom_id 的稳定全序，
+    从而避免把排序后的 Atom 身份当作抽样规则。函数只返回内存对象，不写入验收或生产工件。
+    """
+
+    if not all(isinstance(row, dict) for row in candidate_atoms):
+        raise BGESelectionPreflightError("ACCEPTANCE_CANDIDATE_ID_INVALID")
+    candidate_ids = [row.get("atom_id") for row in candidate_atoms]
+    if len(candidate_ids) != 10000:
+        raise BGESelectionPreflightError("ACCEPTANCE_CANDIDATE_COUNT_INVALID")
+    if len(candidate_ids) != len(set(candidate_ids)) or any(not isinstance(x, str) or not x for x in candidate_ids):
+        raise BGESelectionPreflightError("ACCEPTANCE_CANDIDATE_ID_INVALID")
+    candidate_set = set(candidate_ids)
+    # 优先复用 preflight 已经筛出的 10,000 个 Atom；否则只扫描 Source 流并收集候选，
+    # 不把 525 MB 的完整 Source JSONL 驻留为字典，避免验收计划改变内存和血缘边界。
+    if preflight_atoms is not None:
+        source_iterable = preflight_atoms
+    elif isinstance(source_atoms, dict) and isinstance(source_atoms.get("atoms"), list):
+        source_iterable = source_atoms["atoms"]
+    elif isinstance(source_atoms, dict):
+        source_iterable = source_atoms.values()
+    else:
+        source_iterable = source_atoms
+    source_map: dict[str, dict[str, Any]] = {}
+    for row in source_iterable:
+        if not isinstance(row, dict):
+            raise BGESelectionPreflightError("ACCEPTANCE_SOURCE_ATOM_INVALID")
+        atom_id = row.get("atom_id")
+        if not isinstance(atom_id, str) or not atom_id or atom_id not in candidate_set:
+            continue
+        if atom_id in source_map:
+            raise BGESelectionPreflightError("ACCEPTANCE_SOURCE_ATOM_DUPLICATE")
+        source_map[atom_id] = row
+    proof_map: dict[str, dict[str, Any]] = {}
+    for row in proof_rows:
+        if not isinstance(row, dict):
+            raise BGESelectionPreflightError("ACCEPTANCE_PROOF_INVALID")
+        atom_id = row.get("atom_id")
+        record_type = row.get("record_type")
+        if record_type == "candidate":
+            if not isinstance(atom_id, str) or atom_id not in candidate_set:
+                raise BGESelectionPreflightError("ACCEPTANCE_PROOF_ATOM_OUT_OF_RANGE")
+            if atom_id in proof_map:
+                raise BGESelectionPreflightError("ACCEPTANCE_CANDIDATE_PROOF_DUPLICATE")
+            if not isinstance(row.get("selection_sequence"), int) or isinstance(row.get("selection_sequence"), bool):
+                raise BGESelectionPreflightError("ACCEPTANCE_SELECTION_SEQUENCE_INVALID")
+            proof_map[atom_id] = row
+    calibration_records, calibration = _cue_v2_calibration_records(proof_rows, candidate_set)
+    if set(proof_map) != candidate_set:
+        raise BGESelectionPreflightError("ACCEPTANCE_CANDIDATE_PROOF_INCOMPLETE")
+    selection_sequences = [row["selection_sequence"] for row in proof_map.values()]
+    if len(selection_sequences) != len(set(selection_sequences)):
+        raise BGESelectionPreflightError("ACCEPTANCE_SELECTION_SEQUENCE_DUPLICATE")
+    missing = [atom_id for atom_id in candidate_ids if atom_id not in source_map]
+    if missing:
+        raise BGESelectionPreflightError("ACCEPTANCE_SOURCE_ATOM_MISSING")
+    eligible = [atom_id for atom_id in candidate_ids if atom_id not in calibration]
+    if len(eligible) < 900:
+        raise BGESelectionPreflightError("ACCEPTANCE_POOL_TOO_SMALL")
+    groups: dict[tuple[Any, ...], list[tuple[int, str]]] = {}
+    for atom_id in eligible:
+        source = source_map[atom_id]
+        proof = proof_map[atom_id]
+        fields = _cue_v2_atom_stratum(source, proof)[:4]
+        if any(not isinstance(field, str) or not field for field in fields):
+            raise BGESelectionPreflightError("ACCEPTANCE_SOURCE_METADATA_MISSING")
+        key = _cue_v2_atom_stratum(source, proof)
+        groups.setdefault(key, []).append((proof["selection_sequence"], atom_id))
+    counts = {key: len(rows) for key, rows in groups.items()}
+    # strata 配额相同余数时只看该层最小 atom_id；selection_sequence 仅用于层内选取，
+    # 不得把运行输入顺序偷偷带入最大余数的平局决策。
+    tie_atom_ids = {key: min(atom_id for _sequence, atom_id in rows) for key, rows in groups.items()}
+    quotas, remainder_rows = _cue_v2_maximum_remainder_quotas(counts, 900, tie_atom_ids)
+    for rows in groups.values():
+        rows.sort(key=lambda pair: (pair[0], pair[1]))
+    selected = [atom_id for key in sorted(groups, key=_cue_v2_stratum_sort_key) for _seq, atom_id in groups[key][:quotas[key]]]
+    selected.sort(key=lambda atom_id: (proof_map[atom_id]["selection_sequence"], atom_id))
+    if len(selected) != 900 or len(set(selected)) != 900:
+        raise BGESelectionPreflightError("ACCEPTANCE_SELECTION_COUNT_INVALID")
+    selected_counts = {key: sum(1 for atom_id in selected if _cue_v2_atom_stratum(source_map[atom_id], proof_map[atom_id]) == key) for key in groups}
+    selected_by_stratum: dict[tuple[Any, ...], list[str]] = {key: [] for key in groups}
+    for atom_id in selected:
+        source = source_map[atom_id]
+        key = _cue_v2_atom_stratum(source, proof_map[atom_id])
+        selected_by_stratum[key].append(atom_id)
+    overlap_tie_atom_ids = {key: min(values) for key, values in selected_by_stratum.items() if values}
+    overlap_quotas, overlap_remainder_rows = _cue_v2_maximum_remainder_quotas(selected_counts, 120, overlap_tie_atom_ids)
+    overlap = [atom_id for key in sorted(selected_by_stratum, key=_cue_v2_stratum_sort_key) for atom_id in selected_by_stratum[key][:overlap_quotas[key]]]
+    overlap.sort(key=lambda atom_id: (proof_map[atom_id]["selection_sequence"], atom_id))
+    main = [atom_id for atom_id in selected if atom_id not in set(overlap)]
+    if len(overlap) != 120 or len(main) != 780 or set(overlap) & set(main) or set(overlap) | set(main) != set(selected):
+        raise BGESelectionPreflightError("ACCEPTANCE_OVERLAP_INVARIANT_FAILED")
+    partitions = {"worker_00": main[0::2], "worker_01": main[1::2]}
+    if len(partitions["worker_00"]) != 390 or len(partitions["worker_01"]) != 390 or set(partitions["worker_00"]) & set(partitions["worker_01"]) or set(partitions["worker_00"]) | set(partitions["worker_01"]) != set(main):
+        raise BGESelectionPreflightError("ACCEPTANCE_PARTITION_INVARIANT_FAILED")
+    worker_acceptance_inputs = {key: partitions[key] + overlap for key in ("worker_00", "worker_01")}
+    if any(len(values) != 510 or len(set(values)) != 510 or len(set(values) & set(overlap)) != 120 for values in worker_acceptance_inputs.values()):
+        raise BGESelectionPreflightError("ACCEPTANCE_WORKER_INPUT_INVARIANT_FAILED")
+    strata = []
+    ranked_keys = {id(row): rank for rank, row in enumerate(remainder_rows, 1)}
+    for row in remainder_rows:
+        key = row["stratum"]
+        strata.append({"key": list(key), "candidate_count": row["candidate_count"], "quota": quotas[key], "actual_count": selected_counts[key], "remainder": row["remainder"], "remainder_rank": ranked_keys.get(id(row))})
+    candidate_set_sha256 = _cue_v2_id_sha256(candidate_ids)
+    proof_identity_payload = [{"atom_id": atom_id, "selection_sequence": proof_map[atom_id]["selection_sequence"], "retrieval_channel": _cue_v2_retrieval_channel(proof_map[atom_id])} for atom_id in candidate_ids]
+    proof_identity_sha256 = hashlib.sha256(json.dumps(proof_identity_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    source_identity_payload = [{"atom_id": atom_id, "stratum": list(_cue_v2_atom_stratum(source_map[atom_id], proof_map[atom_id]))} for atom_id in candidate_ids]
+    source_identity_sha256 = hashlib.sha256(json.dumps(source_identity_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    calibration_identity_payload = [
+        {"sample_stratum": row["sample_stratum"], "sample_index": row["sample_index"], "atom_id": row["atom_id"]}
+        for row in calibration_records
+    ]
+    calibration_identity_sha256 = hashlib.sha256(json.dumps(calibration_identity_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).hexdigest()
+    calibration_protocol_identity = {
+        "identity_version": _CUE_V2_CALIBRATION_IDENTITY_VERSION,
+        "strata_order": list(_CUE_V2_CALIBRATION_STRATA),
+        "samples_per_stratum": _CUE_V2_CALIBRATION_SAMPLES_PER_STRATUM,
+        "index_rule": _CUE_V2_CALIBRATION_INDEX_RULE,
+    }
+    selection_identity_sha256 = hashlib.sha256(json.dumps({"candidate_set_sha256": candidate_set_sha256, "proof_identity_sha256": proof_identity_sha256, "source_identity_sha256": source_identity_sha256, "calibration_identity_sha256": calibration_identity_sha256, "calibration_protocol": calibration_protocol_identity}, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    plan = {"acceptance_atom_ids": selected, "overlap_atom_ids": overlap, "worker_partitions": partitions, "worker_acceptance_inputs": worker_acceptance_inputs, "calibration": calibration_records, "calibration_protocol": calibration_protocol_identity, "strata": strata, "remainder_order": [list(row["stratum"]) for row in remainder_rows], "overlap_strata": [{"key": list(row["stratum"]), "candidate_count": row["candidate_count"], "quota": overlap_quotas[row["stratum"]], "actual_count": overlap_quotas[row["stratum"]], "remainder": row["remainder"], "remainder_rank": index} for index, row in enumerate(overlap_remainder_rows, 1)], "overlap_remainder_order": [list(row["stratum"]) for row in overlap_remainder_rows], "summary": {"atom_count": 900, "overlap_count": 120, "main_count": 780, "worker_counts": {key: len(value) for key, value in partitions.items()}, "worker_input_counts": {key: len(value) for key, value in worker_acceptance_inputs.items()}, "calibration_count": len(calibration_records), "calibration_disjoint": calibration.isdisjoint(set(selected)), "calibration_index_range": [calibration_records[0]["calibration_index"], calibration_records[-1]["calibration_index"]], "candidate_count": len(candidate_ids), "source_bound": True, "proof_bound": True, "candidate_set_sha256": candidate_set_sha256, "proof_identity_sha256": proof_identity_sha256, "source_identity_sha256": source_identity_sha256, "calibration_identity_sha256": calibration_identity_sha256, "selection_identity_sha256": selection_identity_sha256, "acceptance_set_sha256": _cue_v2_id_sha256(selected), "overlap_set_sha256": _cue_v2_id_sha256(overlap)}}
+    plan["plan_sha256"] = hashlib.sha256(json.dumps(plan, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    return plan
+
+
+def build_cue_v2_request(atoms: list[dict[str, Any]], inference_schema: dict[str, Any]) -> dict[str, Any]:
+    """构造 Cue v2 的只读结构化请求，不接入旧 V3.6 请求、密钥或网络。
+
+    输入为一至五个内存 Atom 和已冻结推理 Schema；输出只暴露索引与两个原文字段。
+    这让模型不能通过 Atom 身份、split、路径、可见文字或事件时间推断额外事实。
+    """
+
+    if not 1 <= len(atoms) <= 5:
+        raise ContractError("CUE_V2_REQUEST_ATOM_COUNT_OUT_OF_RANGE")
+    if not isinstance(inference_schema, dict):
+        raise ContractError("CUE_V2_REQUEST_SCHEMA_INVALID")
+    items: list[dict[str, Any]] = []
+    for index, atom in enumerate(atoms):
+        if not isinstance(atom, dict):
+            raise ContractError("CUE_V2_REQUEST_ATOM_INVALID")
+        transcript, dense_caption = atom.get("transcript"), atom.get("dense_caption")
+        if not isinstance(transcript, str) or not isinstance(dense_caption, str):
+            raise ContractError("CUE_V2_REQUEST_TEXT_INVALID")
+        items.append({"item_index": index, "transcript": transcript, "dense_caption": dense_caption})
+    return {"temperature": 0, "max_tokens": 128 * len(items), "messages": [{"role": "user", "content": json.dumps({"items": items}, ensure_ascii=False)}], "response_format": {"type": "json_schema", "json_schema": {"name": "cue_v2_inference", "strict": True, "schema": inference_schema}}}
 
 
 def validate_inference_response(validator: jsonschema.Draft202012Validator, response: dict[str, Any]) -> None:
@@ -3832,49 +4538,111 @@ def run(arguments: argparse.Namespace) -> int:
     return 0
 
 
+def _cue_v2_current_config(path: Path) -> tuple[dict[str, Any], Path]:
+    """读取唯一 Cue v2 配置并解析相对路径，输入是 model registry，输出是当前运行设置。
+
+    它位于第 05 阶段当前入口；路径只从该配置或 CLI 覆盖取得，避免 `paths.yaml`、脚本常量
+    与 CLI 默认值并存而悄然读回 V9。
+    """
+
+    loaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    settings = loaded.get("models", {}).get("cue_v2_extraction") if isinstance(loaded, dict) else None
+    if not isinstance(settings, dict):
+        raise ContractError("缺少 cue_v2_extraction 当前配置")
+    return settings, path.parent
+
+
+def _cue_v2_config_path(settings: dict[str, Any], key: str, config_dir: Path, override: Path | None) -> Path:
+    """优先采用显式 CLI 路径；否则只解析当前配置中的单一路径字段。"""
+
+    if override is not None:
+        return override
+    value = settings.get(key)
+    if not isinstance(value, str) or not value:
+        raise ContractError(f"Cue v2 配置缺少 {key}")
+    return (config_dir / value).resolve()
+
+
+def run_cue_v2_current(arguments: argparse.Namespace) -> int:
+    """执行 Cue v2 的只读预检，输入是候选与 Source，输出是请求规模摘要。
+
+    该函数位于第 05 阶段的当前开发路径：它不读取 proof、SUCCESS、V9 manifest 或账本，
+    也不写任何 Cue 工件。真实模型传输与 checkpoint/finalize 属于后续小规模 pilot，故本阶段
+    即使显式给出 `--execute` 也拒绝联网，防止路径切换时误发请求。
+    """
+
+    if arguments.limit is None or arguments.limit <= 0:
+        raise ContractError("Cue v2 预检必须提供有限正数 --limit")
+    settings, config_dir = _cue_v2_current_config(arguments.model_registry)
+    source_path = _cue_v2_config_path(settings, "source_path", config_dir, arguments.source_atoms)
+    candidate_path = _cue_v2_config_path(settings, "candidate_path", config_dir, arguments.candidates)
+    prompt_path = _cue_v2_config_path(settings, "prompt_path", config_dir, arguments.prompt)
+    inference_path = _cue_v2_config_path(settings, "inference_schema_path", config_dir, arguments.inference_schema)
+    if arguments.execute:
+        raise ContractError("阶段 B 只允许 Cue v2 只读预检；真实 API 调用留待小规模 pilot")
+    if not source_path.is_file() or not candidate_path.is_file() or not prompt_path.is_file() or not inference_path.is_file():
+        raise ContractError("Cue v2 当前输入缺失")
+    candidate_ids: list[str] = []
+    with candidate_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            atom_id = row.get("atom_id") if isinstance(row, dict) else None
+            if not isinstance(atom_id, str) or not atom_id or atom_id in candidate_ids:
+                raise ContractError("candidate_atoms.jsonl 含缺失或重复 atom_id")
+            candidate_ids.append(atom_id)
+            if len(candidate_ids) >= arguments.limit:
+                break
+    if not candidate_ids:
+        raise ContractError("candidate_atoms.jsonl 没有可预检 Atom")
+    wanted = set(candidate_ids)
+    found: dict[str, dict[str, Any]] = {}
+    with source_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            row = json.loads(line)
+            if isinstance(row, dict) and row.get("atom_id") in wanted:
+                found[str(row["atom_id"])] = row
+    if set(found) != wanted:
+        raise ContractError("候选 Atom 未全部出现在 Source")
+    if any(
+        not any(
+            isinstance(found[atom_id].get(field), str) and found[atom_id][field].strip()
+            for field in ("transcript", "dense_caption")
+        )
+        for atom_id in candidate_ids
+    ):
+        raise ContractError("候选 Atom 缺少 transcript 与 dense_caption")
+    schema = json.loads(inference_path.read_text(encoding="utf-8"))
+    jsonschema.Draft202012Validator.check_schema(schema)
+    print(json.dumps({"mode": "cue_v2_dry_run", "run_id": arguments.run_id or "dry_run", "candidate_count": len(candidate_ids), "model_id": settings.get("model_id"), "prompt": str(prompt_path), "inference_schema": str(inference_path), "source": str(source_path)}, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
 def parse_arguments(argv: list[str] | None = None) -> argparse.Namespace:
-    """定义只读默认值和执行前核验参数；`--execute` 仍需后续明确生产指令。"""
+    """定义当前 Cue v2 默认 CLI；旧 V9 参数只能在显式 legacy 模式下使用。"""
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--legacy-v9", action="store_true", help="仅用于读取隔离的 V9 历史入口；不是当前默认路径")
     parser.add_argument("--model-registry", type=Path, default=ROOT / "config/model_registry.yaml")
-    parser.add_argument("--source-atoms", type=Path, default=ROOT / "source/source_video_atoms.jsonl")
-    parser.add_argument("--source-success", type=Path, default=ROOT / "source/SOURCE_ATOMS_SUCCESS.json")
-    parser.add_argument("--source-schema", type=Path, default=ROOT / "schemas/source_video_atom.schema.json")
-    parser.add_argument("--cue-schema", type=Path, default=ROOT / "schemas/cue_candidate.schema.json")
-    parser.add_argument("--inference-schema", type=Path, default=ROOT / "schemas/cue_inference_batch_compact_v1.schema.json")
-    parser.add_argument("--prompt", type=Path, default=ROOT / "prompts/cue_extractor_v3_compact.md")
-    parser.add_argument("--run-root", type=Path, default=ROOT / "cues/realtime")
-    parser.add_argument("--output", type=Path, default=ROOT / "cues/cue_library.jsonl")
-    parser.add_argument("--success-marker", type=Path, default=ROOT / "cues/CUE_LIBRARY_SUCCESS.json")
-    parser.add_argument("--freeze-cue-library", action="store_true", help="从唯一 realtime_v9_01 运行离线冻结 75 个正式 Cue task 分片")
-    parser.add_argument("--formal-dir", type=Path, default=ROOT / "cues/formal")
-    parser.add_argument("--manifest-path", type=Path, default=ROOT / "cues/cue_library_manifest.json")
+    parser.add_argument("--source-atoms", type=Path)
+    parser.add_argument("--candidates", type=Path, help="覆盖 cue_v2_extraction.candidate_path")
+    parser.add_argument("--inference-schema", type=Path)
+    parser.add_argument("--prompt", type=Path)
     parser.add_argument("--run-id")
-    parser.add_argument("--authorization", type=Path, help="本机未提交的执行授权 JSON")
-    parser.add_argument("--wave-index", type=int, default=1, help="八波计划中的目标波次（1--8）")
-    parser.add_argument("--validate-execution-plan", action="store_true", help="只校验授权、波次和预算，绝不联网")
-    parser.add_argument("--confirmation", default="", help="提交或接收的显式 API 确认短语")
-    parser.add_argument("--execute", action="store_true", help="提交首波 Batch；需授权文件和显式 confirmation")
-    parser.add_argument("--receive", action="store_true", help="接收已提交 Batch 的结果；需独立确认和授权")
-    parser.add_argument("--realtime-execute", action="store_true", help="实时生产保留入口；必须独立授权与显式 confirmation")
-    parser.add_argument("--repair-ledger-migration-package", help="仅离线迁移错误复用首轮 ID 的 attempt 3 修复 package")
-    parser.add_argument("--close-realtime-wave-coverage", action="store_true", help="仅离线生成已完成 Wave 的逐 Atom 覆盖终态账本")
-    parser.add_argument("--poll-attempts", type=int, default=1, help="接收命令内的最多轮询次数；默认一次")
-    parser.add_argument("--rerun-failed-packages", action="store_true")
-    parser.add_argument("--max-in-flight", type=int, default=None,
-                        help="仅覆盖本次进程的实时在飞 package 上限（不改变冻结配置/协议哈希）")
-    parser.add_argument("--requests-per-minute", type=int, default=None,
-                        help="仅覆盖本次进程的客户端 RPM 令牌桶容量（不改变冻结配置/协议哈希）")
-    parser.add_argument("--tokens-per-minute", type=int, default=None,
-                        help="仅覆盖本次进程的客户端 TPM 令牌桶容量，用于匹配 TPM 预留额度（不改变冻结配置/协议哈希）")
-    return parser.parse_args(argv)
+    parser.add_argument("--limit", type=int, help="当前预检或未来真实运行处理的最大 Atom 数")
+    parser.add_argument("--dry-run", action="store_true", help="显式标记只读 Cue v2 预检")
+    parser.add_argument("--execute", action="store_true", help="阶段 B 保留为拒绝项；真实执行在阶段 C 单独实现")
+    arguments = parser.parse_args(argv)
+    if arguments.legacy_v9:
+        parser.error("旧 V9 入口已隔离，仅保留历史代码供阶段 F 清理前查阅，不能再执行")
+    return arguments
 
 
 def main() -> int:
     """将合同失败转为稳定退出码，避免回溯中出现请求/响应正文。"""
 
     try:
-        return run(parse_arguments())
+        arguments = parse_arguments()
+        return run_cue_v2_current(arguments)
     except ContractError as error:
         print(f"合同门禁失败：{error}", file=sys.stderr)
         return 2

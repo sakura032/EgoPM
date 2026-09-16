@@ -1,6 +1,6 @@
 # EgoPM-Bench v1 统筹合同
 
-治理合同版本：**v1.5.0**（2026-09-15）。本文件仅由 T0 维护。配置合同与已冻结 Source Atom Schema 保持 `v1.1.0`；CR-2026-021 启动 Cue v2 主线切换批次 A 并增加全仓工件与目录节制硬门禁，CR-2026-022 进一步冻结 Atom→Cue→Seed→Life Log 全流程事实边界、Cue 三层语义门和统一 Life Log 骨架。Cue/Seed v2 Schema、配置与执行代码尚未实施，必须通过对应 CHANGE_REQUEST 和验证后才能开始正式生产。
+治理合同版本：**v1.5.0**（2026-09-15）。本文件仅由 T0 维护。配置合同与已冻结 Source Atom Schema 保持 `v1.1.0`；CR-2026-021 启动 Cue v2 主线切换批次 A 并增加全仓工件与目录节制硬门禁，CR-2026-022 进一步冻结 Atom→Cue→Seed→Life Log 全流程事实边界、Cue 三层语义门和统一 Life Log 骨架。Cue v2 Schema、配置、纯验证器和离线验收计划已完成实现，但正式 API 生产与 Seed 生成仍未启动，必须通过对应 CHANGE_REQUEST 和验证后才能开始正式生产。
 
 ## 不可变规则
 
@@ -62,7 +62,7 @@
 ### 多账号执行、账本与恢复规则
 
 - 同一生产阶段只能有一个固定模型、一个 prompt hash、一个 Schema hash 和一套采样参数；多个账号只扩展吞吐，禁止按账号改变模型或协议。
-- Cue v2 允许三个阿里云账号并行，分别固定绑定 `worker_00`、`worker_01`、`worker_02` 和互不重叠的静态 partition。每个 worker 使用独立授权、独立预算上限、独立 ledger、独立费用快照和独立 staging 目录。
+- Cue v2 当前协议只允许两个阿里云账号并行，分别固定绑定 `worker_00`、`worker_01` 和互不重叠的静态 partition。每个 worker 使用独立授权、独立预算上限、独立 ledger、独立费用快照和独立 staging 目录；历史三 worker 交接仅作只读记录。
 - 禁止多个 worker 追加同一个累计账本、状态文件、manifest 或 SUCCESS。协调器只读聚合已关闭的 worker 账本；发现重复 request ID、终态冲突、费用缺失或身份不一致必须立即阻断，禁止自动重发。
 - request ID 必须确定性绑定 campaign、worker、partition、package、Atom 集合 SHA 和 attempt。网络层幂等重试复用 idempotency key；模型修复必须增加 attempt 并产生新 request ID。
 - 恢复只能处理本 worker、本 partition 的未终态请求。任何已计费、已成功、已排除或已有终态的 Atom 均不得自动重发。账本迁移只能由确定性工具原子完成并保留全部费用事件，严禁手改或删除 JSONL 行。
@@ -84,8 +84,8 @@
 - Cue v2 只表达单个 Source Atom 中可直接观察的事实，只允许 `all_of` 合取；`any_of`、虚拟时间、跨 Atom 关系和生命周期规则必须在 Seed/Rule 阶段表达。
 - Cue v2 每条正式记录只允许一个含 1–3 个 clause 的 predicate；每个 clause 都必须通过“字段内连续 span → value 直接支持 → 完整断言语义支持”三层门。Cue 不要求完整句法，但必须具有可识别指向对象；无法解析的代词、泛指词、空值和无承载者的活动/状态不得接受。
 - Cue v2 clause 的 `dimension` 统一为 `person/location/object/activity/state/explicit_time`；旧 `place/state_change/time` 只属于 legacy，不得作为 current 同义枚举并存。BGE 的查询族只表示召回来源，不自动决定 Cue dimension。
-- Cue v2 批量抽取沿用 `qwen3.7-flash`。三个阿里云账号必须使用相同地域、端点、模型 ID、prompt、Schema 和参数；模型在阶段中途发生不可证明的一致性变化时必须停批并创建新 campaign。
-- Cue v2 扩量前必须从 BGE selection 分层冻结 800–1,000 个协议验收 Atom，其中至少 120 个重叠 Atom 由三个账号分别处理。该集合只验证协议与账号同质性，永不进入正式数据；任一验收门失败必须产生新协议 SHA 和新验收集 ID，禁止沿用旧结果扩量。
+- Cue v2 批量抽取沿用 `qwen3.7-flash`。两个阿里云账号必须使用相同地域、端点、模型 ID、prompt、Schema 和参数；模型在阶段中途发生不可证明的一致性变化时必须停批并创建新 campaign。
+- Cue v2 扩量前必须从 BGE selection 分层冻结 800–1,000 个协议验收 Atom，其中至少 120 个重叠 Atom 由两个账号分别处理。该集合只验证协议与账号同质性，永不进入正式数据；任一验收门失败必须产生新协议 SHA 和新验收集 ID，禁止沿用旧结果扩量。
 - 不同生产阶段可以使用不同的固定模型。Seed 生成、Seed 审计和 Life Log 生成的具体模型在各阶段执行前分别通过 CHANGE_REQUEST 冻结；DeepSeek 只可少量用于独立审计或争议第三意见，不做全量高成本审计。任何模型意见均不得替代人工终审。
 - Cue v2 正式行删除顶层 `cue_type`、`confidence` 及可由 Source/manifest 派生的冗余字段；每个 predicate clause 自带 `dimension/operator/value/evidence`。正式行只包含 accepted Cue；`no_cue`、闭环后仍不确定的 `excluded_ambiguous` 和其他排除终态只写无正文 disposition ledger。
 - 每个正式 Seed 必须保存 `trigger_cue_id`。该 ID 必须解析到 Cue v2 manifest 中的 `accepted_cue`，并与 `trigger_atom_id` 和 `trigger_predicate` 建立可由程序验证的唯一血缘；顶层 `primary_cue_type` 不再是正式血缘字段，需要分析维度时从 predicate clauses 确定性派生。
@@ -120,7 +120,7 @@
 | --- | --- | --- | --- | --- |
 | Source atoms | 治理合同 v1.1.0 | `source/SOURCE_ATOMS_SUCCESS.json`，以及 inventory、segments、atoms、split map、report | T1 | T4 通过 Schema、来源时间、路径与 split 检查 |
 | BGE candidate selection | source 标记、冻结哈希、T4 source QA | `cues/v2/source_selection/<selection_id>/` 下五文件快照 | T2/WSL | selection v3.1；10,000–12,000 个候选；两个直接绑定的必要 Schema、固定 revision、请求/组件 SHA、CP-SAT 最优门、proof 离散复核、WSL 数值审计与 Source 血缘通过 |
-| Cue v2 protocol acceptance | BGE selection 标记、冻结协议与验收集 manifest | 协议验收报告与 `PROTOCOL_ACCEPTANCE_SUCCESS.json` | T2/T4 | 800–1,000 个分层 Atom；至少 120 个三账号重叠 Atom；证据、Schema、语义精度和账号漂移门全部通过；验收数据不进入正式 Cue |
+| Cue v2 protocol acceptance | BGE selection 标记、冻结协议与验收集 manifest | 协议验收报告与 `PROTOCOL_ACCEPTANCE_SUCCESS.json` | T2/T4 | 800–1,000 个分层 Atom；至少 120 个两账号重叠 Atom；证据、Schema、语义精度和账号漂移门全部通过；验收数据不进入正式 Cue |
 | Cue v2 library | BGE selection 标记、Source 标记 | `cues/v2/cue_library_manifest.json`、正式分片与 `cues/v2/CUE_LIBRARY_SUCCESS.json` | T2 | 约 3,000–5,000 条高质量 accepted Cue；旧 V9 不混入；T4 通过 clause 语义、证据、覆盖、分布与血缘检查 |
 | Seed candidates | Cue v2 标记、冻结哈希、T4 Cue v2 QA | `seeds/SEED_CANDIDATES_SUCCESS.json` | T2 | 900–1,400 个候选；每候选有唯一 Cue 血缘、一个 trigger、至少两个不跨 Seed 复用且满足同组/跨组构成的同 split lure、可执行 predicate 和终止沉默条件 |
 | Seed freeze | candidate 标记、T4 candidate QA、人工审计 | `seeds/SEEDS_FROZEN_SUCCESS.json` | T3（在 T0 冻结审计后） | 480 个接受且可状态机化的 Seed；不足则扩大候选池，不降低门禁 |
@@ -145,3 +145,6 @@ git status --short
 ```
 
 工作对话交接前必须通过测试命令。完整验证器仅由 T4 在声明的 SUCCESS/哈希边界可用后运行。
+
+CR-2026-022 第四步：BGE 属于非事实候选召回层；外部 anytime 优化结果可在原 Schema 不可用时兼容导入，但不得宣称全局最优。Source→Cue 三层事实门继续为硬门。
+当前有效 BGE selection 为 `bge_m3_source_select_v3_1_20260914_02`；Cue v2 只允许 `worker_00`、`worker_01` 两个账号/预算/ledger/staging。历史三 worker 交接只读保留，不得被当前运行器读取。

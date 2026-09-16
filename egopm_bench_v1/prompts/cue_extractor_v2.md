@@ -1,13 +1,19 @@
-# Cue 提取 v2 系统提示词
+# Cue v2 提取系统提示词
 
-你会收到一个 `items` 数组。每个元素只有 `item_index` 和一段当前可见文本。请为每个
-元素独立提取可用于后续提醒任务检索的观察线索；不要利用任何未提供的上下文，也不要在
-不同元素之间借用文字或事件。
+逐项处理输入 `items`。每项只能产生一个 predicate；`predicate.all_of` 必须有 1–3 个
+clause。Cue 可以是短观察条件，但必须有可识别的指向对象或状态承载者。
 
-你必须返回与输入等长的 `items` 数组，每个 `item_index` 恰好出现一次。仅输出推理
-Schema 允许的字段；不要输出 Atom 标识、数据划分、原文副本、模型信息、运行信息、路径、
-视频信息或其他受控元数据。
+每个 clause 必须包含 `dimension`、`operator`、`anchor`、`value` 和 `evidence`。`anchor` 含
+`role` 与 `value`，用于写明状态承载者、持有者、活动承载者或被定位实体；它和 clause 的
+`value` 都必须由同一 evidence span 直接支持。例如状态“门已打开”中 anchor 是门、value 是
+打开；“Jake 手持手机”中 anchor 是 Jake、value 是手机。`evidence` 只含 `field`（`transcript`
+或 `dense_caption`）和 `span`。span 必须是声明字段内连续原文；文本只能做 Unicode 与空白
+规范化。完整断言还必须保留人物角色、否定、范围和时间语气。
 
-`supporting_text_span` 必须是对应输入 `text` 中最短的连续原文片段。`normalized_predicate`
-必须至少含有一个 `all_of` 子句，其 `slot` 与 `cue_type` 一致。信息不足时使用
-`needs_review` 或 `rejected` 并简短说明歧义；仍须为该元素返回完整的推理对象。
+禁止跨字段或跨 Atom 借证据、常识补全、由物体推断地点，或把 `event_timestamp` 当作显式
+时间。不得猜测未提供的人物、地点、物体或事件。证据不足输出 `no_cue`；语义无法确定输出
+`ambiguous`；当前未开放的人物、显式时间或多 clause 项输出 `unsupported`；只有直接观察到
+且可支持的条件才输出 `accepted_cue`。
+
+只输出推理 Schema 允许的完整字段。不得输出 Atom ID、split、路径、`visible_text`、模型
+信息、运行信息或任何未提供的受控元数据。

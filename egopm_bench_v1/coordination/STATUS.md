@@ -1,17 +1,17 @@
 # EgoPM-Bench v1 状态板
 
-当前治理合同版本：**v1.5.0**（2026-09-15）。配置合同与已冻结 Source Atom Schema 为 `v1.1.0`；CR-2026-022 已冻结 Atom→Cue→Seed→Life Log 事实边界、Cue 三层语义门和统一 Life Log 骨架。优化版 WSL selection 快照已导入供检查，但尚未完成 T4 导入与人工精度复核；Cue v2 Schema、prompt、执行器和验证器仍未实施，当前不得启动正式 Cue API 或 Seed 生产。
+当前治理合同版本：**v1.5.0**（2026-09-15）。配置合同与已冻结 Source Atom Schema 为 `v1.1.0`；CR-2026-022 已冻结 Atom→Cue→Seed→Life Log 事实边界、Cue 三层语义门和统一 Life Log 骨架。当前 BGE selection 为 `bge_m3_source_select_v3_1_20260914_02`，已按外部优化结果兼容导入规则归位；原始 artifact Schema 不可用仅记录 provenance warning。Cue v2 Schema、prompt、纯验证器、两 worker 协议验收计划和 legacy 隔离测试已完成无 API 实施；B08 已修正 proof 的七层局部校准身份，当前仍不得启动正式 Cue API 或 Seed 生产。
 
 `DONE` 表示 T0 已审阅产物并确认通过必需验证。状态只能是 `TODO`、`IN_PROGRESS`、`BLOCKED` 或 `DONE`。
 
 | 门禁 | 负责人 | 状态 | 冻结产物/哈希 | 阻断项 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| 治理合同 v1.5.0 | T0 | IN_PROGRESS | CR-2026-021/022；工件节制门、事实边界、Cue 三层门、统一 Life Log 骨架 | Cue/Seed v2 Schema、配置、代码与测试尚未按新语义实施；既有旧执行测试基线仍需收敛 | 批次 B 先冻结 Cue v2 Schema/operator/错误码和 Life Log 参数，再做无 API 实现；代码与数据门仍为 BLOCKED |
+| 治理合同 v1.5.0 | T0 | IN_PROGRESS | CR-2026-021/022；工件节制门、事实边界、Cue 三层门、统一 Life Log 骨架 | 正式 Cue/Seed 数据仍未生成；既有旧执行测试基线仍保留 | 继续由 T4 完成 BGE 离散复核和协议验收审阅，未获授权前不得调用 API |
 | Source atoms | T1 | DONE | `SOURCE_ATOMS_SUCCESS.json`；`source_video_atoms.jsonl` SHA256 `be5f36b77970cb5147b88551c566f081589fe00fcf5ef912d8468a037e92960e`；370799 行 | 无 | Source 哈希已冻结，禁止重写；供 T4/T2 按 SUCCESS 门只读 |
 | Source QA | T4 | DONE | 审计 `7ea18b8`；Source 阻断 0；答案/split 泄漏均为 0 | 无 | 作为 WSL BGE selection 与 Cue v2 的只读上游 |
 | 旧 V9 Cue 审计快照 | T2/T4 | DONE | `realtime_v9_01`；75 个 task 分片；294839 条；manifest/SUCCESS SHA256 `a7ccd99e629d185911084bb654f79ca6891711b7874cd950c07b0bc7972fdf75` | 旧结构 QA 为 0 blocker，但存在系统性内容语义问题 | 永久只作审计；不覆盖、不混入、不作为 Seed 输入 |
-| BGE candidate selection v3.1 | T2/WSL | BLOCKED | 优化版 10,000 条候选及五文件快照已导入供检查；候选唯一且可回查 Source | T4 proof 导入复核、人工精度抽样与正式路径/身份收敛尚未完成 | 只读完成 T4 离散复核和 350 条设计校准；不得把 WSL SUCCESS 直接视为 Cue 启动门 |
-| Cue v2 library | T2 | BLOCKED | CR-2026-018/019/020/022 方向已冻结 | Cue Schema v2、1–3 clause、三层 validator、prompt、三账号执行器和协议验收尚未实现 | 先完成 350 条人工设计校准、800–1,000 条协议验收和无 API 测试，再另行取得 API 授权 |
+| BGE candidate selection v3.1 | T2/WSL | IN_PROGRESS | `bge_m3_source_select_v3_1_20260914_02`；10,000 条候选及五文件快照已兼容导入；`data_gate=passed` | `provenance_status=origin_schema_unavailable`、`provenance_gate=warning`，预检 warning 为 `ORIGIN_ARTIFACT_SCHEMA_UNAVAILABLE`；该 warning 不阻断 Cue v2 生成，但限制 BGE 原始产生 Schema 的可复现性声明 | 校准身份使用 `(sample_stratum, sample_index, atom_id)`；计划按固定层顺序派生 `calibration_index=1..350`，不改写原始 proof；继续 T4 离散复核与协议审阅 |
+| Cue v2 library | T2 | BLOCKED | CR-2026-018/019/020/022 方向已冻结；两 worker 纯函数计划和协议隔离测试已完成 | 尚未取得 API 授权，未生成正式 Cue/SUCCESS | 先完成 T4 协议验收审阅，再另行取得 API 授权；legacy V3.6 只读隔离 |
 | Seed candidates | T2 | BLOCKED | 目标 900–1,400；旧 CR-017 实现不得直接生产 | 依赖 Cue v2 SUCCESS、分布报告和 T4 Cue v2 QA；Seed Schema/布局/模型需更新 | Cue v2 完成后生成候选，至少 576 个通过机器门才可停止扩充 |
 | Seed audit | T0/T4 | BLOCKED | — | candidate 标记 + 人工审计 | 审核候选 |
 | Frozen seeds | T3 | BLOCKED | 目标 480 | 审计冻结 + T4 seed QA | 全部人工终审；不足 480 时扩大候选池，不降低标准 |
@@ -29,8 +29,8 @@
 - Cue v2 正式行只保留 `cue_id`、`atom_id` 和 clause-level predicate/evidence，只允许 `all_of`；删除顶层 `cue_type`、`confidence` 和可派生冗余字段。ambiguous 必须闭环，正式分片只含 accepted Cue。
 - 一个 Atom 最多一条 Cue；每条 Cue 只含一个 predicate 和 1–3 个 clause。Cue 可以是不完整句法的简短观察条件，但必须有可识别指向对象。每个 clause 依次通过字段内连续 span、value 直接支持和完整 `dimension/operator/value` 语义支持三层门。
 - 三层门必须显式检查人物在场/说话/被提及、主客体、否定、范围、条件/假设和时间语气；物体不得反推地点，视频时间戳不得变成显式时间 Cue。规则无法判断的第三层问题进入人工审计，不以另一模型意见自动放行。
-- 三个阿里云账号在同一 Cue 阶段必须使用相同 `qwen3.7-flash` 模型、prompt、Schema 和参数，并处理静态不重叠 partition。每个 worker 独立授权、预算、账本、租约和 staging；协调器只读聚合，任何共享追加或重复 request ID 均为 blocker。
-- 大规模 Cue 调用前先做 800–1,000 个 Atom 的独立协议验收，其中至少 120 个重叠 Atom 由三个账号分别处理；验收集永不进入正式数据。
+- 两个阿里云账号在同一 Cue 阶段必须使用相同 `qwen3.7-flash` 模型、prompt、Schema 和参数，并处理静态不重叠 partition。每个 worker 独立授权、预算、账本、租约和 staging；协调器只读聚合，任何共享追加或重复 request ID 均为 blocker。
+- 大规模 Cue 调用前先做 800–1,000 个 Atom 的独立协议验收，其中至少 120 个重叠 Atom 由两个账号分别处理；验收集永不进入正式数据。
 - BGE proof 的 350 条 audit sample 先用于人工设计校准，不能代替最终验收集；最终验收先跑约 500 条子波次，正式生产再以约 1,500 条为首个 checkpoint。单项最多一次简化修复，强模型仅处理歧义、抽样和拟进入 Seed 的 trigger Cue。
 - Seed candidates 目标为 900–1,400，最终冻结 480 个 Seed，预计派生 2,880 条 Life Log。候选不足时扩大池，不降低 trigger/lure、同组/跨组、split、失败 clause、生命周期或反事实标准。
 - 每条 Life Log 固定包含一个目标意图创建、一个 constructed 生命周期控制、同一个 trigger 和两条 lure；同一 family 的正负分支共享所有 Source 观察，只改变生命周期控制状态。目标相关 Source 观察数恒为 3，核心负分支限于 completed/cancelled/expired/already_reminded，`never_created` 不混入统一六路数据。
@@ -73,3 +73,4 @@
 - 2026-09-05：为避免 Wave 1 启动时将全量 370799 Atom 驻留内存，实时执行器改为按冻结波次流式 materialize。Wave 1 只验证并保留 shard `0..9` 的 5000 Atom，越过边界立即停止读取；每完成一个 shard 写入并打印无正文 `preparing_source` 进度。T0 以冻结正式 Source 离线核验得到 5000 Atom、1000 package、shard `0..9`，授权与 SHA 一致；未读密钥、未联网、未写 Cue/SUCCESS。全仓无 API 测试为 `50 passed in 5.83s`；用户已确认本机 `¥80` 八波累计授权绑定当前协议 SHA。
 - 2026-09-05：`realtime_v5_01` 与 `realtime_v6_01` 的无正文账本分别出现 `5/10`、`4/10` 个本地隔离项；安全分类均为 `PREDICATE_CUE_TYPE_MISMATCH`，累计实耗约 `¥0.0067032`。未读取或保存任何模型正文。T2 将安全分类码和 JSON 指针写入无正文账本；T0 确认根因是模型同时回传冗余的 `t` 与 `p`，两者存在可避免的不一致。
 - 2026-09-05：实时协议升级为 `v3.3.0`：模型仅生成 `n,p,x,c,v,e,s,a,r`，禁止回传 `t`；程序从 `p[0][0]` 确定最终 `cue_type`，并继续进行严格 Schema、原文子串、血缘和最终 Cue Schema 校验。最终 Cue Schema、Source 覆盖和五 Atom package 上限均未改变。完整无 API 回归与授权绑定核验通过后，才允许使用新的 run ID `realtime_v7_01` 启动 Wave 1。
+2026-09-15：`_02` 快照已兼容预检并归位；原始 artifact Schema 不可用，solver 为 anytime 结果，不得宣称全局最优。

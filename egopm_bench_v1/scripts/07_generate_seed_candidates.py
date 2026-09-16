@@ -628,8 +628,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model-registry", type=Path, default=ROOT / "config" / "model_registry.yaml")
     parser.add_argument("--source-atoms", type=Path, default=ROOT / "source" / "source_video_atoms.jsonl")
     parser.add_argument("--source-success", type=Path, default=ROOT / "source" / "SOURCE_ATOMS_SUCCESS.json")
-    parser.add_argument("--cue-manifest", type=Path, default=ROOT / "cues" / "cue_library_manifest.json")
-    parser.add_argument("--cue-success", type=Path, default=ROOT / "cues" / "CUE_LIBRARY_SUCCESS.json")
+    parser.add_argument("--cue-manifest", type=Path, help="旧 V9 输入已无默认值；阶段 E 将改为单个 Cue v2 run 输入")
+    parser.add_argument("--cue-success", type=Path, help="旧 V9 输入已无默认值；阶段 E 将删除该参数")
     parser.add_argument("--trigger-lures", type=Path, default=ROOT / "cues" / "trigger_lure_sets.jsonl")
     parser.add_argument("--trigger-lures-success", type=Path, default=ROOT / "cues" / "TRIGGER_LURES_SUCCESS.json")
     parser.add_argument("--source-schema", type=Path, default=ROOT / "schemas" / "source_video_atom.schema.json")
@@ -643,6 +643,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--timeout-sec", type=float, default=60.0)
     args = parser.parse_args(argv)
+    if args.cue_manifest is None or args.cue_success is None:
+        parser.error("当前阶段不允许默认读取 V9 Cue；请等待 Cue v2 Seed 接口切换")
     if args.max_candidates < 0 or args.max_retries < 0 or args.timeout_sec <= 0:
         parser.error("max-candidates/max-retries 必须非负，timeout-sec 必须大于零")
     return args
