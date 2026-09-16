@@ -220,6 +220,7 @@ egopm_bench_v1/
 │  └─ cues/
 │     └─ cue.schema.json
 ├─ DESIGN.md                        # Seed / Life Log 设计与状态机设计（只写设计）
+├─ FACT_RULES.md                    # 十条事实边界，事实正确性的唯一权威（批次 6 建立）
 └─ tests/
    ├─ source/
    │  └─ test_source_pipeline.py    # 搬移后修正路径
@@ -635,7 +636,7 @@ git add -A && git commit -m "chore: 拆分 source.yaml/cue.yaml 并更新 gitign
 
 ---
 
-### 批次 6：更新 `README.md`，建立 `DESIGN.md`
+### 批次 6：更新 `README.md`，建立 `DESIGN.md` 与 `FACT_RULES.md`
 
 **6.1 `README.md`**：写清当前进度（已完成 Source + BGE 筛选）、`scripts/source/` 怎么跑、数据文件都在哪里、哪些文件不进 Git。
 
@@ -648,9 +649,23 @@ git add -A && git commit -m "chore: 拆分 source.yaml/cue.yaml 并更新 gitign
 - 状态机：状态集合、生命周期转移、remind / silent 判定规则、有效窗口；gold 只能由确定性状态机产生。
 - 状态机代码在进入该阶段时按最终 Seed / Life Log 结构重写（见 3.4）。
 
+**6.3 `FACT_RULES.md`（必做，不是可选项）**
+
+批次 2 把 `AGENTS.md` 的第 4 节写成「指向 `codex对话记录md` 第 5 节」，这是清理期间的临时做法——**`codex对话记录md` 是执行手册，清理结束后本身就要退役归档**。到那时 `AGENTS.md` 会指向一份过时文件，而这十条恰恰是全项目最不能丢的科学约束。
+
+所以本批次必须把这十条边界从 `codex对话记录md` 第 5 节抄一份到独立文档：
+
+- 新建 `egopm_bench_v1/FACT_RULES.md`，正文即那十条（一字不改，保持语义）。
+- 把 `AGENTS.md` 第 4 节的指针从 `codex对话记录md` 第 5 节改为 `egopm_bench_v1/FACT_RULES.md`。
+- 此后 `FACT_RULES.md` 成为事实边界的**唯一权威**；`codex对话记录md` 归档后不再被引用。
+
+**6.4 提交**
+
 ```bash
-git add -A && git commit -m "docs: 更新 README 并新增 DESIGN.md"
+git add -A && git commit -m "docs: 更新 README，新增 DESIGN.md 与 FACT_RULES.md"
 ```
+
+**验收**：`grep -rn "codex对话记录md" AGENTS.md README.md egopm_bench_v1/ --include="*.md"` 无匹配（旧手册不再是任何活动文档的引用目标）。
 
 **回滚**：`git revert HEAD`。
 
