@@ -6,6 +6,22 @@ v1 是面向流式第一视角观察、视频可追溯且文本优先的前瞻�
 
 本次路径切换和后续清理顺序见[代码整理与去治理优化执行方案](代码整理与去治理优化执行方案.md)。WSL 本地 BGE-M3 部署与传输说明见 [WSL BGE-M3 执行包](wsl_BGE-M3_filter/README.md)。
 
+## Python 虚拟环境
+
+项目自带的虚拟环境位于 `.venv`。在项目根目录 `D:\scientific\EgoPM` 中打开终端后，按终端类型激活：
+
+PowerShell：
+
+```powershell
+.\.venv\Scripts\Activate.ps1
+```
+
+Git Bash：
+
+```bash
+source .venv/Scripts/activate
+```
+
 ## 正式产物布局
 
 - Cue v2 仅表达单个 Source Atom 可直接支持的观察。每个 predicate 为 1–3 个 `all_of` clause；每个 clause 必须保留连续 evidence span、直接支持的 value，以及能说明状态承载者、持有者或指向对象的 `anchor`。
