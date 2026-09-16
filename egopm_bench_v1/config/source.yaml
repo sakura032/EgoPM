@@ -1,0 +1,40 @@
+# Source 阶段（脚本 01–04，已封存）使用的路径与构建参数。
+# 本文件保留 01–04 实际读取的键，此后不再修改；新阶段的需求请写入 cue.yaml。
+# 所有相对路径都相对本文件所在目录解析。
+
+contract_version: v1.1.0
+config_version: v1.1.0
+
+raw_root: ../../raw/EgoLifeCap
+transcript_root: ../../raw/EgoLifeCap/Transcript
+dense_caption_root: ../../raw/EgoLifeCap/DenseCaption
+schema_dir: ../schemas
+
+artifacts:
+  source_inventory: ../source/srt_inventory.csv
+  raw_srt_segments: ../source/raw_srt_segments.jsonl
+  source_atoms_draft: ../source/source_video_atoms_draft.jsonl
+  source_atoms: ../source/source_video_atoms.jsonl
+  source_split_map: ../source/source_split_map.jsonl
+  source_report: ../source/atom_build_report.json
+
+# 第 03 步只写草稿；第 04 步验证草稿、确认 split 后才写唯一正式 Source Atom 路径。
+source_build:
+  alignment:
+    transcript_dense_caption_tolerance_seconds: 2.0
+    primary_window_modality: dense_caption
+    retain_unmatched_single_modality_atoms: true
+  atom_merging:
+    enabled: false
+    rationale: v1 保留最小可追溯字幕窗口，不按时长丢弃或合并相邻窗口
+    report_longer_than_seconds: 30
+  staging:
+    draft_atom_stage: draft
+    draft_split: null
+    final_atom_stage: final
+    final_split_labels: [train, dev, test]
+
+# 第 04 步写出的 Source 自检标记。
+# 它只是已完成阶段自己的内部校验，新版 Cue 不读取它，也不得把它当作下游读取门禁。
+success_markers:
+  source_atoms: ../source/SOURCE_ATOMS_SUCCESS.json

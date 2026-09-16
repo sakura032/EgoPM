@@ -1,0 +1,45 @@
+# 新版 Cue 阶段的配置：模型、端点、输入输出路径与 Cue 语义参数。
+# 本文件承接原 model_registry.yaml 中仍然有效的部分，去掉了 worker / ledger / 清单哈希等治理字段。
+# 批量与费用上限的具体字段在实现 scripts/cues/ 时（批次 7）按实际 CLI 补齐。
+
+# 凭据只从环境变量读取，禁止写入本文件或提交。
+credential_environment_variable: DASHSCOPE_API_KEY
+region: cn-beijing
+endpoint: https://dashscope.aliyuncs.com/compatible-mode/v1
+
+cue_extraction:
+  model_id: qwen3.7-flash
+  thinking_enabled: false
+  reasoning_effort: none
+  temperature: 0
+  maximum_atoms_per_request: 5
+
+# 路径：相对本文件所在目录解析。
+source_path: ../source/source_video_atoms.jsonl
+candidate_path: ../cues/wsl_BGE/candidate_atoms.jsonl
+inputs_path: ../cues/inputs/selected_atoms.jsonl
+runs_root: ../cues/runs
+prompt_dir: ../prompts/cues
+schema_path: ../schemas/cues/cue.schema.json
+
+# 允许的 dimension -> operator 组合。
+# 这套操作符必须在 pilot 之前一次定稿，之后不再变；定稿后写在 cue.schema.json 里即可，不需要版本冻结。
+# 注意：schema 声明的 dimension 共六种（person/location/object/activity/state/explicit_time），
+# 下面只列出目前已经定义好操作符的四种；person 与 explicit_time 的操作符待批次 7 一并定稿。
+dimension_operators:
+  location: [at]
+  object: [present, held]
+  activity: [starts, ongoing]
+  state: [is, changes_to]
+
+# no_cue 的 reason 取值。
+reason_codes:
+  - NO_OBSERVABLE_CONDITION
+  - INSUFFICIENT_EVIDENCE
+  - UNRESOLVED_REFERENT
+  - AMBIGUOUS_PERSON_ROLE
+  - AMBIGUOUS_SCOPE
+  - AMBIGUOUS_TEMPORAL_MODALITY
+  - UNSUPPORTED_RELATION
+  - MULTIPLE_UNRELATED_FACTS
+  - EXPLICIT_TIME_NOT_ENABLED

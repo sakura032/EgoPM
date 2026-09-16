@@ -1,0 +1,3 @@
+# 统一行尾为 LF，消除 Windows 侧 CRLF 造成的整文件“伪修改”。
+# 提交后新检出与后续 diff 都不再被行尾噪音干扰。
+* text=auto eol=lf

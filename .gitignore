@@ -1,4 +1,4 @@
-# Secrets and environment-specific credentials
+# 密钥与本机凭据
 .env
 .env.*
 !.env.example
@@ -6,7 +6,7 @@
 *.key
 *credentials*.json
 
-# Read-only source corpora and media must never enter this repository.
+# 只读语料与媒体，绝不进入仓库
 raw/
 Egolife/
 *.mp4
@@ -16,22 +16,21 @@ Egolife/
 *.wav
 *.mp3
 
-# 正式 Source 派生产物保留本机，以 SUCCESS 哈希追溯，不进入代码仓库。
+# 正式 Source 派生产物保留本机，不进入代码仓库
 egopm_bench_v1/source/raw_srt_segments.jsonl
 egopm_bench_v1/source/source_split_map.jsonl
 egopm_bench_v1/source/source_video_atoms.jsonl
 egopm_bench_v1/source/source_video_atoms_draft.jsonl
 .local_source_backup/
 
-# Model raw responses can contain third-party text and must remain local.
-egopm_bench_v1/logs/model_runs/**
+# Cue 阶段：selected_atoms.jsonl 含 EgoLife 原文，结果与 checkpoint 属本机数据
+egopm_bench_v1/cues/inputs/*.jsonl
+egopm_bench_v1/cues/runs/
 
-# 每次正式 Batch 运行的审批文件含预算和负责人信息，只留本机且不含密钥。
-egopm_bench_v1/cues/CUE_EXECUTION_AUTHORIZATION.json
-egopm_bench_v1/cues/batch/
-egopm_bench_v1/cues/realtime/
+# 模型原始响应含第三方文本，只能留在本机
+egopm_bench_v1/logs/
 
-# Atomic-production intermediates and local caches
+# 中间产物与本机缓存
 *.tmp
 *.tmp.*
 __pycache__/
@@ -43,7 +42,7 @@ htmlcov/
 venv/
 *.egg-info/
 
-# OS/editor files
+# 操作系统与编辑器文件
 .DS_Store
 Thumbs.db
 .vscode/

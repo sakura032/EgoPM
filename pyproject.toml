@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "egopm-bench"
 version = "1.0.0"
-description = "Reproducible production contracts and validators for EgoPM-Bench v1"
+description = "EgoPM-Bench v1 数据处理前置流水线：Source 建库与 Cue 构造"
 requires-python = ">=3.10"
 dependencies = [
   "jsonschema>=4.22,<5",
@@ -18,22 +18,10 @@ dev = [
 ]
 
 [tool.setuptools]
-# The production tree contains data directories and standalone numbered scripts;
-# it is deliberately not auto-discovered as a Python package distribution.
+# 生产目录里既有数据目录也有独立编号脚本，刻意不按 Python 包分发。
 packages = []
 
 [tool.pytest.ini_options]
 testpaths = ["egopm_bench_v1/tests"]
-addopts = "-ra -m 'not legacy_v36'"
+addopts = "-ra"
 python_files = ["test_*.py"]
-markers = [
-  "cue_v2: Cue v2 协议、验证器与验收计划测试",
-  "legacy_v36: legacy V3.6 实时紧凑协议回归测试",
-]
-
-[tool.egopm]
-contract_version = "v1.0.0"
-config_root = "egopm_bench_v1/config"
-schema_root = "egopm_bench_v1/schemas"
-test_command = "python -m pytest -q"
-full_validation_command = "python egopm_bench_v1/scripts/11_validate_all.py --config egopm_bench_v1/config/benchmark_protocol.yaml"

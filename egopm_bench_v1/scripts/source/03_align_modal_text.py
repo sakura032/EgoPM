@@ -292,7 +292,7 @@ def _frozen_alignment_tolerance(config: dict[str, Any]) -> float:
 
     source_build = config.get("source_build")
     if not isinstance(source_build, dict):
-        raise ValueError("paths.yaml 缺少冻结的 source_build 配置")
+        raise ValueError("source.yaml 缺少 source_build 配置")
     alignment = source_build.get("alignment")
     atom_merging = source_build.get("atom_merging")
     if not isinstance(alignment, dict) or not isinstance(atom_merging, dict):
@@ -341,8 +341,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "config" / "paths.yaml",
-        help="冻结的 paths.yaml 路径",
+        default=Path(__file__).resolve().parents[2] / "config" / "source.yaml",
+        help="Source 阶段配置 source.yaml 的路径",
     )
     arguments = parser.parse_args()
     run(arguments.config)

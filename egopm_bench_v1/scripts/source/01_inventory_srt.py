@@ -1,6 +1,6 @@
 """Source 流水线第 01 步：清点只读 EgoLife SRT，输出 `srt_inventory.csv`。
 
-输入为 `paths.yaml` 指向的 Transcript 与 DenseCaption 根目录；输出是后续解析步骤
+输入为 `source.yaml` 指向的 Transcript 与 DenseCaption 根目录；输出是后续解析步骤
 唯一读取的可追溯文件清单。本脚本不读取或修改字幕内容，也不发布 SUCCESS 标记：
 正式 Source 门仅能在第 04 步完成原子分组与 split 后发布。
 """
@@ -210,8 +210,8 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parents[2] / "config" / "paths.yaml",
-        help="冻结的 paths.yaml 路径",
+        default=Path(__file__).resolve().parents[2] / "config" / "source.yaml",
+        help="Source 阶段配置 source.yaml 的路径",
     )
     arguments = parser.parse_args()
     run(arguments.config)
