@@ -20,8 +20,8 @@ import pytest
 import yaml
 
 
-ROOT = Path(__file__).resolve().parents[1]
-SCRIPTS = ROOT / "scripts"
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPTS = ROOT / "scripts" / "source"
 
 
 def _load_script(script_name: str) -> ModuleType:

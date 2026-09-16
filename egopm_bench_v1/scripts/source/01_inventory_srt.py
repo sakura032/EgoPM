@@ -210,7 +210,7 @@ def main() -> None:
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "config" / "paths.yaml",
+        default=Path(__file__).resolve().parents[2] / "config" / "paths.yaml",
         help="冻结的 paths.yaml 路径",
     )
     arguments = parser.parse_args()
