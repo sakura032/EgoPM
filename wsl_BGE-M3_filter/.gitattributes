@@ -1,4 +1,0 @@
-*.md text eol=lf
-input/request/*.json text eol=lf
-input/request/*.jsonl text eol=lf
-input/request/*.sha256 text eol=lf
