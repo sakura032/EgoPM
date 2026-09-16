@@ -549,18 +549,27 @@ rm -f  $R/cues/CUE_EXECUTION_AUTHORIZATION.json
 rm -rf $R/cues/realtime            # 已确认删除，不备份内容
 rm -rf $R/cues/v2                  # 五文件搬走后的空目录
 
-# 4.12 未跟踪 / 被忽略的目录
-rm -rf $R/audit $R/benchmark $R/lifelogs $R/seeds $R/logs
+# 4.12 audit/ 下有两个「被跟踪」文件，必须用 git rm，不能用 rm -rf
+git rm -f -r $R/audit
+
+# 4.13 未跟踪 / 被忽略的目录（这些用 rm -rf）
+rm -rf $R/benchmark $R/lifelogs $R/seeds $R/logs $R/cues/v2
 rm -f  $R/cues/CUE_EXECUTION_AUTHORIZATION.json
 rm -rf $R/cues/realtime            # 已确认删除，不备份内容
-rm -rf $R/cues/v2                  # 五文件搬走后的空目录
+rm -rf $R/scripts/__pycache__ $R/tests/__pycache__
 ```
 
 > **本批次不做分支与 worktree 清理。** `codex/*` 分支均未合并进 `main`，且 4 个仍被 `C:/Users/20474/.codex/worktrees/*/EgoPM` 下的 worktree 实际占用（另有 1 个 locked worktree）。清理它们是一个需要单独判断的独立任务，**不要在本批次执行 `git worktree prune`、`git worktree remove` 或任何 `git branch -d/-D`**。代码清理不应与 worktree 清理混在一起。
 
 ```bash
-git add -A && git commit -m "chore: 删除旧代码、旧状态机与治理体系"
+# 只提交上面 git rm 已暂存的删除。
+# 不要用 git add -A：那会把 .gitignore、EgoPM_Bench_v1_完整生产流水线统筹指南.md、
+# source/srt_inventory.csv 这三个纯 CRLF 行尾差异一起卷进这个"删除"提交，
+# 让提交变得不可回看。这三个文件留给批次 5 的 .gitattributes 统一处理。
+git commit -m "chore: 删除旧代码、旧状态机与治理体系"
 ```
+
+**期望结果**：`144 files changed, 314317 deletions(-)`，插入为 0——纯删除提交。
 
 **验收**：
 
